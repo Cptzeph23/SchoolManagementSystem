@@ -1,18 +1,3 @@
-"""
-SMS + LMS Platform — Django settings
-Path in repo: SMS/SMS/settings.py
-
-Kept as a SINGLE settings.py, matching the project structure already in
-place (SMS/SMS/settings.py), rather than splitting into a settings/
-package. Environment differences (development vs. production vs.
-testing) are handled inside this one file via the DJANGO_ENV variable,
-read from `.env`.
-
-Phase 1A scope: project boots, connects to PostgreSQL/Supabase, serves
-Django admin + a health-check view. `smsApp` is registered as the first
-local app, but no models/business logic are added yet — that starts in
-Phase 1B.
-"""
 
 from pathlib import Path
 from decouple import config, Csv
@@ -36,9 +21,6 @@ DJANGO_ENV = config("DJANGO_ENV", default="development")
 # -----------------------------------------------------------------------
 SECRET_KEY = config("DJANGO_SECRET_KEY")
 
-# DEBUG defaults to False no matter what — it is only ever turned on
-# explicitly below, and only when DJANGO_ENV=development. A production
-# deploy that forgets to set DJANGO_ENV correctly fails safe, not open.
 DEBUG = False
 if DJANGO_ENV == "development":
     DEBUG = config("DJANGO_DEBUG", default=True, cast=bool)
@@ -61,12 +43,7 @@ THIRD_PARTY_APPS = [
     "django_extensions",
 ]
 
-# smsApp is the first local app (already scaffolded in your project).
-# It currently holds no models — it becomes the home for shared/core
-# concerns (base abstract models, the custom User model, RBAC) starting
-# Phase 1B. Additional apps (students, academics, lms, finance, etc.)
-# are added as their own apps in later phases rather than piling
-# everything into smsApp.
+
 LOCAL_APPS = [
     "smsApp",
 ]
@@ -144,10 +121,6 @@ if DJANGO_ENV == "testing":
     # Fast hashing for test speed only — never used outside the test runner.
     PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
 
-# NOTE: AUTH_USER_MODEL will be set to "smsApp.User" once the custom User
-# model is created in Phase 1B. Django requires this to be set BEFORE the
-# first migration, so it's called out here even though the model doesn't
-# exist yet.
 # AUTH_USER_MODEL = "smsApp.User"
 
 # -----------------------------------------------------------------------
@@ -166,8 +139,7 @@ STATICFILES_DIRS = [BASE_DIR / "static"]
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
-# Media is LOCAL/filesystem only in Phase 1. Supabase Storage integration
-# replaces this with a custom storage backend in a later phase.
+
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
