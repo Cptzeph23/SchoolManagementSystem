@@ -6,8 +6,7 @@ import dj_database_url
 # -----------------------------------------------------------------------
 # Paths
 # -----------------------------------------------------------------------
-# This file lives at SMS/SMS/settings.py, so BASE_DIR (two levels up)
-# is SMS/ — the folder that contains manage.py.
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # -----------------------------------------------------------------------
@@ -42,7 +41,6 @@ DJANGO_APPS = [
 THIRD_PARTY_APPS = [
     "django_extensions",
 ]
-
 
 LOCAL_APPS = [
     "smsApp",
@@ -85,8 +83,6 @@ ASGI_APPLICATION = "SMS.asgi.application"
 # -----------------------------------------------------------------------
 # Database — Supabase PostgreSQL via DATABASE_URL
 # -----------------------------------------------------------------------
-# ssl_require defaults to False so local dev against SQLite or a non-SSL
-# local Postgres doesn't break. Production forces SSL on explicitly below.
 DATABASES = {
     "default": dj_database_url.config(
         default=config("DATABASE_URL"),
@@ -121,7 +117,8 @@ if DJANGO_ENV == "testing":
     # Fast hashing for test speed only — never used outside the test runner.
     PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
 
-# AUTH_USER_MODEL = "smsApp.User"
+
+AUTH_USER_MODEL = "smsApp.User"
 
 # -----------------------------------------------------------------------
 # Internationalization
@@ -137,9 +134,14 @@ USE_TZ = True
 STATIC_URL = "static/"
 STATICFILES_DIRS = [BASE_DIR / "static"]
 STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
+if DJANGO_ENV == "production":
+    STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+else:
+    STATICFILES_STORAGE = "django.contrib.staticfiles.storage.StaticFilesStorage"
 
+# Media is LOCAL/filesystem only in Phase 1. Supabase Storage integration
+# replaces this with a custom storage backend in a later phase.
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
