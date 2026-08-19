@@ -1,0 +1,232 @@
+"""
+SMS + LMS Platform — Django settings
+Path in repo: SMS/SMS/settings.py
+
+Kept as a SINGLE settings.py, matching the project structure already in
+place (SMS/SMS/settings.py), rather than splitting into a settings/
+package. Environment differences (development vs. production vs.
+testing) are handled inside this one file via the DJANGO_ENV variable,
+read from `.env`.
+
+Phase 1A scope: project boots, connects to PostgreSQL/Supabase, serves
+Django admin + a health-check view. `smsApp` is registered as the first
+local app, but no models/business logic are added yet — that starts in
+Phase 1B.
+"""
+
+from pathlib import Path
+from decouple import config, Csv
+import dj_database_url
+
+# -----------------------------------------------------------------------
+# Paths
+# -----------------------------------------------------------------------
+# This file lives at SMS/SMS/settings.py, so BASE_DIR (two levels up)
+# is SMS/ — the folder that contains manage.py.
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# -----------------------------------------------------------------------
+# Environment switch
+# -----------------------------------------------------------------------
+# development | production | testing
+DJANGO_ENV = config("DJANGO_ENV", default="development")
+
+# -----------------------------------------------------------------------
+# Core / Security
+# -----------------------------------------------------------------------
+SECRET_KEY = config("DJANGO_SECRET_KEY")
+
+# DEBUG defaults to False no matter what — it is only ever turned on
+# explicitly below, and only when DJANGO_ENV=development. A production
+# deploy that forgets to set DJANGO_ENV correctly fails safe, not open.
+DEBUG = False
+if DJANGO_ENV == "development":
+    DEBUG = config("DJANGO_DEBUG", default=True, cast=bool)
+
+ALLOWED_HOSTS = config("DJANGO_ALLOWED_HOSTS", default="127.0.0.1,localhost", cast=Csv())
+
+# -----------------------------------------------------------------------
+# Applications
+# -----------------------------------------------------------------------
+DJANGO_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+]
+
+THIRD_PARTY_APPS = [
+    "django_extensions",
+]
+
+# smsApp is the first local app (already scaffolded in your project).
+# It currently holds no models — it becomes the home for shared/core
+# concerns (base abstract models, the custom User model, RBAC) starting
+# Phase 1B. Additional apps (students, academics, lms, finance, etc.)
+# are added as their own apps in later phases rather than piling
+# everything into smsApp.
+LOCAL_APPS = [
+    "smsApp",
+]
+
+INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
+
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
+ROOT_URLCONF = "SMS.urls"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [BASE_DIR / "templates"],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = "SMS.wsgi.application"
+ASGI_APPLICATION = "SMS.asgi.application"
+
+# -----------------------------------------------------------------------
+# Database — Supabase PostgreSQL via DATABASE_URL
+# -----------------------------------------------------------------------
+# ssl_require defaults to False so local dev against SQLite or a non-SSL
+# local Postgres doesn't break. Production forces SSL on explicitly below.
+DATABASES = {
+    "default": dj_database_url.config(
+        default=config("DATABASE_URL"),
+        conn_max_age=600,
+        ssl_require=config("DB_SSL_REQUIRE", default=False, cast=bool),
+    )
+}
+
+if DJANGO_ENV == "production":
+    DATABASES["default"]["OPTIONS"] = {
+        **DATABASES["default"].get("OPTIONS", {}),
+        "sslmode": "require",
+    }
+
+if DJANGO_ENV == "testing":
+    DATABASES["default"] = {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": ":memory:",
+    }
+
+# -----------------------------------------------------------------------
+# Password validation
+# -----------------------------------------------------------------------
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator", "OPTIONS": {"min_length": 10}},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+if DJANGO_ENV == "testing":
+    # Fast hashing for test speed only — never used outside the test runner.
+    PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
+
+# NOTE: AUTH_USER_MODEL will be set to "smsApp.User" once the custom User
+# model is created in Phase 1B. Django requires this to be set BEFORE the
+# first migration, so it's called out here even though the model doesn't
+# exist yet.
+# AUTH_USER_MODEL = "smsApp.User"
+
+# -----------------------------------------------------------------------
+# Internationalization
+# -----------------------------------------------------------------------
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = config("DJANGO_TIME_ZONE", default="Africa/Nairobi")
+USE_I18N = True
+USE_TZ = True
+
+# -----------------------------------------------------------------------
+# Static & media files
+# -----------------------------------------------------------------------
+STATIC_URL = "static/"
+STATICFILES_DIRS = [BASE_DIR / "static"]
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+
+# Media is LOCAL/filesystem only in Phase 1. Supabase Storage integration
+# replaces this with a custom storage backend in a later phase.
+MEDIA_URL = "media/"
+MEDIA_ROOT = BASE_DIR / "media"
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# -----------------------------------------------------------------------
+# Security hardening (applied automatically once DJANGO_ENV=production)
+# -----------------------------------------------------------------------
+if DJANGO_ENV == "production":
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_BROWSER_XSS_FILTER = True
+    X_FRAME_OPTIONS = "DENY"
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    EMAIL_HOST = config("EMAIL_HOST", default="")
+    EMAIL_PORT = config("EMAIL_PORT", default=587, cast=int)
+    EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
+    EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
+    EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=True, cast=bool)
+elif DJANGO_ENV == "testing":
+    EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+
+# -----------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {"format": "[{asctime}] {levelname} {name} — {message}", "style": "{"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "verbose"},
+        "file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": BASE_DIR / "logs" / "django.log",
+            "maxBytes": 5 * 1024 * 1024,
+            "backupCount": 5,
+            "formatter": "verbose",
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "WARNING" if DJANGO_ENV == "production" else "INFO",
+    },
+    "loggers": {
+        "django": {
+            "handlers": ["console", "file"],
+            "level": "CRITICAL" if DJANGO_ENV == "testing" else "INFO",
+            "propagate": False,
+        },
+    },
+}
