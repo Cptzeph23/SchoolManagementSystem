@@ -1,6 +1,6 @@
 """
 Base settings shared by all environments.
-
+Absolute path: SMS/SMS/settings/base.py
 """
 from pathlib import Path
 import environ
@@ -31,11 +31,11 @@ DJANGO_APPS = [
 ]
 
 LOCAL_APPS = [
-    "smsApp",  
+    "smsApp",  # accounts / users / RBAC core (Phase 1)
 ]
 
 THIRD_PARTY_APPS = [
-    
+    # DRF added in Phase 16
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -72,7 +72,7 @@ WSGI_APPLICATION = "SMS.wsgi.application"
 ASGI_APPLICATION = "SMS.asgi.application"
 
 # ---------------------------------------------------------------------------
-# Custom user model
+# Custom user model (RBAC foundation — Phase 1B)
 # ---------------------------------------------------------------------------
 AUTH_USER_MODEL = "smsApp.User"
 
@@ -82,6 +82,11 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
+
+# Auth redirect targets (spec §4-§19: role-based dashboard routing).
+LOGIN_URL = "dashboard:login"
+LOGIN_REDIRECT_URL = "dashboard:home"
+LOGOUT_REDIRECT_URL = "dashboard:login"
 
 # ---------------------------------------------------------------------------
 # Internationalization
