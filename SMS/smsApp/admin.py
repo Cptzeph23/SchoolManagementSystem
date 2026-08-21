@@ -1,3 +1,4 @@
+# Absolute path: SMS/smsApp/admin.py
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
@@ -6,9 +7,14 @@ from .models import (
     Campus,
     Class,
     Department,
+    Guardian,
     Program,
     School,
+    Staff,
+    StaffQualification,
     Stream,
+    Student,
+    StudentGuardian,
     Term,
     User,
 )
@@ -75,3 +81,42 @@ class StreamAdmin(admin.ModelAdmin):
     list_display = ("name", "class_group", "capacity", "is_active")
     list_filter = ("class_group__school", "is_active")
     search_fields = ("name",)
+
+
+@admin.register(Guardian)
+class GuardianAdmin(admin.ModelAdmin):
+    list_display = ("first_name", "last_name", "relationship", "phone_number", "school", "is_active")
+    list_filter = ("school", "relationship", "is_active")
+    search_fields = ("first_name", "last_name", "phone_number", "email", "national_id")
+
+
+class StudentGuardianInline(admin.TabularInline):
+    model = StudentGuardian
+    extra = 1
+
+
+@admin.register(Student)
+class StudentAdmin(admin.ModelAdmin):
+    list_display = (
+        "admission_number", "user", "school", "current_class", "current_stream",
+        "status", "is_active",
+    )
+    list_filter = ("school", "status", "current_class", "current_stream", "is_active")
+    search_fields = ("admission_number", "user__first_name", "user__last_name", "national_id")
+    inlines = [StudentGuardianInline]
+
+
+class StaffQualificationInline(admin.TabularInline):
+    model = StaffQualification
+    extra = 1
+
+
+@admin.register(Staff)
+class StaffAdmin(admin.ModelAdmin):
+    list_display = (
+        "staff_id", "user", "school", "department", "job_title",
+        "employment_status", "employment_type", "is_active",
+    )
+    list_filter = ("school", "department", "employment_status", "employment_type", "is_active")
+    search_fields = ("staff_id", "user__first_name", "user__last_name", "job_title")
+    inlines = [StaffQualificationInline]
