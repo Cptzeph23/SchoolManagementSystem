@@ -1,7 +1,0 @@
-/* Path in repo: SMS/static/css/base.css
-   Shared base styles. Real dashboard component styles land in the
-   UI/UX phase once sidebar/topnav/dashboard-card components are designed. */
-
-body {
-    background-color: #f8f9fa;
-}

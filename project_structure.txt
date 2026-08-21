@@ -1,0 +1,21 @@
+.
+├── project_structure.txt
+└── SMS
+    ├── manage.py
+    ├── SMS
+    │   ├── asgi.py
+    │   ├── __init__.py
+    │   ├── settings.py
+    │   ├── urls.py
+    │   └── wsgi.py
+    └── smsApp
+        ├── admin.py
+        ├── apps.py
+        ├── __init__.py
+        ├── migrations
+        │   └── __init__.py
+        ├── models.py
+        ├── tests.py
+        └── views.py
+
+5 directories, 14 files
