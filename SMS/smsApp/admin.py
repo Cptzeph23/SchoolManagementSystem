@@ -4,10 +4,12 @@ from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
 from .models import (
     AcademicYear,
+    AuditLog,
     Campus,
     Class,
     Department,
     Guardian,
+    LoginHistory,
     Program,
     School,
     Staff,
@@ -120,3 +122,37 @@ class StaffAdmin(admin.ModelAdmin):
     list_filter = ("school", "department", "employment_status", "employment_type", "is_active")
     search_fields = ("staff_id", "user__first_name", "user__last_name", "job_title")
     inlines = [StaffQualificationInline]
+
+
+@admin.register(AuditLog)
+class AuditLogAdmin(admin.ModelAdmin):
+    """Read-only in admin — audit rows must never be edited/deleted from
+    the UI (spec §37/§38 'never silently change'), only written via
+    smsApp.services.log_audit()."""
+
+    list_display = ("created_at", "actor", "action", "target_model", "target_object_id", "ip_address")
+    list_filter = ("action", "target_model")
+    search_fields = ("actor__username", "target_model", "target_object_id", "description")
+    readonly_fields = [f.name for f in AuditLog._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(LoginHistory)
+class LoginHistoryAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "user", "was_successful", "ip_address")
+    list_filter = ("was_successful",)
+    search_fields = ("user__username",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
