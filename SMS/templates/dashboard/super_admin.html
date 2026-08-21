@@ -1,0 +1,76 @@
+<!-- Absolute path: SMS/templates/dashboard/super_admin.html -->
+{% extends "base.html" %}
+{% block title %}Super Admin Dashboard — SMS{% endblock %}
+
+{% block sidebar_items %}
+    <li class="nav-item"><a class="nav-link active" href="{% url 'dashboard:super_admin' %}"><i class="bi bi-grid-1x2 me-2"></i>Overview</a></li>
+    <li class="nav-item"><a class="nav-link disabled" href="#"><i class="bi bi-people me-2"></i>Users <span class="badge bg-secondary ms-1">soon</span></a></li>
+    <li class="nav-item"><a class="nav-link disabled" href="#"><i class="bi bi-building me-2"></i>School Config <span class="badge bg-secondary ms-1">soon</span></a></li>
+    <li class="nav-item"><a class="nav-link disabled" href="#"><i class="bi bi-journal-text me-2"></i>Audit Logs <span class="badge bg-secondary ms-1">soon</span></a></li>
+{% endblock %}
+
+{% block breadcrumbs %}
+    <li class="breadcrumb-item"><a href="{% url 'dashboard:home' %}">Dashboard</a></li>
+    <li class="breadcrumb-item active">Super Admin</li>
+{% endblock %}
+
+{% block content %}
+<h3 class="mb-4">Super Admin Overview</h3>
+
+<div class="row g-3">
+    <div class="col-md-3 col-sm-6">
+        <div class="card sms-stat-card p-3">
+            <div class="text-muted small">Total Students</div>
+            <div class="fs-3 fw-semibold">{{ total_students }}</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="card sms-stat-card p-3">
+            <div class="text-muted small">Total Staff</div>
+            <div class="fs-3 fw-semibold">{{ total_staff }}</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="card sms-stat-card p-3">
+            <div class="text-muted small">Active Classes</div>
+            <div class="fs-3 fw-semibold">{{ active_classes }}</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="card sms-stat-card p-3">
+            <div class="text-muted small">Current Academic Year</div>
+            <div class="fs-5 fw-semibold">{{ current_academic_year|default:"— not set —" }}</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="card sms-stat-card p-3">
+            <div class="text-muted small">Current Term</div>
+            <div class="fs-5 fw-semibold">{{ current_term|default:"— not set —" }}</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="card sms-stat-card p-3">
+            <div class="text-muted small">Fees Collected</div>
+            <div class="fs-5 fw-semibold text-muted">— (Finance module pending)</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="card sms-stat-card p-3">
+            <div class="text-muted small">Outstanding Fees</div>
+            <div class="fs-5 fw-semibold text-muted">— (Finance module pending)</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="card sms-stat-card p-3">
+            <div class="text-muted small">Attendance Overview</div>
+            <div class="fs-5 fw-semibold text-muted">— (Attendance module pending)</div>
+        </div>
+    </div>
+</div>
+
+<div class="card sms-stat-card mt-4 p-3">
+    <div class="text-muted small mb-2">Recent Activity</div>
+    <div class="text-muted">Audit log feed will render here once the log browser view is built.</div>
+</div>
+{% endblock %}
+
