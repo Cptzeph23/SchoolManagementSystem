@@ -1,0 +1,89 @@
+# Absolute path: SMS/smsApp/services.py
+"""
+Business logic / service layer.
+
+Per spec §3 'Separation of concerns', views must not contain business logic
+directly — they call into functions here. This keeps logic reusable between
+Django views today and DRF API views later (§3 'API-first architecture').
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from django.http import HttpRequest
+
+from .models import AuditLog, LoginHistory, User
+
+
+def _client_ip(request: HttpRequest | None) -> str | None:
+    if request is None:
+        return None
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.META.get("REMOTE_ADDR")
+
+
+def log_audit(
+    *,
+    actor: User | None,
+    action: str,
+    request: HttpRequest | None = None,
+    target_model: str = "",
+    target_object_id: str | int = "",
+    description: str = "",
+    previous_value: dict[str, Any] | None = None,
+    new_value: dict[str, Any] | None = None,
+) -> AuditLog:
+    """Single write path for the audit trail (spec §5, §27, §33, §37, §38).
+    Every sensitive action (role changes, approvals, financial adjustments,
+    account lock/unlock, etc.) must go through this function rather than
+    writing to AuditLog directly, so the shape stays consistent."""
+    return AuditLog.objects.create(
+        actor=actor,
+        action=action,
+        target_model=target_model,
+        target_object_id=str(target_object_id) if target_object_id != "" else "",
+        description=description,
+        previous_value=previous_value,
+        new_value=new_value,
+        ip_address=_client_ip(request),
+    )
+
+
+def record_login(
+    *, user: User, request: HttpRequest | None, was_successful: bool
+) -> LoginHistory:
+    """Spec §5 'View login history'. Called from the login view (Phase 4)."""
+    user_agent = request.META.get("HTTP_USER_AGENT", "")[:255] if request else ""
+    entry = LoginHistory.objects.create(
+        user=user,
+        ip_address=_client_ip(request),
+        user_agent=user_agent,
+        was_successful=was_successful,
+    )
+    log_audit(
+        actor=user,
+        action=AuditLog.Action.LOGIN if was_successful else AuditLog.Action.LOGIN_FAILED,
+        request=request,
+        target_model="User",
+        target_object_id=user.pk,
+        description="User logged in" if was_successful else "Failed login attempt",
+    )
+    return entry
+
+
+def get_dashboard_url_for_role(role: str) -> str:
+    """Central place mapping User.Role -> dashboard URL name.
+    Used by the post-login router (Phase 4) and kept here, not hard-coded
+    in views, so Phase 6+ dashboards only need one line added here."""
+    from django.urls import reverse
+
+    mapping = {
+        User.Role.SUPER_ADMIN: "dashboard:super_admin",
+        # Other roles route to a placeholder until their dashboards are built
+        # in later phases (Staff Admin -> Phase 6, Academic Admin -> Phase 7, etc.)
+    }
+    url_name = mapping.get(role, "dashboard:coming_soon")
+    return reverse(url_name)
+
