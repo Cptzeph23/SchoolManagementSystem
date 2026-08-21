@@ -4,8 +4,21 @@ import datetime
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.test import TestCase
+from django.urls import reverse
 
-from .models import AcademicYear, Class, Guardian, Program, School, Staff, Student, StudentGuardian, Term
+from .models import (
+    AcademicYear,
+    AuditLog,
+    Class,
+    Guardian,
+    LoginHistory,
+    Program,
+    School,
+    Staff,
+    Student,
+    StudentGuardian,
+    Term,
+)
 
 User = get_user_model()
 
@@ -166,3 +179,81 @@ class PeopleModelTests(TestCase):
                     user=staff_user2, school=self.school, staff_id="STF001",
                     job_title="Science Teacher", date_hired=datetime.date(2024, 2, 1),
                 )
+
+
+class AuthAndDashboardTests(TestCase):
+    """Phase 4: login flow, role-based routing, access control."""
+
+    def setUp(self):
+        self.super_admin = User.objects.create_user(
+            username="admin1", password="pass12345", role=User.Role.SUPER_ADMIN
+        )
+        self.teacher = User.objects.create_user(
+            username="teach1", password="pass12345", role=User.Role.TEACHER
+        )
+
+    def test_login_creates_login_history_and_audit_log(self):
+        self.client.post(
+            reverse("dashboard:login"),
+            {"username": "admin1", "password": "pass12345"},
+        )
+        self.assertEqual(LoginHistory.objects.filter(user=self.super_admin).count(), 1)
+        self.assertTrue(
+            LoginHistory.objects.get(user=self.super_admin).was_successful
+        )
+        self.assertTrue(
+            AuditLog.objects.filter(
+                actor=self.super_admin, action=AuditLog.Action.LOGIN
+            ).exists()
+        )
+
+    def test_failed_login_recorded(self):
+        self.client.post(
+            reverse("dashboard:login"),
+            {"username": "admin1", "password": "wrong-password"},
+        )
+        self.assertTrue(
+            LoginHistory.objects.filter(
+                user=self.super_admin, was_successful=False
+            ).exists()
+        )
+
+    def test_super_admin_router_redirects_to_super_admin_dashboard(self):
+        self.client.login(username="admin1", password="pass12345")
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertRedirects(response, reverse("dashboard:super_admin"))
+
+    def test_non_super_admin_router_redirects_to_coming_soon(self):
+        self.client.login(username="teach1", password="pass12345")
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertRedirects(response, reverse("dashboard:coming_soon"))
+
+    def test_teacher_cannot_access_super_admin_dashboard(self):
+        self.client.login(username="teach1", password="pass12345")
+        response = self.client.get(reverse("dashboard:super_admin"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_super_admin_dashboard_shows_live_student_count(self):
+        school = School.objects.create(name="Riverside High", code="RVH2")
+        student_user = User.objects.create_user(
+            username="stud1", password="pass12345", role=User.Role.STUDENT
+        )
+        Student.objects.create(
+            user=student_user, school=school, admission_number="ADM100",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        self.client.login(username="admin1", password="pass12345")
+        response = self.client.get(reverse("dashboard:super_admin"))
+        self.assertEqual(response.context["total_students"], 1)
+
+    def test_locked_account_cannot_reach_dashboard(self):
+        self.super_admin.is_locked = True
+        self.super_admin.save()
+        self.client.login(username="admin1", password="pass12345")
+        response = self.client.get(reverse("dashboard:super_admin"))
+        self.assertRedirects(response, reverse("dashboard:account_locked"))
+
+    def test_anonymous_user_redirected_to_login(self):
+        response = self.client.get(reverse("dashboard:super_admin"))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("dashboard:login"), response.url)
