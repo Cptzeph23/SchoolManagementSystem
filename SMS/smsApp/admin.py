@@ -4,6 +4,8 @@ from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
 from .models import (
     AcademicYear,
+    AttendanceRecord,
+    AttendanceSession,
     AuditLog,
     Campus,
     Class,
@@ -189,3 +191,28 @@ class EnrollmentAdmin(admin.ModelAdmin):
     list_display = ("student", "class_subject", "academic_year", "status", "enrolled_on")
     list_filter = ("academic_year", "status")
     search_fields = ("student__admission_number", "class_subject__subject__name")
+
+
+class AttendanceRecordInline(admin.TabularInline):
+    model = AttendanceRecord
+    extra = 0
+
+
+@admin.register(AttendanceSession)
+class AttendanceSessionAdmin(admin.ModelAdmin):
+    list_display = ("class_subject", "date", "term", "taken_by", "is_locked")
+    list_filter = ("term", "is_locked", "class_subject__class_group__school")
+    search_fields = ("class_subject__subject__name",)
+    inlines = [AttendanceRecordInline]
+
+
+@admin.register(AttendanceRecord)
+class AttendanceRecordAdmin(admin.ModelAdmin):
+    """Direct editing here bypasses the audit trail in
+    smsApp.services.correct_attendance_record() — kept available for Super
+    Admin emergency fixes, but the in-app correction workflow (Phase 7+)
+    should be the normal path so corrections are logged."""
+
+    list_display = ("student", "session", "status", "recorded_by", "updated_at")
+    list_filter = ("status", "session__term")
+    search_fields = ("student__admission_number",)
