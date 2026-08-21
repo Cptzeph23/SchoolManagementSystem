@@ -1,5 +1,6 @@
 """
 Base settings shared by all environments.
+
 """
 from pathlib import Path
 import environ
@@ -30,11 +31,11 @@ DJANGO_APPS = [
 ]
 
 LOCAL_APPS = [
-    "smsApp",  # accounts / users / RBAC core (Phase 1)
+    "smsApp",  
 ]
 
 THIRD_PARTY_APPS = [
-    # DRF added in Phase 16
+    
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -71,7 +72,7 @@ WSGI_APPLICATION = "SMS.wsgi.application"
 ASGI_APPLICATION = "SMS.asgi.application"
 
 # ---------------------------------------------------------------------------
-# Custom user model (RBAC foundation — Phase 1B)
+# Custom user model
 # ---------------------------------------------------------------------------
 AUTH_USER_MODEL = "smsApp.User"
 
