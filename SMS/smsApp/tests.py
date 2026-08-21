@@ -8,6 +8,8 @@ from django.urls import reverse
 
 from .models import (
     AcademicYear,
+    AttendanceRecord,
+    AttendanceSession,
     AuditLog,
     Class,
     ClassSubject,
@@ -23,6 +25,7 @@ from .models import (
     TeachingAssignment,
     Term,
 )
+from .services import correct_attendance_record
 
 User = get_user_model()
 
@@ -387,3 +390,83 @@ class CurriculumModelTests(TestCase):
         advanced.prerequisites.add(self.subject)
         self.assertIn(self.subject, advanced.prerequisites.all())
         self.assertNotIn(advanced, self.subject.prerequisites.all())
+
+
+class AttendanceModelTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(
+            school=self.school, code="MATH", name="Mathematics"
+        )
+        self.class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+        self.admin_user = User.objects.create_user(
+            username="acadadmin", password="pass12345", role=User.Role.ACADEMIC_ADMIN
+        )
+        student_user = User.objects.create_user(
+            username="s20", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM300",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+
+    def test_only_one_session_per_class_subject_per_date(self):
+        AttendanceSession.objects.create(
+            class_subject=self.class_subject, term=self.term, date=datetime.date(2026, 2, 1)
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AttendanceSession.objects.create(
+                    class_subject=self.class_subject, term=self.term,
+                    date=datetime.date(2026, 2, 1),
+                )
+
+    def test_only_one_record_per_student_per_session(self):
+        session = AttendanceSession.objects.create(
+            class_subject=self.class_subject, term=self.term, date=datetime.date(2026, 2, 2)
+        )
+        AttendanceRecord.objects.create(
+            session=session, student=self.student, status=AttendanceRecord.Status.PRESENT
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AttendanceRecord.objects.create(
+                    session=session, student=self.student,
+                    status=AttendanceRecord.Status.ABSENT,
+                )
+
+    def test_correct_attendance_record_updates_status_and_writes_audit_log(self):
+        session = AttendanceSession.objects.create(
+            class_subject=self.class_subject, term=self.term, date=datetime.date(2026, 2, 3)
+        )
+        record = AttendanceRecord.objects.create(
+            session=session, student=self.student, status=AttendanceRecord.Status.ABSENT
+        )
+        correct_attendance_record(
+            record=record, new_status=AttendanceRecord.Status.PRESENT,
+            corrected_by=self.admin_user, new_notes="Was marked absent by mistake",
+        )
+        record.refresh_from_db()
+        self.assertEqual(record.status, AttendanceRecord.Status.PRESENT)
+        self.assertEqual(record.recorded_by, self.admin_user)
+
+        audit_entry = AuditLog.objects.filter(
+            target_model="AttendanceRecord", target_object_id=str(record.pk)
+        ).first()
+        self.assertIsNotNone(audit_entry)
+        self.assertEqual(audit_entry.previous_value["status"], "ABSENT")
+        self.assertEqual(audit_entry.new_value["status"], "PRESENT")
