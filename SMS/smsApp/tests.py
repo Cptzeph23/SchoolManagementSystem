@@ -1,10 +1,11 @@
+# Absolute path: SMS/smsApp/tests.py
 import datetime
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 
-from .models import AcademicYear, Class, Program, School, Term
+from .models import AcademicYear, Class, Guardian, Program, School, Staff, Student, StudentGuardian, Term
 
 User = get_user_model()
 
@@ -80,4 +81,88 @@ class AcademicStructureTests(TestCase):
                 Term.objects.create(
                     academic_year=ay, name="Term 1 Duplicate", term_number=1,
                     start_date=datetime.date(2026, 5, 1), end_date=datetime.date(2026, 8, 1),
+                )
+
+
+class PeopleModelTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+
+    def _make_student_user(self, username="student1"):
+        return User.objects.create_user(
+            username=username, password="pass12345", role=User.Role.STUDENT
+        )
+
+    def test_admission_number_unique_per_school_not_globally(self):
+        school2 = School.objects.create(name="Lakeside Academy", code="LKA")
+        Student.objects.create(
+            user=self._make_student_user("s1"),
+            school=self.school, admission_number="ADM001",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        # Same admission number at a different school must be allowed.
+        Student.objects.create(
+            user=self._make_student_user("s2"),
+            school=school2, admission_number="ADM001",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+
+    def test_duplicate_admission_number_same_school_rejected(self):
+        Student.objects.create(
+            user=self._make_student_user("s3"),
+            school=self.school, admission_number="ADM002",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Student.objects.create(
+                    user=self._make_student_user("s4"),
+                    school=self.school, admission_number="ADM002",
+                    admission_date=datetime.date(2026, 1, 10),
+                )
+
+    def test_student_default_status_is_active(self):
+        student = Student.objects.create(
+            user=self._make_student_user("s5"),
+            school=self.school, admission_number="ADM003",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        self.assertEqual(student.status, Student.Status.ACTIVE)
+
+    def test_guardian_linked_via_through_model_with_primary_contact_flag(self):
+        student = Student.objects.create(
+            user=self._make_student_user("s6"),
+            school=self.school, admission_number="ADM004",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        guardian = Guardian.objects.create(
+            school=self.school, first_name="Jane", last_name="Doe",
+            relationship="Mother", phone_number="+254700000000",
+        )
+        link = StudentGuardian.objects.create(
+            student=student, guardian=guardian, is_primary_contact=True
+        )
+        self.assertIn(guardian, student.guardians.all())
+        self.assertTrue(link.is_primary_contact)
+
+    def test_staff_id_unique_per_school(self):
+        staff_user = User.objects.create_user(
+            username="teacher1", password="pass12345", role=User.Role.TEACHER
+        )
+        Staff.objects.create(
+            user=staff_user, school=self.school, staff_id="STF001",
+            job_title="Mathematics Teacher", date_hired=datetime.date(2024, 1, 5),
+        )
+        staff_user2 = User.objects.create_user(
+            username="teacher2", password="pass12345", role=User.Role.TEACHER
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Staff.objects.create(
+                    user=staff_user2, school=self.school, staff_id="STF001",
+                    job_title="Science Teacher", date_hired=datetime.date(2024, 2, 1),
                 )
