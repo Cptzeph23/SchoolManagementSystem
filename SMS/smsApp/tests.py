@@ -257,3 +257,11 @@ class AuthAndDashboardTests(TestCase):
         response = self.client.get(reverse("dashboard:super_admin"))
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("dashboard:login"), response.url)
+
+    def test_anonymous_user_hitting_root_redirected_not_500(self):
+        """Regression test: DashboardRouterView must reject anonymous users
+        before touching request.user.role, or it 500s with AttributeError
+        on AnonymousUser."""
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("dashboard:login"), response.url)

@@ -1,4 +1,5 @@
 # Absolute path: SMS/smsApp/views.py
+from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView as DjangoLoginView
 from django.shortcuts import render
 from django.urls import reverse_lazy
@@ -32,12 +33,15 @@ class LoginView(DjangoLoginView):
         return super().form_invalid(form)
 
 
-class DashboardRouterView(RedirectView):
+class DashboardRouterView(LoginRequiredMixin, RedirectView):
     """Post-login landing point. Redirects each user to the dashboard that
     matches their role (spec §4 System User Types) instead of one shared
-    dashboard, per the multi-dashboard structure §5-§19 describe."""
+    dashboard, per the multi-dashboard structure §5-§19 describe.
+    LoginRequiredMixin sends anonymous visitors to LOGIN_URL first —
+    without it, `request.user` is an AnonymousUser with no `.role`."""
 
     permanent = False
+    login_url = "dashboard:login"
 
     def get_redirect_url(self, *args, **kwargs):
         return get_dashboard_url_for_role(self.request.user.role)
