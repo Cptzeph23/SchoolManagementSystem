@@ -561,3 +561,76 @@ class StaffQualification(models.Model):
 
     def __str__(self) -> str:
         return f"{self.title} - {self.staff}"
+
+
+# =============================================================================
+# Phase 4 — Audit logging + login history
+# Spec refs: §5 (audit logs), §27 (audit logging as a security requirement),
+#            §33 (audit logging), §37/§38 (never silently change data)
+# =============================================================================
+
+class AuditLog(models.Model):
+    """Generic audit trail. Rows are written via `smsApp.services.log_audit()`
+    (Phase 4 service layer), never edited or deleted from application code —
+    enforced by omitting update/delete from ModelAdmin (see admin.py)."""
+
+    class Action(models.TextChoices):
+        CREATE = "CREATE", "Create"
+        UPDATE = "UPDATE", "Update"
+        DELETE = "DELETE", "Delete"
+        LOGIN = "LOGIN", "Login"
+        LOGOUT = "LOGOUT", "Logout"
+        LOGIN_FAILED = "LOGIN_FAILED", "Failed Login"
+        APPROVE = "APPROVE", "Approve"
+        PUBLISH = "PUBLISH", "Publish"
+        LOCK = "LOCK", "Lock Account"
+        UNLOCK = "UNLOCK", "Unlock Account"
+        ROLE_CHANGE = "ROLE_CHANGE", "Role Change"
+        PERMISSION_CHANGE = "PERMISSION_CHANGE", "Permission Change"
+        PASSWORD_RESET = "PASSWORD_RESET", "Password Reset"
+        OTHER = "OTHER", "Other"
+
+    actor = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="audit_logs",
+        blank=True, null=True, help_text="Who performed the action.",
+    )
+    action = models.CharField(max_length=20, choices=Action.choices, db_index=True)
+    target_model = models.CharField(
+        max_length=100, blank=True, help_text="e.g. 'Student', 'User'."
+    )
+    target_object_id = models.CharField(max_length=50, blank=True)
+    description = models.CharField(max_length=255, blank=True)
+    previous_value = models.JSONField(blank=True, null=True)
+    new_value = models.JSONField(blank=True, null=True)
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "audit_logs"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.actor} - {self.action} - {self.target_model} @ {self.created_at:%Y-%m-%d %H:%M}"
+
+
+class LoginHistory(models.Model):
+    """Spec §5 'View login history'. Separate from AuditLog's LOGIN entries
+    so login-history queries (frequent, per-user) don't scan the whole
+    audit trail table."""
+
+    user = models.ForeignKey(
+        "smsApp.User", on_delete=models.CASCADE, related_name="login_history"
+    )
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    user_agent = models.CharField(max_length=255, blank=True)
+    was_successful = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "login_history"
+        ordering = ["-created_at"]
+        verbose_name_plural = "Login history"
+
+    def __str__(self) -> str:
+        status = "success" if self.was_successful else "failed"
+        return f"{self.user} - {status} @ {self.created_at:%Y-%m-%d %H:%M}"
