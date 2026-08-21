@@ -60,6 +60,17 @@ class User(AbstractUser):
     def __str__(self) -> str:
         return f"{self.get_full_name() or self.username} ({self.get_role_display()})"
 
+    def save(self, *args, **kwargs):
+        # `createsuperuser` (and any code setting is_superuser=True) has no
+        # concept of our custom `role` field, so it silently keeps the
+        # model default (STUDENT). Self-correct here so is_superuser and
+        # role never disagree — otherwise role-based routing/permission
+        # checks (DashboardRouterView, RoleRequiredMixin) misclassify
+        # superusers as students.
+        if self.is_superuser:
+            self.role = self.Role.SUPER_ADMIN
+        super().save(*args, **kwargs)
+
 
 # =============================================================================
 # Phase 2 — Academic structure
@@ -634,3 +645,165 @@ class LoginHistory(models.Model):
     def __str__(self) -> str:
         status = "success" if self.was_successful else "failed"
         return f"{self.user} - {status} @ {self.created_at:%Y-%m-%d %H:%M}"
+
+
+# =============================================================================
+# Phase 5 — Curriculum: Subject/Course, class assignment, teaching
+# assignment, enrollment.
+# Spec refs: §7 (Enrollment), §8 (Curriculum Management), §9 (Teacher
+# Dashboard "My classes/My subjects").
+#
+# Design: `Subject` is the catalog definition (reusable across classes/years).
+# `ClassSubject` is "assign courses to classes" (§8) — which subjects are
+# taught in which class. `TeachingAssignment` is "assign teachers" (§8) —
+# who teaches a given ClassSubject in a given Term. `Enrollment` is the
+# student-facing record (§7) — which students are actually taking it.
+# Splitting these four instead of one wide table keeps each concern testable
+# independently and matches §3 "Separation of concerns".
+# =============================================================================
+
+class Subject(models.Model):
+    """Catalog entry — spec §8: code, name, description, credit hours,
+    prerequisites. `credit_hours` is nullable/blank because school-style
+    programs (spec §7 'support both school-style and university-style')
+    typically don't use credit hours at all."""
+
+    class SubjectType(models.TextChoices):
+        CORE = "CORE", "Core"
+        ELECTIVE = "ELECTIVE", "Elective"
+
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="subjects")
+    department = models.ForeignKey(
+        Department, on_delete=models.SET_NULL, related_name="subjects",
+        blank=True, null=True,
+    )
+    code = models.CharField(max_length=20)
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    subject_type = models.CharField(
+        max_length=10, choices=SubjectType.choices, default=SubjectType.CORE
+    )
+    credit_hours = models.DecimalField(
+        max_digits=4, decimal_places=1, blank=True, null=True,
+        help_text="University-style credit hours. Leave blank for school-style subjects.",
+    )
+    prerequisites = models.ManyToManyField(
+        "self", symmetrical=False, blank=True, related_name="unlocks"
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "subjects"
+        ordering = ["school", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["school", "code"], name="uniq_subject_code_per_school"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.code})"
+
+
+class ClassSubject(models.Model):
+    """'Assign courses to classes' (spec §8). A Subject taught within a
+    specific Class — the unit that TeachingAssignment and Enrollment
+    both hang off of."""
+
+    class_group = models.ForeignKey(
+        Class, on_delete=models.CASCADE, related_name="class_subjects"
+    )
+    subject = models.ForeignKey(
+        Subject, on_delete=models.CASCADE, related_name="class_subjects"
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "class_subjects"
+        ordering = ["class_group", "subject"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["class_group", "subject"], name="uniq_subject_per_class"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.subject.name} - {self.class_group.name}"
+
+
+class TeachingAssignment(models.Model):
+    """'Assign teachers' (spec §8) / Teacher Dashboard 'My classes',
+    'My subjects' (spec §9). Scoped to a Term, not just an AcademicYear,
+    since a teacher can be swapped mid-year (e.g. maternity cover) without
+    losing the Term 1 assignment history — needed later for accurate
+    attendance/marks-entry permission checks per term."""
+
+    class_subject = models.ForeignKey(
+        ClassSubject, on_delete=models.CASCADE, related_name="teaching_assignments"
+    )
+    teacher = models.ForeignKey(
+        Staff, on_delete=models.CASCADE, related_name="teaching_assignments",
+        limit_choices_to={"employment_status": "ACTIVE"},
+    )
+    term = models.ForeignKey(
+        Term, on_delete=models.CASCADE, related_name="teaching_assignments"
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "teaching_assignments"
+        ordering = ["term", "class_subject"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["class_subject", "term"],
+                name="uniq_teacher_per_class_subject_term",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.teacher} -> {self.class_subject} ({self.term})"
+
+
+class Enrollment(models.Model):
+    """Student-facing enrollment record (spec §7 'Enrollment'). Distinct
+    from Student.current_class (Phase 3) — a student has one current_class
+    but potentially many subject enrollments (school-style: all subjects
+    for their class; university-style: a chosen subset)."""
+
+    class Status(models.TextChoices):
+        ENROLLED = "ENROLLED", "Enrolled"
+        DROPPED = "DROPPED", "Dropped"
+        COMPLETED = "COMPLETED", "Completed"
+
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="enrollments"
+    )
+    class_subject = models.ForeignKey(
+        ClassSubject, on_delete=models.CASCADE, related_name="enrollments"
+    )
+    academic_year = models.ForeignKey(
+        AcademicYear, on_delete=models.CASCADE, related_name="enrollments"
+    )
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.ENROLLED, db_index=True
+    )
+    enrolled_on = models.DateField(auto_now_add=True)
+    dropped_on = models.DateField(blank=True, null=True)
+
+    class Meta:
+        db_table = "enrollments"
+        ordering = ["-enrolled_on"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["student", "class_subject", "academic_year"],
+                name="uniq_enrollment_per_student_subject_year",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.student} - {self.class_subject} ({self.academic_year})"

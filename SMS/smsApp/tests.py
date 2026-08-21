@@ -10,6 +10,8 @@ from .models import (
     AcademicYear,
     AuditLog,
     Class,
+    ClassSubject,
+    Enrollment,
     Guardian,
     LoginHistory,
     Program,
@@ -17,6 +19,8 @@ from .models import (
     Staff,
     Student,
     StudentGuardian,
+    Subject,
+    TeachingAssignment,
     Term,
 )
 
@@ -265,3 +269,121 @@ class AuthAndDashboardTests(TestCase):
         response = self.client.get(reverse("dashboard:home"))
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("dashboard:login"), response.url)
+
+    def test_createsuperuser_account_gets_super_admin_role_and_dashboard(self):
+        """Regression test: `createsuperuser` sets is_superuser=True but has
+        no concept of our custom `role` field, so it would otherwise stay at
+        the STUDENT default and misroute to the coming-soon page."""
+        superuser = User.objects.create_superuser(
+            username="rootadmin", email="root@example.com", password="pass12345"
+        )
+        self.assertEqual(superuser.role, User.Role.SUPER_ADMIN)
+
+        self.client.login(username="rootadmin", password="pass12345")
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertRedirects(response, reverse("dashboard:super_admin"))
+
+
+class CurriculumModelTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(
+            school=self.school, code="MATH", name="Mathematics"
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+
+    def test_subject_code_unique_per_school_not_globally(self):
+        school2 = School.objects.create(name="Lakeside Academy", code="LKA")
+        Subject.objects.create(school=school2, code="MATH", name="Mathematics")  # allowed
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Subject.objects.create(school=self.school, code="MATH", name="Maths Duplicate")
+
+    def test_class_subject_pair_unique(self):
+        ClassSubject.objects.create(class_group=self.class_group, subject=self.subject)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ClassSubject.objects.create(class_group=self.class_group, subject=self.subject)
+
+    def test_only_one_teacher_per_class_subject_per_term(self):
+        class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        teacher_user1 = User.objects.create_user(
+            username="t1", password="pass12345", role=User.Role.TEACHER
+        )
+        staff1 = Staff.objects.create(
+            user=teacher_user1, school=self.school, staff_id="STF010",
+            job_title="Maths Teacher", date_hired=datetime.date(2024, 1, 1),
+        )
+        TeachingAssignment.objects.create(
+            class_subject=class_subject, teacher=staff1, term=self.term
+        )
+        teacher_user2 = User.objects.create_user(
+            username="t2", password="pass12345", role=User.Role.TEACHER
+        )
+        staff2 = Staff.objects.create(
+            user=teacher_user2, school=self.school, staff_id="STF011",
+            job_title="Maths Teacher 2", date_hired=datetime.date(2024, 1, 1),
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                TeachingAssignment.objects.create(
+                    class_subject=class_subject, teacher=staff2, term=self.term
+                )
+
+    def test_student_cannot_double_enroll_same_subject_same_year(self):
+        class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        student_user = User.objects.create_user(
+            username="s10", password="pass12345", role=User.Role.STUDENT
+        )
+        student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM200",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        Enrollment.objects.create(
+            student=student, class_subject=class_subject, academic_year=self.academic_year
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Enrollment.objects.create(
+                    student=student, class_subject=class_subject,
+                    academic_year=self.academic_year,
+                )
+
+    def test_enrollment_default_status_is_enrolled(self):
+        class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        student_user = User.objects.create_user(
+            username="s11", password="pass12345", role=User.Role.STUDENT
+        )
+        student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM201",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        enrollment = Enrollment.objects.create(
+            student=student, class_subject=class_subject, academic_year=self.academic_year
+        )
+        self.assertEqual(enrollment.status, Enrollment.Status.ENROLLED)
+
+    def test_subject_prerequisites_are_not_symmetrical(self):
+        advanced = Subject.objects.create(
+            school=self.school, code="MATH2", name="Advanced Mathematics"
+        )
+        advanced.prerequisites.add(self.subject)
+        self.assertIn(self.subject, advanced.prerequisites.all())
+        self.assertNotIn(advanced, self.subject.prerequisites.all())

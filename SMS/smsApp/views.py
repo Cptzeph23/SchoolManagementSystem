@@ -44,7 +44,7 @@ class DashboardRouterView(LoginRequiredMixin, RedirectView):
     login_url = "dashboard:login"
 
     def get_redirect_url(self, *args, **kwargs):
-        return get_dashboard_url_for_role(self.request.user.role)
+        return get_dashboard_url_for_role(self.request.user)
 
 
 class ComingSoonView(TemplateView):

@@ -7,7 +7,9 @@ from .models import (
     AuditLog,
     Campus,
     Class,
+    ClassSubject,
     Department,
+    Enrollment,
     Guardian,
     LoginHistory,
     Program,
@@ -17,6 +19,8 @@ from .models import (
     Stream,
     Student,
     StudentGuardian,
+    Subject,
+    TeachingAssignment,
     Term,
     User,
 )
@@ -156,3 +160,32 @@ class LoginHistoryAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+@admin.register(Subject)
+class SubjectAdmin(admin.ModelAdmin):
+    list_display = ("name", "code", "school", "department", "subject_type", "credit_hours", "is_active")
+    list_filter = ("school", "department", "subject_type", "is_active")
+    search_fields = ("name", "code")
+    filter_horizontal = ("prerequisites",)
+
+
+@admin.register(ClassSubject)
+class ClassSubjectAdmin(admin.ModelAdmin):
+    list_display = ("subject", "class_group", "is_active")
+    list_filter = ("class_group__school", "is_active")
+    search_fields = ("subject__name", "class_group__name")
+
+
+@admin.register(TeachingAssignment)
+class TeachingAssignmentAdmin(admin.ModelAdmin):
+    list_display = ("class_subject", "teacher", "term", "is_active")
+    list_filter = ("term", "is_active")
+    search_fields = ("teacher__staff_id", "class_subject__subject__name")
+
+
+@admin.register(Enrollment)
+class EnrollmentAdmin(admin.ModelAdmin):
+    list_display = ("student", "class_subject", "academic_year", "status", "enrolled_on")
+    list_filter = ("academic_year", "status")
+    search_fields = ("student__admission_number", "class_subject__subject__name")

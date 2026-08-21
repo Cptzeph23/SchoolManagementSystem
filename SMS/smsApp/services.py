@@ -73,17 +73,23 @@ def record_login(
     return entry
 
 
-def get_dashboard_url_for_role(role: str) -> str:
-    """Central place mapping User.Role -> dashboard URL name.
+def get_dashboard_url_for_role(user: User) -> str:
+    """Central place mapping a User -> dashboard URL name.
     Used by the post-login router (Phase 4) and kept here, not hard-coded
-    in views, so Phase 6+ dashboards only need one line added here."""
+    in views, so Phase 6+ dashboards only need one line added here.
+
+    Accepts the full user (not just `role`) because `is_superuser` must
+    win regardless of `role` — see User.save() docstring for why `role`
+    alone can't be trusted for accounts created via createsuperuser."""
     from django.urls import reverse
+
+    if user.is_superuser:
+        return reverse("dashboard:super_admin")
 
     mapping = {
         User.Role.SUPER_ADMIN: "dashboard:super_admin",
-        # Other roles route to a placeholder until their dashboards are built
-        # in later phases (Staff Admin -> Phase 6, Academic Admin -> Phase 7, etc.)
+        # Other roles route here as their dashboards are built
+        # (Staff Admin -> Phase 6, Academic Admin -> Phase 7, etc.)
     }
-    url_name = mapping.get(role, "dashboard:coming_soon")
+    url_name = mapping.get(user.role, "dashboard:coming_soon")
     return reverse(url_name)
-
