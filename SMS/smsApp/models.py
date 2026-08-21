@@ -1,4 +1,8 @@
 """
+Absolute path: SMS/smsApp/models.py
+
+Phase 1B — Custom User model + RBAC foundation.
+
 Design notes:
 - `role` is a coarse label used for dashboard routing / UI branching
   (e.g. "show Finance Admin sidebar").
@@ -58,7 +62,7 @@ class User(AbstractUser):
 
 
 # =============================================================================
-#Academic structure
+# Phase 2 — Academic structure
 # Hierarchy (spec §7): AcademicYear → Term → Department → Program → Class
 #                      → Subject/Course → Teacher
 # School/Campus/Stream are siblings supporting that hierarchy (spec §24).
@@ -318,3 +322,242 @@ class Stream(models.Model):
 
     def __str__(self) -> str:
         return f"{self.class_group.name} - {self.name}"
+
+
+# =============================================================================
+# Phase 3 — People: Guardian, Student, Staff
+# Spec refs: §6 (Staff management), §7 (Student management), §24 (DB design),
+#            §36 (unique admission number), §39 (multi-school readiness)
+# =============================================================================
+
+class Guardian(models.Model):
+    """Parent/Guardian contact record. Deliberately NOT a `User` by default —
+    spec §18 implies a Parent Portal, but a guardian record must be able to
+    exist before any portal login is issued (e.g. entered at admission time).
+    `user` is optional and links back once a portal account is created."""
+
+    user = models.OneToOneField(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="guardian_profile",
+        blank=True, null=True,
+        limit_choices_to={"role": "PARENT"},
+    )
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="guardians")
+    first_name = models.CharField(max_length=100)
+    last_name = models.CharField(max_length=100)
+    relationship = models.CharField(
+        max_length=50, help_text="e.g. 'Mother', 'Father', 'Uncle', 'Legal Guardian'"
+    )
+    phone_number = models.CharField(max_length=20)
+    alternate_phone_number = models.CharField(max_length=20, blank=True)
+    email = models.EmailField(blank=True)
+    national_id = models.CharField(max_length=50, blank=True)
+    occupation = models.CharField(max_length=150, blank=True)
+    address = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "guardians"
+        ordering = ["last_name", "first_name"]
+
+    def __str__(self) -> str:
+        return f"{self.first_name} {self.last_name} ({self.relationship})"
+
+
+class Student(models.Model):
+    """Spec §7 statuses reproduced verbatim; §36 requires a unique admission
+    number (unique per school, not globally, per §39 multi-school readiness).
+    `photo`/`documents` use local storage now — swapped to Supabase Storage
+    in Phase 17 (spec §6/§29) without changing this model's public API."""
+
+    class Status(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        GRADUATED = "GRADUATED", "Graduated"
+        SUSPENDED = "SUSPENDED", "Suspended"
+        TRANSFERRED = "TRANSFERRED", "Transferred"
+        DEFERRED = "DEFERRED", "Deferred"
+        WITHDRAWN = "WITHDRAWN", "Withdrawn"
+        EXPELLED = "EXPELLED", "Expelled"
+        ALUMNI = "ALUMNI", "Alumni"
+
+    class Gender(models.TextChoices):
+        MALE = "M", "Male"
+        FEMALE = "F", "Female"
+        OTHER = "O", "Other"
+
+    user = models.OneToOneField(
+        "smsApp.User", on_delete=models.CASCADE, related_name="student_profile",
+        limit_choices_to={"role": "STUDENT"},
+    )
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="students")
+    admission_number = models.CharField(max_length=30)
+    admission_date = models.DateField()
+    date_of_birth = models.DateField(blank=True, null=True)
+    gender = models.CharField(max_length=1, choices=Gender.choices, blank=True)
+    photo = models.ImageField(upload_to="students/photos/", blank=True, null=True)
+    national_id = models.CharField(
+        max_length=50, blank=True, help_text="Birth certificate no. or national ID."
+    )
+    current_class = models.ForeignKey(
+        Class, on_delete=models.SET_NULL, related_name="students", blank=True, null=True
+    )
+    current_stream = models.ForeignKey(
+        Stream, on_delete=models.SET_NULL, related_name="students", blank=True, null=True
+    )
+    program = models.ForeignKey(
+        Program, on_delete=models.SET_NULL, related_name="students", blank=True, null=True
+    )
+    status = models.CharField(
+        max_length=15, choices=Status.choices, default=Status.ACTIVE, db_index=True
+    )
+    guardians = models.ManyToManyField(
+        Guardian, through="StudentGuardian", related_name="students"
+    )
+    address = models.TextField(blank=True)
+    blood_group = models.CharField(max_length=5, blank=True)
+    medical_notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "students"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["school", "admission_number"],
+                name="uniq_admission_number_per_school",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user.get_full_name() or self.user.username} ({self.admission_number})"
+
+
+class StudentGuardian(models.Model):
+    """Through-table for Student<->Guardian (§7 'Guardian information').
+    A student can have multiple guardians; one is flagged primary contact."""
+
+    student = models.ForeignKey(Student, on_delete=models.CASCADE)
+    guardian = models.ForeignKey(Guardian, on_delete=models.CASCADE)
+    is_primary_contact = models.BooleanField(default=False)
+    is_emergency_contact = models.BooleanField(default=True)
+    is_billing_contact = models.BooleanField(
+        default=False,
+        help_text="Who fee invoices/statements are addressed to (Finance module, Phase 19).",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "student_guardians"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["student", "guardian"], name="uniq_student_guardian_pair"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.student} - {self.guardian}"
+
+
+class Staff(models.Model):
+    """Spec §6 Staff management fields. `employment_status` distinct from
+    `User.is_active`/`is_locked` — a staff member can be ON_LEAVE while their
+    login stays active. Qualifications/certifications/documents modeled as
+    separate tables (below) rather than JSON/text blobs, per DRY (§3) and so
+    Training/Performance (§6 'Staff performance') can reference them later."""
+
+    class EmploymentStatus(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        ON_LEAVE = "ON_LEAVE", "On Leave"
+        SUSPENDED = "SUSPENDED", "Suspended"
+        TERMINATED = "TERMINATED", "Terminated"
+        RETIRED = "RETIRED", "Retired"
+        RESIGNED = "RESIGNED", "Resigned"
+
+    class EmploymentType(models.TextChoices):
+        FULL_TIME = "FULL_TIME", "Full-Time"
+        PART_TIME = "PART_TIME", "Part-Time"
+        CONTRACT = "CONTRACT", "Contract"
+        INTERN = "INTERN", "Intern"
+
+    user = models.OneToOneField(
+        "smsApp.User", on_delete=models.CASCADE, related_name="staff_profile",
+        limit_choices_to={
+            "role__in": [
+                "STAFF_ADMIN", "ACADEMIC_ADMIN", "FINANCE_ADMIN", "TEACHER",
+                "EXAM_OFFICER", "CLASS_TEACHER", "DEPARTMENT_HEAD",
+                "ACCOUNTANT", "LIBRARIAN",
+            ]
+        },
+    )
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="staff_members")
+    staff_id = models.CharField(max_length=30)
+    department = models.ForeignKey(
+        Department, on_delete=models.SET_NULL, related_name="staff_members",
+        blank=True, null=True,
+    )
+    job_title = models.CharField(max_length=150)
+    employment_type = models.CharField(
+        max_length=15, choices=EmploymentType.choices, default=EmploymentType.FULL_TIME
+    )
+    employment_status = models.CharField(
+        max_length=15, choices=EmploymentStatus.choices, default=EmploymentStatus.ACTIVE,
+        db_index=True,
+    )
+    date_hired = models.DateField()
+    date_left = models.DateField(blank=True, null=True)
+    photo = models.ImageField(upload_to="staff/photos/", blank=True, null=True)
+    national_id = models.CharField(max_length=50, blank=True)
+    emergency_contact_name = models.CharField(max_length=150, blank=True)
+    emergency_contact_phone = models.CharField(max_length=20, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "staff"
+        verbose_name_plural = "Staff"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["school", "staff_id"], name="uniq_staff_id_per_school"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user.get_full_name() or self.user.username} ({self.staff_id})"
+
+
+class StaffQualification(models.Model):
+    """Spec §6 'Qualifications' / 'Certifications' as first-class rows,
+    not a free-text field — supports future filtering/reporting (§32)."""
+
+    class QualificationType(models.TextChoices):
+        DEGREE = "DEGREE", "Degree"
+        DIPLOMA = "DIPLOMA", "Diploma"
+        CERTIFICATE = "CERTIFICATE", "Certificate"
+        LICENSE = "LICENSE", "Professional License"
+        OTHER = "OTHER", "Other"
+
+    staff = models.ForeignKey(
+        Staff, on_delete=models.CASCADE, related_name="qualifications"
+    )
+    qualification_type = models.CharField(
+        max_length=15, choices=QualificationType.choices
+    )
+    title = models.CharField(max_length=255, help_text="e.g. 'B.Ed Mathematics'")
+    institution = models.CharField(max_length=255, blank=True)
+    year_obtained = models.PositiveSmallIntegerField(blank=True, null=True)
+    document = models.FileField(
+        upload_to="staff/qualifications/", blank=True, null=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "staff_qualifications"
+        ordering = ["-year_obtained"]
+
+    def __str__(self) -> str:
+        return f"{self.title} - {self.staff}"
