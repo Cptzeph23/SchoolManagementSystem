@@ -807,3 +807,91 @@ class Enrollment(models.Model):
 
     def __str__(self) -> str:
         return f"{self.student} - {self.class_subject} ({self.academic_year})"
+
+
+# =============================================================================
+# Phase 6 — Attendance
+# Spec ref §11: teacher marks Present/Absent/Late per class+subject+date;
+# Academic Admin can view/correct with "appropriate permissions"; students
+# and parents can view. Split into Session (the roll-call event) + Record
+# (per-student outcome) so "has today's attendance been taken for this
+# class/subject" is a single indexed lookup, and so corrections touch one
+# student's row without re-writing the whole day's roll call.
+# =============================================================================
+
+class AttendanceSession(models.Model):
+    """One roll-call event: a specific ClassSubject on a specific date.
+    `taken_by` is the teacher who submitted it — required for the
+    TeachingAssignment-based permission check in Phase 9's marking view
+    (a teacher may only take attendance for classes/subjects they're
+    assigned to teach)."""
+
+    class_subject = models.ForeignKey(
+        ClassSubject, on_delete=models.CASCADE, related_name="attendance_sessions"
+    )
+    term = models.ForeignKey(
+        Term, on_delete=models.CASCADE, related_name="attendance_sessions"
+    )
+    date = models.DateField()
+    taken_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, related_name="attendance_sessions_taken",
+        blank=True, null=True,
+    )
+    is_locked = models.BooleanField(
+        default=False,
+        help_text="Locked sessions can only be edited by Academic Admin "
+                   "corrections (spec §11), not re-submitted by the teacher.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "attendance_sessions"
+        ordering = ["-date"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["class_subject", "date"], name="uniq_session_per_class_subject_date"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.class_subject} - {self.date}"
+
+
+class AttendanceRecord(models.Model):
+    """Per-student outcome within an AttendanceSession. `recorded_by` is
+    updated (not appended) on correction — full before/after values for
+    corrections live in AuditLog (spec §5/§27/§33), not duplicated here."""
+
+    class Status(models.TextChoices):
+        PRESENT = "PRESENT", "Present"
+        ABSENT = "ABSENT", "Absent"
+        LATE = "LATE", "Late"
+        EXCUSED = "EXCUSED", "Excused"
+
+    session = models.ForeignKey(
+        AttendanceSession, on_delete=models.CASCADE, related_name="records"
+    )
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="attendance_records"
+    )
+    status = models.CharField(max_length=10, choices=Status.choices, db_index=True)
+    notes = models.CharField(max_length=255, blank=True)
+    recorded_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="attendance_records_recorded",
+        blank=True, null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "attendance_records"
+        ordering = ["session", "student"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["session", "student"], name="uniq_record_per_session_student"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.student} - {self.status} ({self.session.date})"

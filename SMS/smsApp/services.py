@@ -93,3 +93,42 @@ def get_dashboard_url_for_role(user: User) -> str:
     }
     url_name = mapping.get(user.role, "dashboard:coming_soon")
     return reverse(url_name)
+
+
+def correct_attendance_record(
+    *,
+    record: "AttendanceRecord",
+    new_status: str,
+    corrected_by: User,
+    request: HttpRequest | None = None,
+    new_notes: str | None = None,
+) -> "AttendanceRecord":
+    """Spec §11: 'Academic Admin can... correct attendance with appropriate
+    permissions'. This is the single write path for corrections — callers
+    (views, Phase 7+) must not set `record.status = ...; record.save()`
+    directly, or the correction won't be captured in AuditLog (spec §5,
+    §27, §33 all require before/after values for sensitive edits).
+
+    Caller is responsible for the actual permission check (e.g.
+    RoleRequiredMixin on the view) — this function only records what
+    changed, it does not decide who is allowed to call it.
+    """
+    previous_value = {"status": record.status, "notes": record.notes}
+
+    record.status = new_status
+    if new_notes is not None:
+        record.notes = new_notes
+    record.recorded_by = corrected_by
+    record.save(update_fields=["status", "notes", "recorded_by", "updated_at"])
+
+    log_audit(
+        actor=corrected_by,
+        action=AuditLog.Action.UPDATE,
+        request=request,
+        target_model="AttendanceRecord",
+        target_object_id=record.pk,
+        description=f"Corrected attendance for {record.student} on {record.session.date}",
+        previous_value=previous_value,
+        new_value={"status": record.status, "notes": record.notes},
+    )
+    return record
