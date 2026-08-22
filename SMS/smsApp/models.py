@@ -1082,7 +1082,13 @@ class Assessment(models.Model):
         Staff, on_delete=models.SET_NULL, related_name="assessments_created",
         blank=True, null=True,
     )
-        # --- Phase 8: Result Processing Workflow (spec §14) ---
+
+    # --- Phase 8: Result Processing Workflow (spec §14) ---
+    # DRAFT -> SUBMITTED -> REVIEWED -> VERIFIED -> APPROVED -> PUBLISHED,
+    # enforced strictly in order by services.transition_assessment_workflow().
+    # `is_published` is kept as a fast boolean flag for read-heavy queries
+    # (report cards, student views) and is set automatically only when
+    # workflow_status reaches PUBLISHED — never set directly.
     class WorkflowStatus(models.TextChoices):
         DRAFT = "DRAFT", "Draft"
         SUBMITTED = "SUBMITTED", "Submitted"
@@ -1092,18 +1098,44 @@ class Assessment(models.Model):
         PUBLISHED = "PUBLISHED", "Published"
         REJECTED = "REJECTED", "Rejected"
 
-    workflow_status = models.CharField(max_length=10, choices=WorkflowStatus.choices, default=WorkflowStatus.DRAFT, db_index=True)
-    submitted_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_submitted", blank=True, null=True)
+    workflow_status = models.CharField(
+        max_length=10, choices=WorkflowStatus.choices, default=WorkflowStatus.DRAFT,
+        db_index=True,
+    )
+    submitted_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="assessments_submitted",
+        blank=True, null=True,
+    )
     submitted_at = models.DateTimeField(blank=True, null=True)
-    reviewed_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_reviewed", blank=True, null=True)
+    reviewed_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="assessments_reviewed",
+        blank=True, null=True,
+        help_text="Department/Class Teacher review step (spec §14).",
+    )
     reviewed_at = models.DateTimeField(blank=True, null=True)
-    verified_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_verified", blank=True, null=True)
+    verified_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="assessments_verified",
+        blank=True, null=True,
+        help_text="Academic Admin verification step (spec §14).",
+    )
     verified_at = models.DateTimeField(blank=True, null=True)
-    approved_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_approved", blank=True, null=True)
+    approved_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="assessments_approved",
+        blank=True, null=True,
+    )
     approved_at = models.DateTimeField(blank=True, null=True)
-    published_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_published", blank=True, null=True)
+    published_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="assessments_published",
+        blank=True, null=True,
+    )
     published_at = models.DateTimeField(blank=True, null=True)
-    is_published = models.BooleanField(default=False, help_text="Set automatically when workflow_status reaches PUBLISHED — do not set directly.")
+
+    is_published = models.BooleanField(
+        default=False,
+        help_text="Marks visible to students/parents. Set automatically "
+                   "when workflow_status reaches PUBLISHED — do not set "
+                   "this directly, use services.transition_assessment_workflow().",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1119,7 +1151,13 @@ class AssessmentMark(models.Model):
     """A student's raw score on one Assessment. Marks entered here are raw
     (out of component.max_marks) — weighted contribution to the subject
     total is computed on read by services.compute_weighted_average(),
-    never stored redundantly."""
+    never stored redundantly.
+
+    Spec §14 'Once published, prevent unrestricted modification' is
+    enforced here, not just by convention: once the parent Assessment's
+    workflow_status is PUBLISHED, save() refuses further changes unless
+    called with `_bypass_publish_lock=True` — the only caller allowed to
+    do that is services.decide_result_amendment()."""
 
     assessment = models.ForeignKey(
         Assessment, on_delete=models.CASCADE, related_name="marks"
@@ -1150,3 +1188,64 @@ class AssessmentMark(models.Model):
 
     def __str__(self) -> str:
         return f"{self.student} - {self.assessment} - {self.marks_obtained}"
+
+    def save(self, *args, _bypass_publish_lock: bool = False, **kwargs):
+        if self.pk and not _bypass_publish_lock:
+            is_published = (
+                AssessmentMark.objects.filter(pk=self.pk)
+                .values_list("assessment__workflow_status", flat=True)
+                .first()
+                == Assessment.WorkflowStatus.PUBLISHED
+            )
+            if is_published:
+                raise ValueError(
+                    "This mark's assessment has been published; use "
+                    "services.request_result_amendment() / "
+                    "decide_result_amendment() to change it (spec §14)."
+                )
+        super().save(*args, **kwargs)
+
+
+class ResultAmendmentRequest(models.Model):
+    """Spec §14: once results are published, prevent unrestricted
+    modification — a correction must go through a Result Amendment
+    Request with reason, original mark, proposed mark, requesting user,
+    date, and approval. Applying the change (services.decide_amendment_
+    request) is the only path that mutates a published AssessmentMark."""
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+
+    assessment_mark = models.ForeignKey(
+        AssessmentMark, on_delete=models.CASCADE, related_name="amendment_requests"
+    )
+    reason = models.TextField()
+    original_mark = models.DecimalField(
+        max_digits=6, decimal_places=2,
+        help_text="Snapshot of the mark at request time, independent of "
+                   "whatever the mark is by the time this is reviewed.",
+    )
+    proposed_mark = models.DecimalField(max_digits=6, decimal_places=2)
+    requested_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="amendment_requests_made",
+        blank=True, null=True,
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True
+    )
+    reviewed_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="amendment_requests_reviewed",
+        blank=True, null=True,
+    )
+    reviewed_at = models.DateTimeField(blank=True, null=True)
+    review_comment = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        db_table = "result_amendment_requests"
+        ordering = ["-requested_at"]
+
+    def __str__(self) -> str:
+        return f"{self.assessment_mark} - {self.original_mark} -> {self.proposed_mark} ({self.status})"

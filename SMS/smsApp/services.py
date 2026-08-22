@@ -13,7 +13,7 @@ from typing import Any
 
 from django.http import HttpRequest
 
-from .models import AuditLog, LoginHistory, User
+from .models import Assessment, AuditLog, LoginHistory, User
 
 
 def _client_ip(request: HttpRequest | None) -> str | None:
@@ -204,3 +204,209 @@ def compute_weighted_average(student, class_subject, term) -> dict[str, Any]:
         "components_total": components_total,
         "is_complete": components_graded == components_total and components_total > 0,
     }
+
+
+# =============================================================================
+# Phase 8 — Result Processing Workflow (spec §14)
+# DRAFT -> SUBMITTED -> REVIEWED -> VERIFIED -> APPROVED -> PUBLISHED.
+# Every transition is a separate, narrow function so each pipeline stage
+# can be permission-checked independently by the calling view (e.g. only
+# a Class Teacher may call review_assessment, only Academic Admin may call
+# verify_assessment) — this module does not decide who is allowed to call
+# it, only that the *sequence* is respected and every step is audited.
+# =============================================================================
+
+_WORKFLOW_ORDER = [
+    "DRAFT", "SUBMITTED", "REVIEWED", "VERIFIED", "APPROVED", "PUBLISHED",
+]
+
+
+def _require_status(assessment, expected: str) -> None:
+    if assessment.workflow_status != expected:
+        raise ValueError(
+            f"Cannot perform this transition from status "
+            f"'{assessment.workflow_status}' — expected '{expected}'."
+        )
+
+
+def transition_assessment_workflow(
+    *,
+    assessment: "Assessment",
+    to_status: str,
+    actor: User,
+    request: HttpRequest | None = None,
+) -> "Assessment":
+    """Single write path for every workflow stage change. `to_status` must
+    be the next status in _WORKFLOW_ORDER (no skipping stages, no going
+    backwards except via explicit rejection — see reject_assessment).
+
+    Enforces spec §9: 'Teachers must not be able to approve their own
+    final results' — the actor who submitted an assessment cannot also
+    be the one who approves it.
+    """
+    from django.utils import timezone
+
+    current_index = _WORKFLOW_ORDER.index(assessment.workflow_status)
+    try:
+        target_index = _WORKFLOW_ORDER.index(to_status)
+    except ValueError:
+        raise ValueError(f"'{to_status}' is not a valid forward workflow status.")
+
+    if target_index != current_index + 1:
+        raise ValueError(
+            f"Cannot jump from '{assessment.workflow_status}' to '{to_status}' — "
+            f"stages must be completed in order."
+        )
+
+    if to_status == Assessment.WorkflowStatus.APPROVED and assessment.submitted_by_id == actor.pk:
+        raise PermissionError(
+            "A teacher cannot approve their own submitted results — "
+            "independent approval is required (spec §9)."
+        )
+
+    now = timezone.now()
+    field_map = {
+        "SUBMITTED": ("submitted_by", "submitted_at"),
+        "REVIEWED": ("reviewed_by", "reviewed_at"),
+        "VERIFIED": ("verified_by", "verified_at"),
+        "APPROVED": ("approved_by", "approved_at"),
+        "PUBLISHED": ("published_by", "published_at"),
+    }
+    actor_field, timestamp_field = field_map[to_status]
+    setattr(assessment, actor_field, actor)
+    setattr(assessment, timestamp_field, now)
+    assessment.workflow_status = to_status
+    if to_status == Assessment.WorkflowStatus.PUBLISHED:
+        assessment.is_published = True
+
+    assessment.save()
+
+    log_audit(
+        actor=actor,
+        action=AuditLog.Action.PUBLISH if to_status == "PUBLISHED" else AuditLog.Action.APPROVE,
+        request=request,
+        target_model="Assessment",
+        target_object_id=assessment.pk,
+        description=f"Assessment moved to '{to_status}'",
+        previous_value={"workflow_status": _WORKFLOW_ORDER[current_index]},
+        new_value={"workflow_status": to_status},
+    )
+    return assessment
+
+
+def reject_assessment(
+    *, assessment: "Assessment", actor: User, reason: str, request: HttpRequest | None = None
+) -> "Assessment":
+    """Sends an assessment back to DRAFT for correction, from any
+    in-progress stage (not from PUBLISHED — use amendment requests
+    instead, since published results must not be silently reopened)."""
+    if assessment.workflow_status in (
+        Assessment.WorkflowStatus.DRAFT, Assessment.WorkflowStatus.PUBLISHED,
+    ):
+        raise ValueError(
+            f"Cannot reject an assessment in '{assessment.workflow_status}' status."
+        )
+
+    previous_status = assessment.workflow_status
+    assessment.workflow_status = Assessment.WorkflowStatus.DRAFT
+    assessment.save(update_fields=["workflow_status", "updated_at"])
+
+    log_audit(
+        actor=actor,
+        action=AuditLog.Action.UPDATE,
+        request=request,
+        target_model="Assessment",
+        target_object_id=assessment.pk,
+        description=f"Assessment rejected and returned to Draft: {reason}",
+        previous_value={"workflow_status": previous_status},
+        new_value={"workflow_status": "DRAFT"},
+    )
+    return assessment
+
+
+def request_result_amendment(
+    *,
+    assessment_mark: "AssessmentMark",
+    reason: str,
+    proposed_mark,
+    requested_by: User,
+    request: HttpRequest | None = None,
+) -> "ResultAmendmentRequest":
+    """Spec §14: the only way to change a mark once its Assessment has
+    been PUBLISHED. Captures original_mark as a snapshot so the audit
+    trail is accurate even if the mark changes again before this is
+    reviewed."""
+    from .models import ResultAmendmentRequest
+
+    amendment = ResultAmendmentRequest.objects.create(
+        assessment_mark=assessment_mark,
+        reason=reason,
+        original_mark=assessment_mark.marks_obtained,
+        proposed_mark=proposed_mark,
+        requested_by=requested_by,
+    )
+    log_audit(
+        actor=requested_by,
+        action=AuditLog.Action.OTHER,
+        request=request,
+        target_model="ResultAmendmentRequest",
+        target_object_id=amendment.pk,
+        description=reason,
+        previous_value={"mark": str(assessment_mark.marks_obtained)},
+        new_value={"proposed_mark": str(proposed_mark)},
+    )
+    return amendment
+
+
+def decide_result_amendment(
+    *,
+    amendment: "ResultAmendmentRequest",
+    approve: bool,
+    reviewed_by: User,
+    comment: str = "",
+    request: HttpRequest | None = None,
+) -> "ResultAmendmentRequest":
+    """Applies or rejects a pending amendment. Approving is the *only*
+    code path permitted to mutate marks.marks_obtained on a mark whose
+    Assessment is already PUBLISHED (spec §14 'prevent unrestricted
+    modification')."""
+    from django.utils import timezone
+    from .models import ResultAmendmentRequest
+
+    if amendment.status != ResultAmendmentRequest.Status.PENDING:
+        raise ValueError("This amendment request has already been decided.")
+
+    amendment.reviewed_by = reviewed_by
+    amendment.reviewed_at = timezone.now()
+    amendment.review_comment = comment
+
+    if approve:
+        amendment.status = ResultAmendmentRequest.Status.APPROVED
+        mark = amendment.assessment_mark
+        previous_marks = mark.marks_obtained
+        mark.marks_obtained = amendment.proposed_mark
+        mark.save(update_fields=["marks_obtained", "updated_at"], _bypass_publish_lock=True)
+
+        log_audit(
+            actor=reviewed_by,
+            action=AuditLog.Action.UPDATE,
+            request=request,
+            target_model="AssessmentMark",
+            target_object_id=mark.pk,
+            description=f"Amendment approved: {amendment.reason}",
+            previous_value={"marks_obtained": str(previous_marks)},
+            new_value={"marks_obtained": str(mark.marks_obtained)},
+        )
+    else:
+        amendment.status = ResultAmendmentRequest.Status.REJECTED
+        log_audit(
+            actor=reviewed_by,
+            action=AuditLog.Action.OTHER,
+            request=request,
+            target_model="ResultAmendmentRequest",
+            target_object_id=amendment.pk,
+            description=f"Amendment rejected: {comment}",
+        )
+
+    amendment.save(update_fields=["status", "reviewed_by", "reviewed_at", "review_comment"])
+    return amendment

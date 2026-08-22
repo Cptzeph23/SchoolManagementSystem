@@ -22,6 +22,7 @@ from .models import (
     Guardian,
     LoginHistory,
     Program,
+    ResultAmendmentRequest,
     School,
     Staff,
     StaffQualification,
@@ -264,9 +265,17 @@ class GradingSchemeAdmin(admin.ModelAdmin):
 
 @admin.register(Assessment)
 class AssessmentAdmin(admin.ModelAdmin):
-    list_display = ("title", "class_subject", "term", "component", "date", "is_published")
-    list_filter = ("term", "is_published", "class_subject__class_group__school")
+    list_display = (
+        "title", "class_subject", "term", "component", "date",
+        "workflow_status", "is_published",
+    )
+    list_filter = ("term", "workflow_status", "is_published", "class_subject__class_group__school")
     search_fields = ("title",)
+    readonly_fields = (
+        "submitted_by", "submitted_at", "reviewed_by", "reviewed_at",
+        "verified_by", "verified_at", "approved_by", "approved_at",
+        "published_by", "published_at",
+    )
 
 
 @admin.register(AssessmentMark)
@@ -274,3 +283,25 @@ class AssessmentMarkAdmin(admin.ModelAdmin):
     list_display = ("student", "assessment", "marks_obtained", "recorded_by", "updated_at")
     list_filter = ("assessment__term",)
     search_fields = ("student__admission_number",)
+
+
+@admin.register(ResultAmendmentRequest)
+class ResultAmendmentRequestAdmin(admin.ModelAdmin):
+    """List/review only — approving or rejecting must go through
+    smsApp.services.decide_result_amendment() so the mark change and
+    audit log stay in sync. Direct admin edits to `status` here would
+    silently desync the mark from the request."""
+
+    list_display = (
+        "assessment_mark", "original_mark", "proposed_mark", "status",
+        "requested_by", "requested_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("assessment_mark__student__admission_number", "reason")
+    readonly_fields = (
+        "assessment_mark", "original_mark", "proposed_mark", "requested_by",
+        "requested_at", "reviewed_by", "reviewed_at",
+    )
+
+    def has_add_permission(self, request):
+        return False

@@ -25,6 +25,7 @@ from .models import (
     Guardian,
     LoginHistory,
     Program,
+    ResultAmendmentRequest,
     School,
     Staff,
     Student,
@@ -33,7 +34,16 @@ from .models import (
     TeachingAssignment,
     Term,
 )
-from .services import correct_attendance_record, compute_weighted_average, get_grade_for_mark, validate_grade_bands_no_overlap
+from .services import (
+    correct_attendance_record,
+    compute_weighted_average,
+    decide_result_amendment,
+    get_grade_for_mark,
+    reject_assessment,
+    request_result_amendment,
+    transition_assessment_workflow,
+    validate_grade_bands_no_overlap,
+)
 
 User = get_user_model()
 
@@ -640,3 +650,194 @@ class GradingEngineModelTests(TestCase):
 
     def test_school_ranking_toggle_defaults_to_enabled(self):
         self.assertTrue(self.school.enable_position_ranking)
+
+
+class ResultWorkflowTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(school=self.school, code="MATH", name="Mathematics")
+        self.class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+        structure = AssessmentStructure.objects.create(
+            school=self.school, term=self.term, name="Standard"
+        )
+        final_type = AssessmentType.objects.create(school=self.school, name="Final", code="FINAL")
+        component = AssessmentComponent.objects.create(
+            structure=structure, assessment_type=final_type,
+            weight_percentage=Decimal("100.00"), max_marks=Decimal("100"),
+        )
+        self.assessment = Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=component,
+            title="Final Exam",
+        )
+        self.teacher_user = User.objects.create_user(
+            username="wfteacher", password="pass12345", role=User.Role.TEACHER
+        )
+        self.class_teacher_user = User.objects.create_user(
+            username="wfclassteacher", password="pass12345", role=User.Role.CLASS_TEACHER
+        )
+        self.academic_admin_user = User.objects.create_user(
+            username="wfacadadmin", password="pass12345", role=User.Role.ACADEMIC_ADMIN
+        )
+        student_user = User.objects.create_user(
+            username="wfstudent", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM500",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        self.mark = AssessmentMark.objects.create(
+            assessment=self.assessment, student=self.student, marks_obtained=Decimal("70"),
+        )
+
+    def _advance_to_verified(self):
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.SUBMITTED,
+            actor=self.teacher_user,
+        )
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.REVIEWED,
+            actor=self.class_teacher_user,
+        )
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.VERIFIED,
+            actor=self.academic_admin_user,
+        )
+
+    def test_workflow_cannot_skip_stages(self):
+        with self.assertRaises(ValueError):
+            transition_assessment_workflow(
+                assessment=self.assessment, to_status=Assessment.WorkflowStatus.APPROVED,
+                actor=self.academic_admin_user,
+            )
+
+    def test_full_workflow_publishes_and_sets_is_published(self):
+        self._advance_to_verified()
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.APPROVED,
+            actor=self.academic_admin_user,
+        )
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.PUBLISHED,
+            actor=self.academic_admin_user,
+        )
+        self.assessment.refresh_from_db()
+        self.assertEqual(self.assessment.workflow_status, Assessment.WorkflowStatus.PUBLISHED)
+        self.assertTrue(self.assessment.is_published)
+
+    def test_teacher_cannot_approve_own_submitted_assessment(self):
+        self._advance_to_verified()
+        with self.assertRaises(PermissionError):
+            transition_assessment_workflow(
+                assessment=self.assessment, to_status=Assessment.WorkflowStatus.APPROVED,
+                actor=self.teacher_user,  # same user who submitted it
+            )
+
+    def test_reject_returns_assessment_to_draft(self):
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.SUBMITTED,
+            actor=self.teacher_user,
+        )
+        reject_assessment(
+            assessment=self.assessment, actor=self.academic_admin_user,
+            reason="Marks look incomplete",
+        )
+        self.assessment.refresh_from_db()
+        self.assertEqual(self.assessment.workflow_status, Assessment.WorkflowStatus.DRAFT)
+
+    def test_cannot_modify_published_mark_directly_without_amendment(self):
+        """Spec §14 'Once published, prevent unrestricted modification' is
+        enforced in AssessmentMark.save() — a direct edit must raise, not
+        just be discouraged by convention."""
+        self._advance_to_verified()
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.APPROVED,
+            actor=self.academic_admin_user,
+        )
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.PUBLISHED,
+            actor=self.academic_admin_user,
+        )
+        self.mark.marks_obtained = Decimal("99")
+        with self.assertRaises(ValueError):
+            self.mark.save()
+
+        # The mark must be unchanged in the database.
+        self.mark.refresh_from_db()
+        self.assertEqual(self.mark.marks_obtained, Decimal("70"))
+
+    def test_amendment_request_still_works_after_publish_lock(self):
+        self._advance_to_verified()
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.APPROVED,
+            actor=self.academic_admin_user,
+        )
+        transition_assessment_workflow(
+            assessment=self.assessment, to_status=Assessment.WorkflowStatus.PUBLISHED,
+            actor=self.academic_admin_user,
+        )
+        amendment = request_result_amendment(
+            assessment_mark=self.mark, reason="Marking error found on recheck",
+            proposed_mark=Decimal("75"), requested_by=self.teacher_user,
+        )
+        self.assertEqual(amendment.original_mark, Decimal("70"))
+        self.assertEqual(amendment.status, ResultAmendmentRequest.Status.PENDING)
+
+    def test_approving_amendment_updates_mark_and_logs_audit(self):
+        amendment = request_result_amendment(
+            assessment_mark=self.mark, reason="Marking error found on recheck",
+            proposed_mark=Decimal("75"), requested_by=self.teacher_user,
+        )
+        decide_result_amendment(
+            amendment=amendment, approve=True, reviewed_by=self.academic_admin_user,
+            comment="Confirmed with answer sheet",
+        )
+        self.mark.refresh_from_db()
+        amendment.refresh_from_db()
+        self.assertEqual(self.mark.marks_obtained, Decimal("75"))
+        self.assertEqual(amendment.status, ResultAmendmentRequest.Status.APPROVED)
+
+        audit_entry = AuditLog.objects.filter(
+            target_model="AssessmentMark", target_object_id=str(self.mark.pk)
+        ).first()
+        self.assertIsNotNone(audit_entry)
+        self.assertEqual(audit_entry.previous_value["marks_obtained"], "70")
+        self.assertEqual(audit_entry.new_value["marks_obtained"], "75")
+
+    def test_rejecting_amendment_leaves_mark_unchanged(self):
+        amendment = request_result_amendment(
+            assessment_mark=self.mark, reason="Requesting re-mark",
+            proposed_mark=Decimal("90"), requested_by=self.teacher_user,
+        )
+        decide_result_amendment(
+            amendment=amendment, approve=False, reviewed_by=self.academic_admin_user,
+            comment="Marking confirmed correct as-is",
+        )
+        self.mark.refresh_from_db()
+        self.assertEqual(self.mark.marks_obtained, Decimal("70"))
+
+    def test_cannot_decide_same_amendment_twice(self):
+        amendment = request_result_amendment(
+            assessment_mark=self.mark, reason="Test", proposed_mark=Decimal("80"),
+            requested_by=self.teacher_user,
+        )
+        decide_result_amendment(
+            amendment=amendment, approve=True, reviewed_by=self.academic_admin_user,
+        )
+        with self.assertRaises(ValueError):
+            decide_result_amendment(
+                amendment=amendment, approve=True, reviewed_by=self.academic_admin_user,
+            )
