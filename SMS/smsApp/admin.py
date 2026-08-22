@@ -4,6 +4,11 @@ from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
 from .models import (
     AcademicYear,
+    Assessment,
+    AssessmentComponent,
+    AssessmentMark,
+    AssessmentStructure,
+    AssessmentType,
     AttendanceRecord,
     AttendanceSession,
     AuditLog,
@@ -12,6 +17,8 @@ from .models import (
     ClassSubject,
     Department,
     Enrollment,
+    GradeBand,
+    GradingScheme,
     Guardian,
     LoginHistory,
     Program,
@@ -215,4 +222,55 @@ class AttendanceRecordAdmin(admin.ModelAdmin):
 
     list_display = ("student", "session", "status", "recorded_by", "updated_at")
     list_filter = ("status", "session__term")
+    search_fields = ("student__admission_number",)
+
+
+@admin.register(AssessmentType)
+class AssessmentTypeAdmin(admin.ModelAdmin):
+    list_display = ("name", "code", "school", "is_active")
+    list_filter = ("school", "is_active")
+    search_fields = ("name", "code")
+
+
+class AssessmentComponentInline(admin.TabularInline):
+    model = AssessmentComponent
+    extra = 1
+
+
+@admin.register(AssessmentStructure)
+class AssessmentStructureAdmin(admin.ModelAdmin):
+    list_display = ("name", "term", "subject", "school", "is_active")
+    list_filter = ("school", "term", "is_active")
+    search_fields = ("name",)
+    inlines = [AssessmentComponentInline]
+
+    def total_weight(self, obj):
+        return sum(c.weight_percentage for c in obj.components.all())
+    total_weight.short_description = "Total weight %"
+
+
+class GradeBandInline(admin.TabularInline):
+    model = GradeBand
+    extra = 1
+
+
+@admin.register(GradingScheme)
+class GradingSchemeAdmin(admin.ModelAdmin):
+    list_display = ("name", "school", "is_default", "is_active")
+    list_filter = ("school", "is_default", "is_active")
+    search_fields = ("name",)
+    inlines = [GradeBandInline]
+
+
+@admin.register(Assessment)
+class AssessmentAdmin(admin.ModelAdmin):
+    list_display = ("title", "class_subject", "term", "component", "date", "is_published")
+    list_filter = ("term", "is_published", "class_subject__class_group__school")
+    search_fields = ("title",)
+
+
+@admin.register(AssessmentMark)
+class AssessmentMarkAdmin(admin.ModelAdmin):
+    list_display = ("student", "assessment", "marks_obtained", "recorded_by", "updated_at")
+    list_filter = ("assessment__term",)
     search_fields = ("student__admission_number",)
