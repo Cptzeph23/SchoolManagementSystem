@@ -1,5 +1,6 @@
 # Absolute path: SMS/smsApp/tests.py
 import datetime
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
@@ -8,12 +9,19 @@ from django.urls import reverse
 
 from .models import (
     AcademicYear,
+    Assessment,
+    AssessmentComponent,
+    AssessmentMark,
+    AssessmentStructure,
+    AssessmentType,
     AttendanceRecord,
     AttendanceSession,
     AuditLog,
     Class,
     ClassSubject,
     Enrollment,
+    GradeBand,
+    GradingScheme,
     Guardian,
     LoginHistory,
     Program,
@@ -25,7 +33,7 @@ from .models import (
     TeachingAssignment,
     Term,
 )
-from .services import correct_attendance_record
+from .services import correct_attendance_record, compute_weighted_average, get_grade_for_mark, validate_grade_bands_no_overlap
 
 User = get_user_model()
 
@@ -470,3 +478,165 @@ class AttendanceModelTests(TestCase):
         self.assertIsNotNone(audit_entry)
         self.assertEqual(audit_entry.previous_value["status"], "ABSENT")
         self.assertEqual(audit_entry.new_value["status"], "PRESENT")
+
+
+class GradingEngineModelTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(
+            school=self.school, code="MATH", name="Mathematics"
+        )
+        self.class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+        self.structure = AssessmentStructure.objects.create(
+            school=self.school, term=self.term, name="Standard Term Structure"
+        )
+        self.cat_type = AssessmentType.objects.create(
+            school=self.school, name="CAT", code="CAT"
+        )
+        self.final_type = AssessmentType.objects.create(
+            school=self.school, name="Final Exam", code="FINAL"
+        )
+        self.cat_component = AssessmentComponent.objects.create(
+            structure=self.structure, assessment_type=self.cat_type,
+            weight_percentage=Decimal("30.00"), max_marks=Decimal("30"),
+        )
+        self.final_component = AssessmentComponent.objects.create(
+            structure=self.structure, assessment_type=self.final_type,
+            weight_percentage=Decimal("70.00"), max_marks=Decimal("100"),
+        )
+        student_user = User.objects.create_user(
+            username="s30", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM400",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+
+    def test_component_weight_must_be_between_0_and_100(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AssessmentComponent.objects.create(
+                    structure=self.structure, assessment_type=self.cat_type,
+                    weight_percentage=Decimal("150.00"),
+                )
+
+    def test_only_one_component_per_assessment_type_per_structure(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AssessmentComponent.objects.create(
+                    structure=self.structure, assessment_type=self.cat_type,
+                    weight_percentage=Decimal("10.00"),
+                )
+
+    def test_only_one_default_grading_scheme_per_school(self):
+        scheme1 = GradingScheme.objects.create(
+            school=self.school, name="Scheme A", is_default=True
+        )
+        scheme2 = GradingScheme.objects.create(
+            school=self.school, name="Scheme B", is_default=True
+        )
+        scheme1.refresh_from_db()
+        self.assertFalse(scheme1.is_default)
+        self.assertTrue(scheme2.is_default)
+
+    def test_grade_band_max_must_be_gte_min(self):
+        scheme = GradingScheme.objects.create(school=self.school, name="Bad Scheme")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                GradeBand.objects.create(
+                    scheme=scheme, min_mark=Decimal("80"), max_mark=Decimal("50"),
+                    grade="A", grade_point=Decimal("4.0"),
+                )
+
+    def test_get_grade_for_mark_resolves_correct_band(self):
+        scheme = GradingScheme.objects.create(school=self.school, name="Standard")
+        GradeBand.objects.create(
+            scheme=scheme, min_mark=Decimal("80"), max_mark=Decimal("100"),
+            grade="A", grade_point=Decimal("4.0"),
+        )
+        GradeBand.objects.create(
+            scheme=scheme, min_mark=Decimal("70"), max_mark=Decimal("79.99"),
+            grade="B", grade_point=Decimal("3.0"),
+        )
+        band = get_grade_for_mark(scheme, Decimal("85"))
+        self.assertEqual(band.grade, "A")
+        band2 = get_grade_for_mark(scheme, Decimal("75"))
+        self.assertEqual(band2.grade, "B")
+        self.assertIsNone(get_grade_for_mark(scheme, Decimal("40")))
+
+    def test_validate_grade_bands_no_overlap_detects_overlap(self):
+        scheme = GradingScheme.objects.create(school=self.school, name="Overlapping")
+        GradeBand.objects.create(
+            scheme=scheme, min_mark=Decimal("70"), max_mark=Decimal("100"),
+            grade="A", grade_point=Decimal("4.0"),
+        )
+        GradeBand.objects.create(
+            scheme=scheme, min_mark=Decimal("60"), max_mark=Decimal("75"),
+            grade="B", grade_point=Decimal("3.0"),
+        )
+        errors = validate_grade_bands_no_overlap(scheme)
+        self.assertEqual(len(errors), 1)
+
+    def test_compute_weighted_average_uses_configured_weights_not_hardcoded(self):
+        cat_assessment = Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=self.cat_component,
+            title="CAT 1",
+        )
+        final_assessment = Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=self.final_component,
+            title="Final Exam",
+        )
+        AssessmentMark.objects.create(
+            assessment=cat_assessment, student=self.student, marks_obtained=Decimal("24"),
+        )  # 24/30 -> 80% of 30% weight = 24.0
+        AssessmentMark.objects.create(
+            assessment=final_assessment, student=self.student, marks_obtained=Decimal("70"),
+        )  # 70/100 -> 70% of 70% weight = 49.0
+
+        result = compute_weighted_average(self.student, self.class_subject, self.term)
+        self.assertEqual(result["weighted_total"], Decimal("73.00"))
+        self.assertTrue(result["is_complete"])
+
+    def test_compute_weighted_average_flags_incomplete_when_marks_missing(self):
+        Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=self.cat_component,
+            title="CAT 1",
+        )
+        Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=self.final_component,
+            title="Final Exam",
+        )
+        result = compute_weighted_average(self.student, self.class_subject, self.term)
+        self.assertFalse(result["is_complete"])
+        self.assertEqual(result["components_graded"], 0)
+
+    def test_assessment_mark_unique_per_assessment_per_student(self):
+        assessment = Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=self.cat_component,
+            title="CAT 1",
+        )
+        AssessmentMark.objects.create(
+            assessment=assessment, student=self.student, marks_obtained=Decimal("20"),
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AssessmentMark.objects.create(
+                    assessment=assessment, student=self.student, marks_obtained=Decimal("25"),
+                )
+
+    def test_school_ranking_toggle_defaults_to_enabled(self):
+        self.assertTrue(self.school.enable_position_ranking)
