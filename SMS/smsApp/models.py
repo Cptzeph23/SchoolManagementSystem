@@ -1082,11 +1082,28 @@ class Assessment(models.Model):
         Staff, on_delete=models.SET_NULL, related_name="assessments_created",
         blank=True, null=True,
     )
-    is_published = models.BooleanField(
-        default=False,
-        help_text="Marks visible to students/parents only once published "
-                   "(spec §14 Result Processing Workflow governs this fully).",
-    )
+        # --- Phase 8: Result Processing Workflow (spec §14) ---
+    class WorkflowStatus(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        SUBMITTED = "SUBMITTED", "Submitted"
+        REVIEWED = "REVIEWED", "Reviewed"
+        VERIFIED = "VERIFIED", "Verified"
+        APPROVED = "APPROVED", "Approved"
+        PUBLISHED = "PUBLISHED", "Published"
+        REJECTED = "REJECTED", "Rejected"
+
+    workflow_status = models.CharField(max_length=10, choices=WorkflowStatus.choices, default=WorkflowStatus.DRAFT, db_index=True)
+    submitted_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_submitted", blank=True, null=True)
+    submitted_at = models.DateTimeField(blank=True, null=True)
+    reviewed_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_reviewed", blank=True, null=True)
+    reviewed_at = models.DateTimeField(blank=True, null=True)
+    verified_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_verified", blank=True, null=True)
+    verified_at = models.DateTimeField(blank=True, null=True)
+    approved_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_approved", blank=True, null=True)
+    approved_at = models.DateTimeField(blank=True, null=True)
+    published_by = models.ForeignKey("smsApp.User", on_delete=models.SET_NULL, related_name="assessments_published", blank=True, null=True)
+    published_at = models.DateTimeField(blank=True, null=True)
+    is_published = models.BooleanField(default=False, help_text="Set automatically when workflow_status reaches PUBLISHED — do not set directly.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
