@@ -93,6 +93,12 @@ class School(models.Model):
     phone_number = models.CharField(max_length=20, blank=True)
     email = models.EmailField(blank=True)
     established_date = models.DateField(blank=True, null=True)
+    enable_position_ranking = models.BooleanField(
+        default=True,
+        help_text="Spec §13: some schools choose not to rank students. "
+                   "Result-processing/report-book views must check this "
+                   "flag before showing or computing positions.",
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -895,3 +901,235 @@ class AttendanceRecord(models.Model):
 
     def __str__(self) -> str:
         return f"{self.student} - {self.status} ({self.session.date})"
+
+
+# =============================================================================
+# Phase 7 — Assessment & Grading engine
+# Spec refs: §12 (Assessment/Examination — configurable weighting, never
+# hard-coded percentages), §13 (Grading Engine — configurable grade bands,
+# never hard-coded grades; ranking configurable per school, see
+# School.enable_position_ranking above).
+# =============================================================================
+
+class AssessmentType(models.Model):
+    """Catalog entry — spec §12 examples: CAT, Assignment, Quiz, Midterm,
+    End-term Exam, Final Exam, Practical, Project, Continuous Assessment.
+    School-scoped (not a hard-coded global enum) so each school can define
+    its own set, per §12 'Do not hard-code assessment percentages' /
+    'Allow administrators to configure assessment structures'."""
+
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="assessment_types")
+    name = models.CharField(max_length=100, help_text="e.g. 'CAT', 'Midterm', 'Final Exam'")
+    code = models.CharField(max_length=20)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "assessment_types"
+        ordering = ["school", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["school", "code"], name="uniq_assessment_type_code_per_school"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.school.code})"
+
+
+class AssessmentStructure(models.Model):
+    """A named weighting scheme (spec §12 example: CAT1=10%, Assignment=10%,
+    CAT2=10%, Midterm=20%, Final=50%). Scoped to a Term so structures can
+    differ year to year; `subject` is optional — null means "applies to
+    every subject in this term unless a subject-specific structure exists."
+    Weight validation (must sum to 100%) is NOT a DB constraint (components
+    are added incrementally) — see services.validate_structure_weight()."""
+
+    school = models.ForeignKey(
+        School, on_delete=models.CASCADE, related_name="assessment_structures"
+    )
+    term = models.ForeignKey(
+        Term, on_delete=models.CASCADE, related_name="assessment_structures"
+    )
+    subject = models.ForeignKey(
+        Subject, on_delete=models.CASCADE, related_name="assessment_structures",
+        blank=True, null=True,
+        help_text="Leave blank to apply this structure to all subjects in the term.",
+    )
+    name = models.CharField(max_length=150, help_text="e.g. 'Standard Term Structure'")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "assessment_structures"
+        ordering = ["term", "name"]
+
+    def __str__(self) -> str:
+        scope = self.subject.name if self.subject else "All subjects"
+        return f"{self.name} - {self.term} ({scope})"
+
+
+class AssessmentComponent(models.Model):
+    """One weighted line item within an AssessmentStructure —
+    spec §12's 'CAT 1 = 10%' rows."""
+
+    structure = models.ForeignKey(
+        AssessmentStructure, on_delete=models.CASCADE, related_name="components"
+    )
+    assessment_type = models.ForeignKey(
+        AssessmentType, on_delete=models.CASCADE, related_name="structure_components"
+    )
+    weight_percentage = models.DecimalField(max_digits=5, decimal_places=2)
+    max_marks = models.DecimalField(
+        max_digits=6, decimal_places=2, default=100,
+        help_text="Marks this component is scored out of before weighting is applied.",
+    )
+    order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        db_table = "assessment_components"
+        ordering = ["structure", "order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["structure", "assessment_type"],
+                name="uniq_assessment_type_per_structure",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(weight_percentage__gte=0) & models.Q(weight_percentage__lte=100),
+                name="component_weight_between_0_and_100",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.assessment_type.name} - {self.weight_percentage}%"
+
+
+class GradingScheme(models.Model):
+    """Spec §13: configurable grading scheme, never hard-coded. A school
+    may define multiple schemes (e.g. one for school-style A-E grades, a
+    different GPA scale for a university-style program)."""
+
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="grading_schemes")
+    name = models.CharField(max_length=150, help_text="e.g. 'Standard 8-4-4 Grading'")
+    is_default = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "grading_schemes"
+        ordering = ["school", "name"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.school.code})"
+
+    def save(self, *args, **kwargs):
+        if self.is_default:
+            GradingScheme.objects.filter(
+                school=self.school, is_default=True
+            ).exclude(pk=self.pk).update(is_default=False)
+        super().save(*args, **kwargs)
+
+
+class GradeBand(models.Model):
+    """Spec §13: min mark, max mark, grade, grade point, remark.
+    Example: 80-100 = A = 4.0 points. Overlap between bands within the
+    same scheme is checked in services.validate_grade_bands_no_overlap()
+    (cross-row validation isn't expressible as a simple DB constraint)."""
+
+    scheme = models.ForeignKey(GradingScheme, on_delete=models.CASCADE, related_name="bands")
+    min_mark = models.DecimalField(max_digits=5, decimal_places=2)
+    max_mark = models.DecimalField(max_digits=5, decimal_places=2)
+    grade = models.CharField(max_length=10, help_text="e.g. 'A', 'B+', 'Pass'")
+    grade_point = models.DecimalField(max_digits=3, decimal_places=1, default=0)
+    remark = models.CharField(max_length=100, blank=True, help_text="e.g. 'Excellent'")
+
+    class Meta:
+        db_table = "grade_bands"
+        ordering = ["scheme", "-min_mark"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scheme", "grade"], name="uniq_grade_per_scheme"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(max_mark__gte=models.F("min_mark")),
+                name="grade_band_max_gte_min",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.grade} ({self.min_mark}-{self.max_mark})"
+
+
+class Assessment(models.Model):
+    """A specific, gradable event — e.g. 'CAT 1' for Grade 10 Mathematics,
+    Term 1 2026. Links back to the AssessmentComponent that defines its
+    weight, so the grading engine (services.compute_weighted_average) can
+    look up how much this assessment counts for."""
+
+    class_subject = models.ForeignKey(
+        ClassSubject, on_delete=models.CASCADE, related_name="assessments"
+    )
+    term = models.ForeignKey(Term, on_delete=models.CASCADE, related_name="assessments")
+    component = models.ForeignKey(
+        AssessmentComponent, on_delete=models.PROTECT, related_name="assessments",
+        help_text="Defines this assessment's weight and max marks.",
+    )
+    title = models.CharField(max_length=150, help_text="e.g. 'CAT 1 - Algebra'")
+    date = models.DateField(blank=True, null=True)
+    created_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, related_name="assessments_created",
+        blank=True, null=True,
+    )
+    is_published = models.BooleanField(
+        default=False,
+        help_text="Marks visible to students/parents only once published "
+                   "(spec §14 Result Processing Workflow governs this fully).",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "assessments"
+        ordering = ["-date"]
+
+    def __str__(self) -> str:
+        return f"{self.title} - {self.class_subject}"
+
+
+class AssessmentMark(models.Model):
+    """A student's raw score on one Assessment. Marks entered here are raw
+    (out of component.max_marks) — weighted contribution to the subject
+    total is computed on read by services.compute_weighted_average(),
+    never stored redundantly."""
+
+    assessment = models.ForeignKey(
+        Assessment, on_delete=models.CASCADE, related_name="marks"
+    )
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="assessment_marks"
+    )
+    marks_obtained = models.DecimalField(max_digits=6, decimal_places=2)
+    remarks = models.CharField(max_length=255, blank=True)
+    recorded_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="marks_recorded",
+        blank=True, null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "assessment_marks"
+        ordering = ["assessment", "student"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["assessment", "student"], name="uniq_mark_per_assessment_student"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(marks_obtained__gte=0), name="marks_obtained_non_negative"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.student} - {self.assessment} - {self.marks_obtained}"
