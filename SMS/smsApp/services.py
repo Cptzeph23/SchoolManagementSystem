@@ -8,6 +8,7 @@ Django views today and DRF API views later (§3 'API-first architecture').
 """
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from django.http import HttpRequest
@@ -132,3 +133,74 @@ def correct_attendance_record(
         new_value={"status": record.status, "notes": record.notes},
     )
     return record
+
+
+# =============================================================================
+# Phase 7 — Grading engine (spec §13). All lookups are data-driven off
+# GradingScheme/GradeBand/AssessmentComponent — nothing here hard-codes a
+# grade boundary or a weighting percentage.
+# =============================================================================
+
+def get_grade_for_mark(scheme, mark) -> "GradeBand | None":
+    """Spec §13: resolve a numeric mark to a GradeBand under the given
+    scheme. Returns None if no band covers the mark (a configuration gap
+    the caller/UI should surface, not silently default from)."""
+    return scheme.bands.filter(min_mark__lte=mark, max_mark__gte=mark).first()
+
+
+def validate_grade_bands_no_overlap(scheme) -> list[str]:
+    """Returns a list of human-readable overlap errors for the scheme's
+    bands, empty if none. Not a DB constraint (cross-row check) — called
+    from the admin/service layer before treating a scheme as usable."""
+    bands = list(scheme.bands.order_by("min_mark"))
+    errors: list[str] = []
+    for i in range(len(bands) - 1):
+        current, nxt = bands[i], bands[i + 1]
+        if current.max_mark >= nxt.min_mark:
+            errors.append(
+                f"'{current.grade}' ({current.min_mark}-{current.max_mark}) overlaps "
+                f"'{nxt.grade}' ({nxt.min_mark}-{nxt.max_mark})"
+            )
+    return errors
+
+
+def compute_weighted_average(student, class_subject, term) -> dict[str, Any]:
+    """Spec §12/§13: weighted total across all Assessments for a student
+    in a ClassSubject/Term, using each Assessment's linked
+    AssessmentComponent for weight and max_marks — no percentages are
+    hard-coded here, they're read entirely from the configured structure.
+
+    Returns a dict rather than a bare number because callers (report book,
+    Phase 15) need the raw weighted score, the count of graded components,
+    and whether every configured component has a mark yet.
+    """
+    assessments = (
+        class_subject.assessments
+        .filter(term=term)
+        .select_related("component")
+    )
+
+    weighted_total = Decimal("0")
+    weight_covered = Decimal("0")
+    components_graded = 0
+    components_total = assessments.count()
+
+    for assessment in assessments:
+        mark_row = assessment.marks.filter(student=student).first()
+        if mark_row is None:
+            continue
+        component = assessment.component
+        if component.max_marks <= 0:
+            continue
+        proportion = mark_row.marks_obtained / component.max_marks
+        weighted_total += proportion * component.weight_percentage
+        weight_covered += component.weight_percentage
+        components_graded += 1
+
+    return {
+        "weighted_total": weighted_total.quantize(Decimal("0.01")),
+        "weight_covered": weight_covered.quantize(Decimal("0.01")),
+        "components_graded": components_graded,
+        "components_total": components_total,
+        "is_complete": components_graded == components_total and components_total > 0,
+    }
