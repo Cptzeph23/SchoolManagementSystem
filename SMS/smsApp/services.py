@@ -790,3 +790,197 @@ def verify_transcript(verification_code) -> dict[str, Any]:
         "cgpa": transcript.cgpa,
         "graduation_status": transcript.get_graduation_status_display(),
     }
+
+
+# =============================================================================
+# Phase 11 — LMS Module (spec §10)
+# =============================================================================
+
+def submit_assignment(
+    *,
+    assignment: "Assignment",
+    student: Student,
+    submitted_file=None,
+    submitted_text: str = "",
+    request: HttpRequest | None = None,
+):
+    """Spec §10 'Upload submissions' / 'Resubmit where permitted'. Single
+    write path for both first submission and resubmission — enforces:
+    - a first submission is always allowed (while published);
+    - a second+ submission requires assignment.allow_resubmission;
+    - `is_late` is computed against the deadline at submission time and
+      never recomputed later, so it stays an honest historical record
+      even if the deadline is edited afterward.
+    """
+    from django.utils import timezone
+
+    from .models import AssignmentSubmission
+
+    existing = AssignmentSubmission.objects.filter(
+        assignment=assignment, student=student
+    ).first()
+
+    if existing is not None and not assignment.allow_resubmission:
+        raise ValueError(
+            "This assignment does not allow resubmission; a submission "
+            "already exists for this student."
+        )
+
+    now = timezone.now()
+    is_late = now > assignment.deadline
+
+    if existing is None:
+        submission = AssignmentSubmission.objects.create(
+            assignment=assignment, student=student,
+            submitted_file=submitted_file, submitted_text=submitted_text,
+            is_late=is_late, status=AssignmentSubmission.Status.SUBMITTED,
+        )
+    else:
+        previous_value = {
+            "submitted_text": existing.submitted_text,
+            "attempt_number": existing.attempt_number,
+        }
+        existing.submitted_file = submitted_file
+        existing.submitted_text = submitted_text
+        existing.attempt_number += 1
+        existing.is_late = is_late
+        existing.status = AssignmentSubmission.Status.RESUBMITTED
+        # A resubmission supersedes any prior grade — re-grading is required.
+        existing.marks_obtained = None
+        existing.feedback = ""
+        existing.graded_by = None
+        existing.graded_at = None
+        existing.save()
+        submission = existing
+
+        log_audit(
+            actor=student.user, action=AuditLog.Action.UPDATE, request=request,
+            target_model="AssignmentSubmission", target_object_id=submission.pk,
+            description=f"Resubmitted {assignment.title}",
+            previous_value=previous_value,
+            new_value={"attempt_number": submission.attempt_number},
+        )
+
+    return submission
+
+
+def grade_assignment_submission(
+    *,
+    submission: "AssignmentSubmission",
+    marks_obtained: Decimal,
+    feedback: str,
+    graded_by: Staff,
+    request: HttpRequest | None = None,
+):
+    """Spec §10 'Mark assignments' / 'Provide feedback' (Teacher Dashboard,
+    §9)."""
+    from django.utils import timezone
+
+    from .models import AssignmentSubmission
+
+    if marks_obtained > submission.assignment.max_marks:
+        raise ValueError(
+            f"marks_obtained ({marks_obtained}) cannot exceed "
+            f"the assignment's max_marks ({submission.assignment.max_marks})."
+        )
+
+    submission.marks_obtained = marks_obtained
+    submission.feedback = feedback
+    submission.graded_by = graded_by
+    submission.graded_at = timezone.now()
+    submission.status = AssignmentSubmission.Status.GRADED
+    submission.save()
+
+    log_audit(
+        actor=graded_by.user, action=AuditLog.Action.OTHER, request=request,
+        target_model="AssignmentSubmission", target_object_id=submission.pk,
+        description=f"Graded submission for {submission.assignment.title}",
+        new_value={"marks_obtained": str(marks_obtained)},
+    )
+    return submission
+
+
+def submit_quiz_attempt(
+    *,
+    attempt: "QuizAttempt",
+    answers: dict[int, dict],
+) -> "QuizAttempt":
+    """Spec §10 'Implement automatic marking where appropriate'.
+
+    `answers` maps question_id -> {"option_ids": [...]} for
+    MULTIPLE_CHOICE/TRUE_FALSE/MULTIPLE_ANSWER, or {"text": "..."} for
+    SHORT_ANSWER.
+
+    Auto-grades objective question types by exact-match: a MULTIPLE_CHOICE
+    or TRUE_FALSE question is correct if the single selected option is the
+    correct one; a MULTIPLE_ANSWER question is correct only if the
+    selected set exactly equals the correct set (no partial credit in
+    this MVP — see docstring note below for extending to partial credit).
+    SHORT_ANSWER questions are recorded but left ungraded
+    (marks_awarded=None) for manual grading.
+    """
+    from django.utils import timezone
+
+    from .models import QuizAnswer
+
+    auto_score = Decimal("0")
+    has_ungraded_manual = False
+
+    for question in attempt.quiz.questions.all():
+        payload = answers.get(question.pk, {})
+        answer = QuizAnswer.objects.create(attempt=attempt, question=question)
+
+        if question.question_type == question.QuestionType.SHORT_ANSWER:
+            answer.text_answer = payload.get("text", "")
+            answer.marks_awarded = None
+            answer.save()
+            has_ungraded_manual = True
+            continue
+
+        option_ids = set(payload.get("option_ids", []))
+        answer.selected_options.set(option_ids)
+
+        correct_ids = set(
+            question.options.filter(is_correct=True).values_list("pk", flat=True)
+        )
+        is_correct = option_ids == correct_ids
+        answer.marks_awarded = question.marks if is_correct else Decimal("0")
+        answer.save()
+        auto_score += answer.marks_awarded
+
+    attempt.auto_score = auto_score
+    attempt.submitted_at = timezone.now()
+    attempt.is_fully_graded = not has_ungraded_manual
+    attempt.save()
+    return attempt
+
+
+def grade_quiz_short_answer(
+    *, answer: "QuizAnswer", marks_awarded: Decimal
+) -> "QuizAnswer":
+    """Manual grading step for SHORT_ANSWER questions within an attempt.
+    Once every short-answer question in the attempt has been graded,
+    the attempt is marked fully graded and its manual_score is totaled."""
+    if marks_awarded > answer.question.marks:
+        raise ValueError(
+            f"marks_awarded ({marks_awarded}) cannot exceed the "
+            f"question's marks ({answer.question.marks})."
+        )
+
+    answer.marks_awarded = marks_awarded
+    answer.save()
+
+    attempt = answer.attempt
+    manual_questions = attempt.quiz.questions.filter(
+        question_type="SHORT_ANSWER"
+    )
+    manual_answers = attempt.answers.filter(question__in=manual_questions)
+
+    if not manual_answers.filter(marks_awarded__isnull=True).exists():
+        attempt.manual_score = sum(
+            (a.marks_awarded or Decimal("0")) for a in manual_answers
+        )
+        attempt.is_fully_graded = True
+        attempt.save()
+
+    return answer
