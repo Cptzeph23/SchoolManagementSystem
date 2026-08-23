@@ -13,7 +13,7 @@ from typing import Any
 
 from django.http import HttpRequest
 
-from .models import Assessment, AuditLog, ClassSubject, LoginHistory, Student, User
+from .models import Assessment, AuditLog, ClassSubject, LoginHistory, Student, Term, User
 
 
 def _client_ip(request: HttpRequest | None) -> str | None:
@@ -164,11 +164,19 @@ def validate_grade_bands_no_overlap(scheme) -> list[str]:
     return errors
 
 
-def compute_weighted_average(student, class_subject, term) -> dict[str, Any]:
+def compute_weighted_average(
+    student, class_subject, term, *, published_only: bool = False
+) -> dict[str, Any]:
     """Spec §12/§13: weighted total across all Assessments for a student
     in a ClassSubject/Term, using each Assessment's linked
     AssessmentComponent for weight and max_marks — no percentages are
     hard-coded here, they're read entirely from the configured structure.
+
+    `published_only=True` restricts to Assessments whose workflow has
+    reached PUBLISHED (spec §14) — used by transcript generation (Phase
+    10), which must never include draft/unapproved marks in an official
+    academic record. Report books (Phase 9) intentionally leave this
+    False, since a term-in-progress report legitimately shows draft marks.
 
     Returns a dict rather than a bare number because callers (report book,
     Phase 15) need the raw weighted score, the count of graded components,
@@ -179,6 +187,8 @@ def compute_weighted_average(student, class_subject, term) -> dict[str, Any]:
         .filter(term=term)
         .select_related("component")
     )
+    if published_only:
+        assessments = assessments.filter(workflow_status=Assessment.WorkflowStatus.PUBLISHED)
 
     weighted_total = Decimal("0")
     weight_covered = Decimal("0")
@@ -602,3 +612,181 @@ def generate_batch_reports(
         generate_report_pdf(report_card=card, generated_by=generated_by, request=request)
         cards.append(card)
     return cards
+
+
+# =============================================================================
+# Phase 10 — Transcript System (spec §16). See Transcript/TranscriptEntry
+# docstrings in models.py for why entries are snapshotted rather than
+# recomputed live, and for the "secure PDF" interpretation.
+# =============================================================================
+
+def generate_transcript(
+    *, student: "Student", generated_by: User, request: HttpRequest | None = None
+) -> "Transcript":
+    """Builds a full cumulative transcript from every PUBLISHED assessment
+    across every term/class_subject the student has been enrolled in,
+    snapshots it into TranscriptEntry rows, computes GPA/CGPA, renders the
+    PDF, and stamps a verification_code + content_hash."""
+    import hashlib
+
+    from django.core.files.base import ContentFile
+    from django.template.loader import render_to_string
+    from django.utils import timezone
+    from weasyprint import HTML
+
+    from .models import ClassSubject as ClassSubjectModel, GradingScheme, Transcript as TranscriptModel
+
+    school = student.school
+    grading_scheme = GradingScheme.objects.filter(school=school, is_default=True).first()
+
+    class_subjects = (
+        ClassSubjectModel.objects.filter(enrollments__student=student)
+        .distinct()
+        .select_related("subject", "class_group")
+    )
+
+    entry_rows = []
+    latest_term = None
+    for class_subject in class_subjects:
+        terms = Term.objects.filter(
+            assessments__class_subject=class_subject,
+            assessments__marks__student=student,
+            assessments__workflow_status=Assessment.WorkflowStatus.PUBLISHED,
+        ).distinct()
+
+        for term in terms:
+            summary = compute_weighted_average(
+                student, class_subject, term, published_only=True
+            )
+            if summary["components_graded"] == 0:
+                continue
+
+            band = None
+            if grading_scheme:
+                band = get_grade_for_mark(grading_scheme, summary["weighted_total"])
+
+            entry_rows.append(
+                {
+                    "subject": class_subject.subject,
+                    "subject_name": class_subject.subject.name,
+                    "academic_year_label": term.academic_year.name,
+                    "term_label": term.name,
+                    "score": summary["weighted_total"],
+                    "grade": band.grade if band else "",
+                    "grade_point": band.grade_point if band else None,
+                    "credit_hours": class_subject.subject.credit_hours,
+                    "term_obj": term,
+                }
+            )
+            if latest_term is None or term.start_date > latest_term.start_date:
+                latest_term = term
+
+    def _grade_points(rows):
+        return [r["grade_point"] for r in rows if r["grade_point"] is not None]
+
+    cgpa = None
+    all_points = _grade_points(entry_rows)
+    if all_points:
+        weighted_sum = Decimal("0")
+        weight_sum = Decimal("0")
+        for row in entry_rows:
+            if row["grade_point"] is None:
+                continue
+            credit = row["credit_hours"] or Decimal("1")
+            weighted_sum += row["grade_point"] * credit
+            weight_sum += credit
+        cgpa = (weighted_sum / weight_sum).quantize(Decimal("0.01")) if weight_sum else None
+
+    gpa = None
+    if latest_term is not None:
+        latest_points = _grade_points(
+            [r for r in entry_rows if r["term_obj"] == latest_term]
+        )
+        if latest_points:
+            gpa = (sum(latest_points) / len(latest_points)).quantize(Decimal("0.01"))
+
+    graduation_status = TranscriptModel.GraduationStatus.IN_PROGRESS
+    if student.status == Student.Status.GRADUATED:
+        graduation_status = TranscriptModel.GraduationStatus.GRADUATED
+    elif student.status in (
+        Student.Status.WITHDRAWN, Student.Status.EXPELLED, Student.Status.TRANSFERRED,
+    ):
+        graduation_status = TranscriptModel.GraduationStatus.NOT_GRADUATED
+
+    transcript = TranscriptModel.objects.create(
+        student=student,
+        generated_by=generated_by,
+        academic_status=student.status,
+        graduation_status=graduation_status,
+        gpa=gpa,
+        cgpa=cgpa,
+    )
+
+    for row in entry_rows:
+        transcript.entries.create(
+            subject=row["subject"],
+            subject_name=row["subject_name"],
+            academic_year_label=row["academic_year_label"],
+            term_label=row["term_label"],
+            score=row["score"],
+            grade=row["grade"],
+            grade_point=row["grade_point"],
+            credit_hours=row["credit_hours"],
+        )
+
+    # Content hash over a canonical representation of what was issued, so
+    # a later dispute can prove whether a PDF matches what was generated.
+    canonical = "|".join(
+        f"{r['subject_name']}:{r['term_label']}:{r['score']}:{r['grade']}"
+        for r in sorted(entry_rows, key=lambda r: (r["academic_year_label"], r["term_label"], r["subject_name"]))
+    )
+    canonical += f"|gpa={gpa}|cgpa={cgpa}|status={student.status}"
+    transcript.content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    transcript.save(update_fields=["content_hash"])
+
+    html_content = render_to_string(
+        "reports/transcript.html",
+        {
+            "school": school,
+            "student": student,
+            "transcript": transcript,
+            "entries": transcript.entries.all(),
+        },
+    )
+    pdf_bytes = HTML(string=html_content).write_pdf()
+    transcript.pdf_file.save(
+        f"transcript_{student.admission_number}_{transcript.pk}.pdf",
+        ContentFile(pdf_bytes), save=True,
+    )
+
+    log_audit(
+        actor=generated_by,
+        action=AuditLog.Action.OTHER,
+        request=request,
+        target_model="Transcript",
+        target_object_id=transcript.pk,
+        description=f"Generated transcript for {student}",
+    )
+    return transcript
+
+
+def verify_transcript(verification_code) -> dict[str, Any]:
+    """Spec §16 'Generate secure PDF documents' — the verification half of
+    that: given the UUID printed on an issued transcript, confirm it's
+    genuine without exposing the full academic record to whoever holds
+    the code."""
+    from .models import Transcript as TranscriptModel
+
+    transcript = TranscriptModel.objects.filter(verification_code=verification_code).first()
+    if transcript is None:
+        return {"valid": False}
+
+    return {
+        "valid": True,
+        "student_name": transcript.student.user.get_full_name()
+        or transcript.student.user.username,
+        "admission_number": transcript.student.admission_number,
+        "generated_at": transcript.generated_at,
+        "cgpa": transcript.cgpa,
+        "graduation_status": transcript.get_graduation_status_display(),
+    }
