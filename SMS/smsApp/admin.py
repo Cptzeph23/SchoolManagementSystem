@@ -9,19 +9,30 @@ from .models import (
     AssessmentMark,
     AssessmentStructure,
     AssessmentType,
+    Assignment,
+    AssignmentResource,
+    AssignmentSubmission,
     AttendanceRecord,
     AttendanceSession,
     AuditLog,
     Campus,
     Class,
     ClassSubject,
+    CourseMaterial,
     Department,
+    Discussion,
+    DiscussionReply,
     Enrollment,
     GradeBand,
     GradingScheme,
     Guardian,
     LoginHistory,
     Program,
+    Quiz,
+    QuizAnswer,
+    QuizAttempt,
+    QuizOption,
+    QuizQuestion,
     ReportCard,
     ReportTemplate,
     ResultAmendmentRequest,
@@ -373,3 +384,94 @@ class TranscriptAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(CourseMaterial)
+class CourseMaterialAdmin(admin.ModelAdmin):
+    list_display = ("title", "material_type", "class_subject", "term", "is_published", "order")
+    list_filter = ("material_type", "term", "is_published")
+    search_fields = ("title",)
+
+
+class AssignmentResourceInline(admin.TabularInline):
+    model = AssignmentResource
+    extra = 0
+
+
+@admin.register(Assignment)
+class AssignmentAdmin(admin.ModelAdmin):
+    list_display = (
+        "title", "class_subject", "term", "deadline", "max_marks",
+        "allow_resubmission", "is_published",
+    )
+    list_filter = ("term", "submission_format", "allow_resubmission", "is_published")
+    search_fields = ("title",)
+    inlines = [AssignmentResourceInline]
+
+
+@admin.register(AssignmentSubmission)
+class AssignmentSubmissionAdmin(admin.ModelAdmin):
+    """Grading should go through smsApp.services.grade_assignment_submission()
+    so marks changes stay audit-logged — this admin view is for
+    oversight/browsing, not the primary grading workflow."""
+
+    list_display = (
+        "student", "assignment", "attempt_number", "status", "is_late",
+        "marks_obtained", "submitted_at",
+    )
+    list_filter = ("status", "is_late", "assignment__term")
+    search_fields = ("student__admission_number", "assignment__title")
+
+
+class QuizOptionInline(admin.TabularInline):
+    model = QuizOption
+    extra = 2
+
+
+@admin.register(QuizQuestion)
+class QuizQuestionAdmin(admin.ModelAdmin):
+    list_display = ("question_text", "quiz", "question_type", "marks", "order")
+    list_filter = ("quiz", "question_type")
+    inlines = [QuizOptionInline]
+
+
+class QuizQuestionInline(admin.TabularInline):
+    model = QuizQuestion
+    extra = 1
+    show_change_link = True
+
+
+@admin.register(Quiz)
+class QuizAdmin(admin.ModelAdmin):
+    list_display = ("title", "class_subject", "term", "max_attempts", "is_published")
+    list_filter = ("term", "is_published")
+    search_fields = ("title",)
+    inlines = [QuizQuestionInline]
+
+
+@admin.register(QuizAttempt)
+class QuizAttemptAdmin(admin.ModelAdmin):
+    """Auto-grading runs via smsApp.services.submit_quiz_attempt(); manual
+    short-answer grading via grade_quiz_short_answer() — both keep
+    auto_score/manual_score/is_fully_graded in sync. Editing scores
+    directly here bypasses that and is for emergency correction only."""
+
+    list_display = (
+        "student", "quiz", "attempt_number", "auto_score", "manual_score",
+        "is_fully_graded", "submitted_at",
+    )
+    list_filter = ("quiz", "is_fully_graded")
+    search_fields = ("student__admission_number",)
+
+
+class DiscussionReplyInline(admin.TabularInline):
+    model = DiscussionReply
+    extra = 0
+
+
+@admin.register(Discussion)
+class DiscussionAdmin(admin.ModelAdmin):
+    list_display = ("title", "thread_type", "class_subject", "term", "created_by", "is_pinned", "created_at")
+    list_filter = ("thread_type", "term", "is_pinned")
+    search_fields = ("title",)
+    inlines = [DiscussionReplyInline]
