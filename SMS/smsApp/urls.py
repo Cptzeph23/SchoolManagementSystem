@@ -22,4 +22,12 @@ urlpatterns = [
         views.ReportCardPDFView.as_view(), name="report_card_pdf",
     ),
     path("reports/batch-generate/", views.BatchReportGenerateView.as_view(), name="report_batch_generate"),
+    path(
+        "transcripts/<int:student_id>/download/",
+        views.TranscriptGenerateAndDownloadView.as_view(), name="transcript_download",
+    ),
+    path(
+        "transcripts/verify/<uuid:verification_code>/",
+        views.TranscriptVerifyView.as_view(), name="transcript_verify",
+    ),
 ]
