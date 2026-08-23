@@ -13,7 +13,7 @@ from typing import Any
 
 from django.http import HttpRequest
 
-from .models import Assessment, AuditLog, LoginHistory, User
+from .models import Assessment, AuditLog, ClassSubject, LoginHistory, Student, User
 
 
 def _client_ip(request: HttpRequest | None) -> str | None:
@@ -410,3 +410,195 @@ def decide_result_amendment(
 
     amendment.save(update_fields=["status", "reviewed_by", "reviewed_at", "review_comment"])
     return amendment
+
+
+# =============================================================================
+# Phase 9 — Report Book System (spec §15). All layout lives in
+# templates/reports/*.html; nothing here hard-codes HTML/positioning —
+# this module only assembles the data dict the template renders.
+# =============================================================================
+
+def compute_class_term_rankings(*, class_group, term) -> dict[int, dict[str, Any]]:
+    """Spec §13: 'Make ranking configurable because some schools may
+    choose not to rank students' — callers must check
+    class_group.school.enable_position_ranking before using this for
+    display; it's computed unconditionally here so the check stays a
+    presentation decision, not a data-availability one.
+
+    Returns {student_id: {"average": Decimal, "position": int}} across
+    every student currently in the class, ranked by their average
+    percentage across all of their ClassSubjects for the term.
+    """
+    students = Student.objects.filter(current_class=class_group, is_active=True)
+    averages: list[tuple[int, Decimal]] = []
+
+    for student in students:
+        class_subjects = ClassSubject.objects.filter(
+            enrollments__student=student, enrollments__academic_year=term.academic_year
+        ).distinct()
+        if not class_subjects:
+            continue
+        totals = [
+            compute_weighted_average(student, cs, term)["weighted_total"]
+            for cs in class_subjects
+        ]
+        if totals:
+            averages.append((student.pk, sum(totals) / len(totals)))
+
+    averages.sort(key=lambda pair: pair[1], reverse=True)
+
+    results: dict[int, dict[str, Any]] = {}
+    for position, (student_id, average) in enumerate(averages, start=1):
+        results[student_id] = {"average": average, "position": position}
+    return results
+
+
+def assemble_report_data(*, student: "Student", term: "Term") -> dict[str, Any]:
+    """Spec §15: gathers every field the report layout needs — school
+    identity, student identity, per-subject marks/grades, attendance,
+    position (if enabled) — into one plain dict. The template decides how
+    to lay it out; this function never renders HTML or decides layout."""
+    from .models import AttendanceRecord, GradingScheme
+
+    school = student.school
+    class_subjects = ClassSubject.objects.filter(
+        enrollments__student=student, enrollments__academic_year=term.academic_year
+    ).distinct().select_related("subject")
+
+    grading_scheme = GradingScheme.objects.filter(school=school, is_default=True).first()
+
+    subject_rows = []
+    percentage_totals = []
+    for class_subject in class_subjects:
+        summary = compute_weighted_average(student, class_subject, term)
+        band = None
+        if grading_scheme and summary["weight_covered"] > 0:
+            band = get_grade_for_mark(grading_scheme, summary["weighted_total"])
+        subject_rows.append(
+            {
+                "subject": class_subject.subject.name,
+                "score": summary["weighted_total"],
+                "grade": band.grade if band else "-",
+                "grade_point": band.grade_point if band else None,
+                "is_complete": summary["is_complete"],
+            }
+        )
+        if summary["weight_covered"] > 0:
+            percentage_totals.append(summary["weighted_total"])
+
+    average = (
+        (sum(percentage_totals) / len(percentage_totals)).quantize(Decimal("0.01"))
+        if percentage_totals else None
+    )
+
+    ranking = None
+    if school.enable_position_ranking and student.current_class_id:
+        rankings = compute_class_term_rankings(class_group=student.current_class, term=term)
+        ranking = rankings.get(student.pk)
+
+    attendance_qs = AttendanceRecord.objects.filter(
+        student=student, session__term=term
+    )
+    attendance_summary = {
+        "present": attendance_qs.filter(status="PRESENT").count(),
+        "absent": attendance_qs.filter(status="ABSENT").count(),
+        "late": attendance_qs.filter(status="LATE").count(),
+        "excused": attendance_qs.filter(status="EXCUSED").count(),
+    }
+
+    return {
+        "school": school,
+        "student": student,
+        "class_group": student.current_class,
+        "stream": student.current_stream,
+        "academic_year": term.academic_year,
+        "term": term,
+        "subject_rows": subject_rows,
+        "average": average,
+        "position": ranking["position"] if ranking else None,
+        "class_size": len(
+            [k for k in (compute_class_term_rankings(
+                class_group=student.current_class, term=term
+            ) if student.current_class_id else {})]
+        ) if ranking else None,
+        "attendance_summary": attendance_summary,
+    }
+
+
+def render_report_html(*, report_card: "ReportCard") -> str:
+    """Renders report_card's configured template with freshly assembled
+    data. Template choice and which sections to show come entirely from
+    ReportTemplate (spec §15 'Allow report templates to be configurable.
+    Do not hard-code the report layout into business logic') — this
+    function contains no layout decisions itself."""
+    from django.template.loader import render_to_string
+
+    template_paths = {
+        "DEFAULT": "reports/default.html",
+    }
+    template_path = template_paths[report_card.template.template_key]
+
+    context = assemble_report_data(student=report_card.student, term=report_card.term)
+    context.update(
+        {
+            "template_config": report_card.template,
+            "class_teacher_comment": report_card.class_teacher_comment,
+            "principal_comment": report_card.principal_comment,
+        }
+    )
+    return render_to_string(template_path, context)
+
+
+def generate_report_pdf(
+    *, report_card: "ReportCard", generated_by: User, request: HttpRequest | None = None
+) -> "ReportCard":
+    """Spec §15 'PDF report' / 'Downloadable report'. Renders via
+    render_report_html() then converts with WeasyPrint (HTML/CSS -> PDF),
+    so the PDF and the on-screen HTML report always come from the exact
+    same template and data-assembly code — no separate PDF-only layout
+    to fall out of sync."""
+    from django.core.files.base import ContentFile
+    from django.utils import timezone
+    from weasyprint import HTML
+
+    html_content = render_report_html(report_card=report_card)
+    pdf_bytes = HTML(string=html_content).write_pdf()
+
+    filename = f"report_{report_card.student.admission_number}_{report_card.term_id}.pdf"
+    report_card.pdf_file.save(filename, ContentFile(pdf_bytes), save=False)
+    report_card.generated_by = generated_by
+    report_card.generated_at = timezone.now()
+    report_card.save()
+
+    log_audit(
+        actor=generated_by,
+        action=AuditLog.Action.OTHER,
+        request=request,
+        target_model="ReportCard",
+        target_object_id=report_card.pk,
+        description=f"Generated report PDF for {report_card.student}",
+    )
+    return report_card
+
+
+def generate_batch_reports(
+    *,
+    class_group,
+    term: "Term",
+    template: "ReportTemplate",
+    generated_by: User,
+    request: HttpRequest | None = None,
+) -> list["ReportCard"]:
+    """Spec §15 'Batch reports'. Creates/updates one ReportCard per active
+    student in the class and generates each PDF. Returns the list so the
+    calling view can present a summary/zip download."""
+    from .models import ReportCard as ReportCardModel
+
+    cards = []
+    for student in Student.objects.filter(current_class=class_group, is_active=True):
+        card, _ = ReportCardModel.objects.get_or_create(
+            student=student, term=term, template=template
+        )
+        generate_report_pdf(report_card=card, generated_by=generated_by, request=request)
+        cards.append(card)
+    return cards
