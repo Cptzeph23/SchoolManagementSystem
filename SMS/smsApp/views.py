@@ -7,14 +7,16 @@ from django.urls import reverse_lazy
 from django.views import View
 from django.views.generic import RedirectView, TemplateView
 
-from .models import AcademicYear, Class, ReportCard, ReportTemplate, Staff, Student, Term, User
+from .models import AcademicYear, Class, ReportCard, ReportTemplate, Staff, Student, Term, Transcript, User
 from .permissions import RoleRequiredMixin
 from .services import (
     generate_batch_reports,
     generate_report_pdf,
+    generate_transcript,
     get_dashboard_url_for_role,
     record_login,
     render_report_html,
+    verify_transcript,
 )
 
 
@@ -153,3 +155,47 @@ class BatchReportGenerateView(RoleRequiredMixin, View):
             f"Generated {len(cards)} report(s) for {class_group} - {term}.",
             content_type="text/plain",
         )
+
+
+class TranscriptGenerateAndDownloadView(RoleRequiredMixin, View):
+    """Spec §16 'secure PDF documents'. Always generates a fresh transcript
+    on request rather than serving a cached one — cumulative academic
+    records must reflect every currently-published result, and each
+    generation gets its own verification_code (spec §16 interpretation,
+    see models.Transcript docstring)."""
+
+    allowed_roles = [
+        User.Role.SUPER_ADMIN, User.Role.ACADEMIC_ADMIN, User.Role.EXAM_OFFICER,
+    ]
+
+    def get(self, request, student_id):
+        student = get_object_or_404(Student, pk=student_id)
+        transcript = generate_transcript(
+            student=student, generated_by=request.user, request=request
+        )
+        response = HttpResponse(transcript.pdf_file.read(), content_type="application/pdf")
+        response["Content-Disposition"] = (
+            f'attachment; filename="transcript_{student.admission_number}.pdf"'
+        )
+        return response
+
+
+class TranscriptVerifyView(View):
+    """Public endpoint — spec §16's 'secure PDF documents' implies a third
+    party (employer, other institution) should be able to confirm a
+    transcript is genuine using only the code printed on it. Deliberately
+    unauthenticated and deliberately minimal in what it discloses (no
+    full mark list) to avoid leaking academic records to link-guessers."""
+
+    def get(self, request, verification_code):
+        result = verify_transcript(verification_code)
+        if not result["valid"]:
+            return HttpResponse("Invalid or unrecognized verification code.", status=404)
+        lines = [
+            "Transcript verified.",
+            f"Student: {result['student_name']} ({result['admission_number']})",
+            f"Issued: {result['generated_at']:%Y-%m-%d}",
+            f"CGPA: {result['cgpa'] if result['cgpa'] is not None else '—'}",
+            f"Status: {result['graduation_status']}",
+        ]
+        return HttpResponse("\n".join(lines), content_type="text/plain")
