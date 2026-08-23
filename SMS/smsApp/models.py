@@ -17,6 +17,8 @@ Design notes:
 """
 from django.contrib.auth.models import AbstractUser
 from django.db import models
+import uuid
+
 
 
 class User(AbstractUser):
@@ -1358,3 +1360,104 @@ class ReportCard(models.Model):
 
     def __str__(self) -> str:
         return f"{self.student} - {self.term}"
+
+
+# =============================================================================
+# Phase 10 — Transcript System
+# Spec ref §16: cumulative academic record (course history, GPA, CGPA,
+# academic/graduation status), generated as a "secure PDF document".
+#
+# "Secure" isn't elaborated further in the spec, so this implements the
+# common, defensible interpretation: each Transcript gets a unique
+# verification_code (UUID) and a content_hash so a third party (employer,
+# other institution) can confirm authenticity via services.verify_transcript()
+# without needing the full document. This is separate from, and doesn't
+# preclude, adding PDF password-encryption later if a specific policy is set.
+#
+# Unlike ReportCard (recomputed fresh from live data each time — a term
+# report changes as marks are corrected), Transcript rows are snapshotted
+# at generation time into TranscriptEntry. A transcript is closer to a
+# permanent record: if grading schemes or subject names change later, a
+# previously issued transcript must still read exactly as it did when
+# issued.
+# =============================================================================
+
+class Transcript(models.Model):
+    class GraduationStatus(models.TextChoices):
+        IN_PROGRESS = "IN_PROGRESS", "In Progress"
+        GRADUATED = "GRADUATED", "Graduated"
+        NOT_GRADUATED = "NOT_GRADUATED", "Not Graduated"
+
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="transcripts"
+    )
+    generated_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="transcripts_generated",
+        blank=True, null=True,
+    )
+    generated_at = models.DateTimeField(auto_now_add=True)
+
+    # Snapshots of student status at generation time — spec §16 "Academic
+    # status", "Graduation status". Stored, not read live, so a transcript
+    # remains accurate even if the student's status changes afterward.
+    academic_status = models.CharField(max_length=15, choices=Student.Status.choices)
+    graduation_status = models.CharField(
+        max_length=15, choices=GraduationStatus.choices,
+        default=GraduationStatus.IN_PROGRESS,
+    )
+
+    gpa = models.DecimalField(
+        max_digits=4, decimal_places=2, blank=True, null=True,
+        help_text="Most recent term/year's grade-point average.",
+    )
+    cgpa = models.DecimalField(
+        max_digits=4, decimal_places=2, blank=True, null=True,
+        help_text="Cumulative GPA across every entry on this transcript.",
+    )
+
+    verification_code = models.UUIDField(
+        default=uuid.uuid4, unique=True, editable=False, db_index=True,
+    )
+    content_hash = models.CharField(
+        max_length=64, blank=True,
+        help_text="SHA-256 of the assembled transcript data at generation "
+                   "time, for tamper-evidence alongside verification_code.",
+    )
+    pdf_file = models.FileField(upload_to="transcripts/", blank=True, null=True)
+
+    class Meta:
+        db_table = "transcripts"
+        ordering = ["-generated_at"]
+
+    def __str__(self) -> str:
+        return f"Transcript - {self.student} ({self.generated_at:%Y-%m-%d})"
+
+
+class TranscriptEntry(models.Model):
+    """One historical subject result, snapshotted at the time the parent
+    Transcript was generated. `subject` is a soft reference (SET_NULL) for
+    querying convenience only — the display fields below are what actually
+    render, so renaming/deleting a Subject later cannot alter an already
+    issued transcript."""
+
+    transcript = models.ForeignKey(
+        Transcript, on_delete=models.CASCADE, related_name="entries"
+    )
+    subject = models.ForeignKey(
+        Subject, on_delete=models.SET_NULL, related_name="transcript_entries",
+        blank=True, null=True,
+    )
+    subject_name = models.CharField(max_length=255)
+    academic_year_label = models.CharField(max_length=20)
+    term_label = models.CharField(max_length=50)
+    score = models.DecimalField(max_digits=6, decimal_places=2)
+    grade = models.CharField(max_length=5, blank=True)
+    grade_point = models.DecimalField(max_digits=3, decimal_places=2, blank=True, null=True)
+    credit_hours = models.DecimalField(max_digits=4, decimal_places=1, blank=True, null=True)
+
+    class Meta:
+        db_table = "transcript_entries"
+        ordering = ["academic_year_label", "term_label", "subject_name"]
+
+    def __str__(self) -> str:
+        return f"{self.subject_name} - {self.term_label} ({self.transcript.student})"
