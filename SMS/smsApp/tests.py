@@ -35,6 +35,7 @@ from .models import (
     Subject,
     TeachingAssignment,
     Term,
+    Transcript,
 )
 from .services import (
     correct_attendance_record,
@@ -42,12 +43,14 @@ from .services import (
     decide_result_amendment,
     generate_batch_reports,
     generate_report_pdf,
+    generate_transcript,
     get_grade_for_mark,
     reject_assessment,
     request_result_amendment,
     render_report_html,
     transition_assessment_workflow,
     validate_grade_bands_no_overlap,
+    verify_transcript,
 )
 
 User = get_user_model()
@@ -965,3 +968,167 @@ class ReportBookTests(TestCase):
                 ReportCard.objects.create(
                     student=self.student, term=self.term, template=self.template,
                 )
+
+
+class TranscriptTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(
+            school=self.school, name="BSc CS", code="BSCCS",
+            program_type=Program.ProgramType.UNIVERSITY,
+        )
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Year 1"
+        )
+        self.subject_math = Subject.objects.create(
+            school=self.school, code="MATH101", name="Calculus I", credit_hours=Decimal("4.0")
+        )
+        self.subject_cs = Subject.objects.create(
+            school=self.school, code="CS101", name="Intro to CS", credit_hours=Decimal("3.0")
+        )
+        self.class_subject_math = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject_math
+        )
+        self.class_subject_cs = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject_cs
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term1 = Term.objects.create(
+            academic_year=self.academic_year, name="Semester 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+        self.term2 = Term.objects.create(
+            academic_year=self.academic_year, name="Semester 2", term_number=2,
+            start_date=datetime.date(2026, 5, 1), end_date=datetime.date(2026, 8, 1),
+        )
+        self.scheme = GradingScheme.objects.create(
+            school=self.school, name="4.0 Scale", is_default=True
+        )
+        GradeBand.objects.create(
+            scheme=self.scheme, min_mark=Decimal("90"), max_mark=Decimal("100"),
+            grade="A", grade_point=Decimal("4.0"),
+        )
+        GradeBand.objects.create(
+            scheme=self.scheme, min_mark=Decimal("80"), max_mark=Decimal("89.99"),
+            grade="B", grade_point=Decimal("3.0"),
+        )
+        GradeBand.objects.create(
+            scheme=self.scheme, min_mark=Decimal("0"), max_mark=Decimal("79.99"),
+            grade="C", grade_point=Decimal("2.0"),
+        )
+
+        student_user = User.objects.create_user(
+            username="tstudent", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM700",
+            admission_date=datetime.date(2026, 1, 10), current_class=self.class_group,
+        )
+        Enrollment.objects.create(
+            student=self.student, class_subject=self.class_subject_math,
+            academic_year=self.academic_year,
+        )
+        Enrollment.objects.create(
+            student=self.student, class_subject=self.class_subject_cs,
+            academic_year=self.academic_year,
+        )
+
+        structure = AssessmentStructure.objects.create(
+            school=self.school, term=self.term1, name="Standard"
+        )
+        final_type = AssessmentType.objects.create(school=self.school, name="Final", code="FINAL")
+        component = AssessmentComponent.objects.create(
+            structure=structure, assessment_type=final_type,
+            weight_percentage=Decimal("100.00"), max_marks=Decimal("100"),
+        )
+
+        # Term 1: Calculus I (credit=4) scores 95 -> grade A (4.0);
+        # published so it counts toward the transcript.
+        math_assessment_t1 = Assessment.objects.create(
+            class_subject=self.class_subject_math, term=self.term1, component=component,
+            title="Final Exam", workflow_status=Assessment.WorkflowStatus.PUBLISHED,
+        )
+        AssessmentMark.objects.create(
+            assessment=math_assessment_t1, student=self.student, marks_obtained=Decimal("95"),
+        )
+
+        # Term 2: Intro to CS (credit=3) scores 85 -> grade B (3.0).
+        component2 = AssessmentComponent.objects.create(
+            structure=AssessmentStructure.objects.create(
+                school=self.school, term=self.term2, name="Standard"
+            ),
+            assessment_type=final_type,
+            weight_percentage=Decimal("100.00"), max_marks=Decimal("100"),
+        )
+        cs_assessment_t2 = Assessment.objects.create(
+            class_subject=self.class_subject_cs, term=self.term2, component=component2,
+            title="Final Exam", workflow_status=Assessment.WorkflowStatus.PUBLISHED,
+        )
+        AssessmentMark.objects.create(
+            assessment=cs_assessment_t2, student=self.student, marks_obtained=Decimal("85"),
+        )
+
+        self.admin_user = User.objects.create_superuser(
+            username="transcriptadmin", email="ta@ta.com", password="pass12345"
+        )
+
+    def test_generate_transcript_snapshots_only_published_entries(self):
+        transcript = generate_transcript(student=self.student, generated_by=self.admin_user)
+        self.assertEqual(transcript.entries.count(), 2)
+        subject_names = set(transcript.entries.values_list("subject_name", flat=True))
+        self.assertEqual(subject_names, {"Calculus I", "Intro to CS"})
+
+    def test_transcript_excludes_unpublished_assessments(self):
+        structure = AssessmentStructure.objects.get(term=self.term1)
+        draft_component = AssessmentComponent.objects.create(
+            structure=structure,
+            assessment_type=AssessmentType.objects.create(
+                school=self.school, name="CAT", code="CAT1"
+            ),
+            weight_percentage=Decimal("0.00"), max_marks=Decimal("100"),
+        )
+        draft_assessment = Assessment.objects.create(
+            class_subject=self.class_subject_math, term=self.term1, component=draft_component,
+            title="Draft CAT", workflow_status=Assessment.WorkflowStatus.DRAFT,
+        )
+        AssessmentMark.objects.create(
+            assessment=draft_assessment, student=self.student, marks_obtained=Decimal("40"),
+        )
+        transcript = generate_transcript(student=self.student, generated_by=self.admin_user)
+        # Still only 2 entries: the draft assessment's term/class_subject
+        # combination must not surface as a separate published entry.
+        self.assertEqual(transcript.entries.count(), 2)
+
+    def test_cgpa_is_credit_hour_weighted(self):
+        transcript = generate_transcript(student=self.student, generated_by=self.admin_user)
+        # (4.0*4 + 3.0*3) / (4+3) = 25/7 = 3.5714... -> 3.57
+        self.assertEqual(transcript.cgpa, Decimal("3.57"))
+
+    def test_transcript_pdf_is_generated_and_downloadable(self):
+        transcript = generate_transcript(student=self.student, generated_by=self.admin_user)
+        self.assertTrue(transcript.pdf_file.name)
+        transcript.pdf_file.open("rb")
+        header = transcript.pdf_file.read(4)
+        transcript.pdf_file.close()
+        self.assertEqual(header, b"%PDF")
+
+    def test_verification_code_is_unique_and_verifiable(self):
+        transcript = generate_transcript(student=self.student, generated_by=self.admin_user)
+        result = verify_transcript(transcript.verification_code)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["admission_number"], "ADM700")
+
+    def test_invalid_verification_code_returns_not_valid(self):
+        import uuid
+        result = verify_transcript(uuid.uuid4())
+        self.assertFalse(result["valid"])
+
+    def test_academic_status_and_graduation_status_snapshotted(self):
+        self.student.status = Student.Status.GRADUATED
+        self.student.save()
+        transcript = generate_transcript(student=self.student, generated_by=self.admin_user)
+        self.assertEqual(transcript.academic_status, Student.Status.GRADUATED)
+        self.assertEqual(transcript.graduation_status, Transcript.GraduationStatus.GRADUATED)
