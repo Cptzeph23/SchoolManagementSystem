@@ -13,5 +13,13 @@ urlpatterns = [
     path("", views.DashboardRouterView.as_view(), name="home"),
     path("coming-soon/", views.ComingSoonView.as_view(), name="coming_soon"),
     path("super-admin/", views.SuperAdminDashboardView.as_view(), name="super_admin"),
+    path(
+        "reports/<int:report_card_id>/html/",
+        views.ReportCardHTMLView.as_view(), name="report_card_html",
+    ),
+    path(
+        "reports/<int:report_card_id>/pdf/",
+        views.ReportCardPDFView.as_view(), name="report_card_pdf",
+    ),
+    path("reports/batch-generate/", views.BatchReportGenerateView.as_view(), name="report_batch_generate"),
 ]
-
