@@ -14,17 +14,25 @@ from .models import (
     AssessmentMark,
     AssessmentStructure,
     AssessmentType,
+    Assignment,
+    AssignmentSubmission,
     AttendanceRecord,
     AttendanceSession,
     AuditLog,
     Class,
     ClassSubject,
+    Discussion,
+    DiscussionReply,
     Enrollment,
     GradeBand,
     GradingScheme,
     Guardian,
     LoginHistory,
     Program,
+    Quiz,
+    QuizAttempt,
+    QuizOption,
+    QuizQuestion,
     ReportCard,
     ReportTemplate,
     ResultAmendmentRequest,
@@ -45,9 +53,13 @@ from .services import (
     generate_report_pdf,
     generate_transcript,
     get_grade_for_mark,
+    grade_assignment_submission,
+    grade_quiz_short_answer,
     reject_assessment,
     request_result_amendment,
     render_report_html,
+    submit_assignment,
+    submit_quiz_attempt,
     transition_assessment_workflow,
     validate_grade_bands_no_overlap,
     verify_transcript,
@@ -1132,3 +1144,221 @@ class TranscriptTests(TestCase):
         transcript = generate_transcript(student=self.student, generated_by=self.admin_user)
         self.assertEqual(transcript.academic_status, Student.Status.GRADUATED)
         self.assertEqual(transcript.graduation_status, Transcript.GraduationStatus.GRADUATED)
+
+
+class LMSTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(school=self.school, code="MATH", name="Mathematics")
+        self.class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+        teacher_user = User.objects.create_user(
+            username="lmsteacher", password="pass12345", role=User.Role.TEACHER
+        )
+        self.teacher = Staff.objects.create(
+            user=teacher_user, school=self.school, staff_id="STF900",
+            job_title="Maths Teacher", date_hired=datetime.date(2024, 1, 1),
+        )
+        student_user = User.objects.create_user(
+            username="lmsstudent", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM800",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+
+    # --- Assignments ---
+
+    def test_first_submission_always_allowed(self):
+        assignment = Assignment.objects.create(
+            class_subject=self.class_subject, term=self.term, title="Essay 1",
+            deadline=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+            allow_resubmission=False,
+        )
+        submission = submit_assignment(
+            assignment=assignment, student=self.student, submitted_text="My essay"
+        )
+        self.assertEqual(submission.attempt_number, 1)
+        self.assertEqual(submission.status, AssignmentSubmission.Status.SUBMITTED)
+
+    def test_resubmission_blocked_when_not_allowed(self):
+        assignment = Assignment.objects.create(
+            class_subject=self.class_subject, term=self.term, title="Essay 2",
+            deadline=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+            allow_resubmission=False,
+        )
+        submit_assignment(assignment=assignment, student=self.student, submitted_text="v1")
+        with self.assertRaises(ValueError):
+            submit_assignment(assignment=assignment, student=self.student, submitted_text="v2")
+
+    def test_resubmission_allowed_increments_attempt_and_clears_grade(self):
+        assignment = Assignment.objects.create(
+            class_subject=self.class_subject, term=self.term, title="Essay 3",
+            deadline=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+            allow_resubmission=True,
+        )
+        submission = submit_assignment(
+            assignment=assignment, student=self.student, submitted_text="v1"
+        )
+        grade_assignment_submission(
+            submission=submission, marks_obtained=Decimal("70"), feedback="Good start",
+            graded_by=self.teacher,
+        )
+        submission = submit_assignment(
+            assignment=assignment, student=self.student, submitted_text="v2"
+        )
+        self.assertEqual(submission.attempt_number, 2)
+        self.assertEqual(submission.status, AssignmentSubmission.Status.RESUBMITTED)
+        self.assertIsNone(submission.marks_obtained)
+
+    def test_late_submission_flagged(self):
+        assignment = Assignment.objects.create(
+            class_subject=self.class_subject, term=self.term, title="Essay 4",
+            deadline=datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc),
+        )
+        submission = submit_assignment(
+            assignment=assignment, student=self.student, submitted_text="Late work"
+        )
+        self.assertTrue(submission.is_late)
+
+    def test_grade_cannot_exceed_max_marks(self):
+        assignment = Assignment.objects.create(
+            class_subject=self.class_subject, term=self.term, title="Essay 5",
+            deadline=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+            max_marks=Decimal("50"),
+        )
+        submission = submit_assignment(
+            assignment=assignment, student=self.student, submitted_text="v1"
+        )
+        with self.assertRaises(ValueError):
+            grade_assignment_submission(
+                submission=submission, marks_obtained=Decimal("75"), feedback="",
+                graded_by=self.teacher,
+            )
+
+    # --- Quizzes ---
+
+    def _make_quiz_with_questions(self):
+        quiz = Quiz.objects.create(
+            class_subject=self.class_subject, term=self.term, title="Quiz 1"
+        )
+        mcq = QuizQuestion.objects.create(
+            quiz=quiz, question_text="2 + 2 = ?",
+            question_type=QuizQuestion.QuestionType.MULTIPLE_CHOICE, marks=Decimal("2"),
+        )
+        correct_opt = QuizOption.objects.create(question=mcq, option_text="4", is_correct=True)
+        QuizOption.objects.create(question=mcq, option_text="5", is_correct=False)
+
+        multi = QuizQuestion.objects.create(
+            quiz=quiz, question_text="Select all primes",
+            question_type=QuizQuestion.QuestionType.MULTIPLE_ANSWER, marks=Decimal("3"),
+        )
+        prime2 = QuizOption.objects.create(question=multi, option_text="2", is_correct=True)
+        prime3 = QuizOption.objects.create(question=multi, option_text="3", is_correct=True)
+        QuizOption.objects.create(question=multi, option_text="4", is_correct=False)
+
+        short = QuizQuestion.objects.create(
+            quiz=quiz, question_text="Explain your reasoning",
+            question_type=QuizQuestion.QuestionType.SHORT_ANSWER, marks=Decimal("5"),
+        )
+        return quiz, mcq, correct_opt, multi, prime2, prime3, short
+
+    def test_mcq_auto_grades_correctly(self):
+        quiz, mcq, correct_opt, multi, prime2, prime3, short = self._make_quiz_with_questions()
+        attempt = QuizAttempt.objects.create(quiz=quiz, student=self.student)
+        submit_quiz_attempt(
+            attempt=attempt,
+            answers={
+                mcq.pk: {"option_ids": [correct_opt.pk]},
+                multi.pk: {"option_ids": [prime2.pk, prime3.pk]},
+                short.pk: {"text": "Because math."},
+            },
+        )
+        attempt.refresh_from_db()
+        # MCQ (2) + multi-answer exact match (3) = 5; short answer ungraded.
+        self.assertEqual(attempt.auto_score, Decimal("5"))
+        self.assertFalse(attempt.is_fully_graded)
+
+    def test_multiple_answer_requires_exact_set_match(self):
+        quiz, mcq, correct_opt, multi, prime2, prime3, short = self._make_quiz_with_questions()
+        attempt = QuizAttempt.objects.create(quiz=quiz, student=self.student)
+        submit_quiz_attempt(
+            attempt=attempt,
+            answers={
+                mcq.pk: {"option_ids": [correct_opt.pk]},
+                # Only one of two correct primes selected -> incorrect, 0 marks.
+                multi.pk: {"option_ids": [prime2.pk]},
+                short.pk: {"text": "..."},
+            },
+        )
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.auto_score, Decimal("2"))  # only the MCQ mark
+
+    def test_short_answer_requires_manual_grading_to_finalize(self):
+        quiz, mcq, correct_opt, multi, prime2, prime3, short = self._make_quiz_with_questions()
+        attempt = QuizAttempt.objects.create(quiz=quiz, student=self.student)
+        submit_quiz_attempt(
+            attempt=attempt,
+            answers={
+                mcq.pk: {"option_ids": [correct_opt.pk]},
+                multi.pk: {"option_ids": [prime2.pk, prime3.pk]},
+                short.pk: {"text": "Because math."},
+            },
+        )
+        attempt.refresh_from_db()
+        self.assertFalse(attempt.is_fully_graded)
+
+        short_answer = attempt.answers.get(question=short)
+        grade_quiz_short_answer(answer=short_answer, marks_awarded=Decimal("4"))
+        attempt.refresh_from_db()
+        self.assertTrue(attempt.is_fully_graded)
+        self.assertEqual(attempt.manual_score, Decimal("4"))
+        self.assertEqual(attempt.total_score, Decimal("9"))  # 5 auto + 4 manual
+
+    def test_short_answer_grade_cannot_exceed_question_marks(self):
+        quiz, mcq, correct_opt, multi, prime2, prime3, short = self._make_quiz_with_questions()
+        attempt = QuizAttempt.objects.create(quiz=quiz, student=self.student)
+        submit_quiz_attempt(
+            attempt=attempt,
+            answers={
+                mcq.pk: {"option_ids": [correct_opt.pk]},
+                multi.pk: {"option_ids": [prime2.pk, prime3.pk]},
+                short.pk: {"text": "..."},
+            },
+        )
+        short_answer = attempt.answers.get(question=short)
+        with self.assertRaises(ValueError):
+            grade_quiz_short_answer(answer=short_answer, marks_awarded=Decimal("10"))
+
+    def test_only_one_attempt_number_per_quiz_student(self):
+        quiz, *_ = self._make_quiz_with_questions()
+        QuizAttempt.objects.create(quiz=quiz, student=self.student, attempt_number=1)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                QuizAttempt.objects.create(quiz=quiz, student=self.student, attempt_number=1)
+
+    # --- Discussions ---
+
+    def test_discussion_and_reply_creation(self):
+        discussion = Discussion.objects.create(
+            class_subject=self.class_subject, term=self.term,
+            thread_type=Discussion.ThreadType.ANNOUNCEMENT,
+            title="Midterm postponed", created_by=self.teacher.user,
+        )
+        DiscussionReply.objects.create(
+            discussion=discussion, author=self.student.user, content="Thanks for the update!"
+        )
+        self.assertEqual(discussion.replies.count(), 1)
