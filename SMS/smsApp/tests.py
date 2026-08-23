@@ -25,6 +25,8 @@ from .models import (
     Guardian,
     LoginHistory,
     Program,
+    ReportCard,
+    ReportTemplate,
     ResultAmendmentRequest,
     School,
     Staff,
@@ -38,9 +40,12 @@ from .services import (
     correct_attendance_record,
     compute_weighted_average,
     decide_result_amendment,
+    generate_batch_reports,
+    generate_report_pdf,
     get_grade_for_mark,
     reject_assessment,
     request_result_amendment,
+    render_report_html,
     transition_assessment_workflow,
     validate_grade_bands_no_overlap,
 )
@@ -841,3 +846,122 @@ class ResultWorkflowTests(TestCase):
             decide_result_amendment(
                 amendment=amendment, approve=True, reviewed_by=self.academic_admin_user,
             )
+
+
+class ReportBookTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(school=self.school, code="MATH", name="Mathematics")
+        self.class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+        structure = AssessmentStructure.objects.create(
+            school=self.school, term=self.term, name="Standard"
+        )
+        final_type = AssessmentType.objects.create(school=self.school, name="Final", code="FINAL")
+        component = AssessmentComponent.objects.create(
+            structure=structure, assessment_type=final_type,
+            weight_percentage=Decimal("100.00"), max_marks=Decimal("100"),
+        )
+        assessment = Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=component,
+            title="Final Exam",
+        )
+        scheme = GradingScheme.objects.create(school=self.school, name="Standard", is_default=True)
+        GradeBand.objects.create(
+            scheme=scheme, min_mark=Decimal("80"), max_mark=Decimal("100"),
+            grade="A", grade_point=Decimal("4.0"),
+        )
+        GradeBand.objects.create(
+            scheme=scheme, min_mark=Decimal("0"), max_mark=Decimal("79.99"),
+            grade="B", grade_point=Decimal("3.0"),
+        )
+
+        student_user = User.objects.create_user(
+            username="rbstudent", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM600",
+            admission_date=datetime.date(2026, 1, 10), current_class=self.class_group,
+        )
+        Enrollment.objects.create(
+            student=self.student, class_subject=self.class_subject,
+            academic_year=self.academic_year,
+        )
+        AssessmentMark.objects.create(
+            assessment=assessment, student=self.student, marks_obtained=Decimal("85"),
+        )
+
+        self.admin_user = User.objects.create_superuser(
+            username="rbadmin", email="rb@rb.com", password="pass12345"
+        )
+        self.template = ReportTemplate.objects.create(
+            school=self.school, name="Standard Report", is_default=True,
+        )
+
+    def test_render_report_html_includes_subject_and_grade(self):
+        card = ReportCard.objects.create(
+            student=self.student, term=self.term, template=self.template,
+        )
+        html = render_report_html(report_card=card)
+        self.assertIn("Mathematics", html)
+        self.assertIn("85.00", html)
+        self.assertIn("A", html)
+
+    def test_generate_report_pdf_creates_downloadable_file(self):
+        card = ReportCard.objects.create(
+            student=self.student, term=self.term, template=self.template,
+        )
+        generate_report_pdf(report_card=card, generated_by=self.admin_user)
+        card.refresh_from_db()
+        self.assertTrue(card.pdf_file.name)
+        self.assertIsNotNone(card.generated_at)
+        card.pdf_file.open("rb")
+        header = card.pdf_file.read(4)
+        card.pdf_file.close()
+        self.assertEqual(header, b"%PDF")
+
+    def test_batch_generate_creates_card_per_active_student_in_class(self):
+        second_user = User.objects.create_user(
+            username="rbstudent2", password="pass12345", role=User.Role.STUDENT
+        )
+        Student.objects.create(
+            user=second_user, school=self.school, admission_number="ADM601",
+            admission_date=datetime.date(2026, 1, 10), current_class=self.class_group,
+        )
+        cards = generate_batch_reports(
+            class_group=self.class_group, term=self.term, template=self.template,
+            generated_by=self.admin_user,
+        )
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(ReportCard.objects.filter(term=self.term).count(), 2)
+
+    def test_only_one_default_report_template_per_school(self):
+        second_template = ReportTemplate.objects.create(
+            school=self.school, name="Alt Report", is_default=True,
+        )
+        self.template.refresh_from_db()
+        self.assertFalse(self.template.is_default)
+        self.assertTrue(second_template.is_default)
+
+    def test_report_card_unique_per_student_term_template(self):
+        ReportCard.objects.create(
+            student=self.student, term=self.term, template=self.template,
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ReportCard.objects.create(
+                    student=self.student, term=self.term, template=self.template,
+                )
