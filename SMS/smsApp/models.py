@@ -15,9 +15,11 @@ Design notes:
   as those apps are built (Phase 3+), then attached to Groups
   matching each Role via the admin or a data migration.
 """
+from decimal import Decimal
+import uuid
+
 from django.contrib.auth.models import AbstractUser
 from django.db import models
-import uuid
 
 
 
@@ -1461,3 +1463,351 @@ class TranscriptEntry(models.Model):
 
     def __str__(self) -> str:
         return f"{self.subject_name} - {self.term_label} ({self.transcript.student})"
+
+
+# =============================================================================
+# Phase 11 — LMS Module (spec §10)
+# Scope note: consistent with Phases 5-8 (Curriculum, Attendance, Assessment,
+# Results), this phase builds the data model + business-logic layer.
+# Interactive UI (submit-assignment forms, quiz-taking screens, discussion
+# threads) is deferred to the Teacher/Student dashboard build-out, same
+# pattern used throughout this project.
+# =============================================================================
+
+class CourseMaterial(models.Model):
+    """Spec §10 'Course content': PDF, Documents, Images, Videos, Links,
+    Presentations, Text lessons. One model with a `material_type` discriminator
+    rather than one table per type — content types share every other field
+    (title, description, ordering, publish state); only the payload differs,
+    and only one of file/external_url/text_content is used depending on type."""
+
+    class MaterialType(models.TextChoices):
+        PDF = "PDF", "PDF"
+        DOCUMENT = "DOCUMENT", "Document"
+        IMAGE = "IMAGE", "Image"
+        VIDEO = "VIDEO", "Video"
+        LINK = "LINK", "Link"
+        PRESENTATION = "PRESENTATION", "Presentation"
+        TEXT_LESSON = "TEXT_LESSON", "Text Lesson"
+
+    class_subject = models.ForeignKey(
+        ClassSubject, on_delete=models.CASCADE, related_name="course_materials"
+    )
+    term = models.ForeignKey(Term, on_delete=models.CASCADE, related_name="course_materials")
+    material_type = models.CharField(max_length=15, choices=MaterialType.choices)
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    file = models.FileField(upload_to="lms/materials/", blank=True, null=True)
+    external_url = models.URLField(blank=True, help_text="Used when material_type is LINK or VIDEO (e.g. YouTube).")
+    text_content = models.TextField(blank=True, help_text="Used when material_type is TEXT_LESSON.")
+    uploaded_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, related_name="course_materials_uploaded",
+        blank=True, null=True,
+    )
+    order = models.PositiveIntegerField(default=0)
+    is_published = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "course_materials"
+        ordering = ["class_subject", "order", "-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.title} ({self.get_material_type_display()})"
+
+
+class Assignment(models.Model):
+    """Spec §10 'Assignments' — teachers set instructions, deadline, marks,
+    submission format; attach resources (AssignmentResource, below)."""
+
+    class SubmissionFormat(models.TextChoices):
+        FILE_UPLOAD = "FILE_UPLOAD", "File Upload"
+        TEXT_ENTRY = "TEXT_ENTRY", "Text Entry"
+        BOTH = "BOTH", "File Upload or Text Entry"
+
+    class_subject = models.ForeignKey(
+        ClassSubject, on_delete=models.CASCADE, related_name="assignments"
+    )
+    term = models.ForeignKey(Term, on_delete=models.CASCADE, related_name="assignments")
+    title = models.CharField(max_length=255)
+    instructions = models.TextField(blank=True)
+    deadline = models.DateTimeField()
+    max_marks = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("100"))
+    submission_format = models.CharField(
+        max_length=15, choices=SubmissionFormat.choices, default=SubmissionFormat.FILE_UPLOAD
+    )
+    allow_resubmission = models.BooleanField(default=False)
+    created_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, related_name="assignments_created",
+        blank=True, null=True,
+    )
+    is_published = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "assignments"
+        ordering = ["-deadline"]
+
+    def __str__(self) -> str:
+        return f"{self.title} ({self.class_subject})"
+
+
+class AssignmentResource(models.Model):
+    """Spec §10 'Attach resources'. Kept separate from CourseMaterial —
+    a resource attached to one specific assignment isn't part of the
+    general course content library and shouldn't appear there."""
+
+    assignment = models.ForeignKey(
+        Assignment, on_delete=models.CASCADE, related_name="resources"
+    )
+    title = models.CharField(max_length=255)
+    file = models.FileField(upload_to="lms/assignment_resources/", blank=True, null=True)
+    external_url = models.URLField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "assignment_resources"
+        ordering = ["assignment", "id"]
+
+    def __str__(self) -> str:
+        return self.title
+
+
+class AssignmentSubmission(models.Model):
+    """One row per student per assignment — the CURRENT submission.
+    Resubmission (spec §10 'Resubmit where permitted') overwrites this row
+    via services.submit_assignment(), which increments `attempt_number` and
+    audit-logs the previous content rather than keeping separate rows, since
+    only the latest attempt is ever gradeable."""
+
+    class Status(models.TextChoices):
+        SUBMITTED = "SUBMITTED", "Submitted"
+        RESUBMITTED = "RESUBMITTED", "Resubmitted"
+        GRADED = "GRADED", "Graded"
+
+    assignment = models.ForeignKey(
+        Assignment, on_delete=models.CASCADE, related_name="submissions"
+    )
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="assignment_submissions"
+    )
+    submitted_file = models.FileField(upload_to="lms/submissions/", blank=True, null=True)
+    submitted_text = models.TextField(blank=True)
+    attempt_number = models.PositiveIntegerField(default=1)
+    is_late = models.BooleanField(default=False)
+    status = models.CharField(max_length=15, choices=Status.choices, default=Status.SUBMITTED)
+    marks_obtained = models.DecimalField(max_digits=6, decimal_places=2, blank=True, null=True)
+    feedback = models.TextField(blank=True)
+    graded_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, related_name="submissions_graded",
+        blank=True, null=True,
+    )
+    graded_at = models.DateTimeField(blank=True, null=True)
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "assignment_submissions"
+        ordering = ["-submitted_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["assignment", "student"], name="uniq_submission_per_assignment_student"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.student} - {self.assignment} (attempt {self.attempt_number})"
+
+
+# -----------------------------------------------------------------------
+# Quizzes (spec §10): MCQ, True/False, Short answer, Multiple-answer.
+# Automatic marking where appropriate — objective question types
+# (MCQ/TRUE_FALSE/MULTIPLE_ANSWER) auto-grade; SHORT_ANSWER always needs
+# manual grading since free text can't be reliably auto-marked.
+# -----------------------------------------------------------------------
+
+class Quiz(models.Model):
+    class_subject = models.ForeignKey(
+        ClassSubject, on_delete=models.CASCADE, related_name="quizzes"
+    )
+    term = models.ForeignKey(Term, on_delete=models.CASCADE, related_name="quizzes")
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    time_limit_minutes = models.PositiveIntegerField(blank=True, null=True)
+    max_attempts = models.PositiveIntegerField(default=1)
+    is_published = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, related_name="quizzes_created",
+        blank=True, null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "quizzes"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.title
+
+
+class QuizQuestion(models.Model):
+    class QuestionType(models.TextChoices):
+        MULTIPLE_CHOICE = "MULTIPLE_CHOICE", "Multiple Choice"
+        TRUE_FALSE = "TRUE_FALSE", "True/False"
+        SHORT_ANSWER = "SHORT_ANSWER", "Short Answer"
+        MULTIPLE_ANSWER = "MULTIPLE_ANSWER", "Multiple Answer"
+
+    quiz = models.ForeignKey(Quiz, on_delete=models.CASCADE, related_name="questions")
+    question_text = models.TextField()
+    question_type = models.CharField(max_length=20, choices=QuestionType.choices)
+    marks = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("1.00"))
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "quiz_questions"
+        ordering = ["quiz", "order"]
+
+    def __str__(self) -> str:
+        return f"{self.question_text[:50]} ({self.get_question_type_display()})"
+
+    @property
+    def requires_manual_grading(self) -> bool:
+        return self.question_type == self.QuestionType.SHORT_ANSWER
+
+
+class QuizOption(models.Model):
+    """Answer choice for MULTIPLE_CHOICE / TRUE_FALSE / MULTIPLE_ANSWER
+    questions. Not used for SHORT_ANSWER."""
+
+    question = models.ForeignKey(
+        QuizQuestion, on_delete=models.CASCADE, related_name="options"
+    )
+    option_text = models.CharField(max_length=255)
+    is_correct = models.BooleanField(default=False)
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "quiz_options"
+        ordering = ["question", "order"]
+
+    def __str__(self) -> str:
+        return self.option_text
+
+
+class QuizAttempt(models.Model):
+    quiz = models.ForeignKey(Quiz, on_delete=models.CASCADE, related_name="attempts")
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="quiz_attempts"
+    )
+    attempt_number = models.PositiveIntegerField(default=1)
+    started_at = models.DateTimeField(auto_now_add=True)
+    submitted_at = models.DateTimeField(blank=True, null=True)
+    auto_score = models.DecimalField(
+        max_digits=6, decimal_places=2, blank=True, null=True,
+        help_text="Sum of marks from auto-gradable questions only.",
+    )
+    manual_score = models.DecimalField(
+        max_digits=6, decimal_places=2, blank=True, null=True,
+        help_text="Sum of marks from manually-graded (short-answer) questions.",
+    )
+    is_fully_graded = models.BooleanField(
+        default=False,
+        help_text="True once every short-answer question (if any) has been "
+                   "manually graded, making the total score final.",
+    )
+
+    class Meta:
+        db_table = "quiz_attempts"
+        ordering = ["-started_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["quiz", "student", "attempt_number"],
+                name="uniq_attempt_number_per_quiz_student",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.student} - {self.quiz} (attempt {self.attempt_number})"
+
+    @property
+    def total_score(self):
+        if self.auto_score is None and self.manual_score is None:
+            return None
+        return (self.auto_score or Decimal("0")) + (self.manual_score or Decimal("0"))
+
+
+class QuizAnswer(models.Model):
+    """One row per question answered within an attempt. `selected_options`
+    covers MCQ/TRUE_FALSE/MULTIPLE_ANSWER; `text_answer` covers SHORT_ANSWER."""
+
+    attempt = models.ForeignKey(QuizAttempt, on_delete=models.CASCADE, related_name="answers")
+    question = models.ForeignKey(QuizQuestion, on_delete=models.CASCADE, related_name="answers")
+    selected_options = models.ManyToManyField(QuizOption, blank=True, related_name="selected_in_answers")
+    text_answer = models.TextField(blank=True)
+    marks_awarded = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
+
+    class Meta:
+        db_table = "quiz_answers"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["attempt", "question"], name="uniq_answer_per_attempt_question"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.attempt} - {self.question}"
+
+
+# -----------------------------------------------------------------------
+# Discussions (spec §10): course discussions, teacher announcements,
+# student questions, replies.
+# -----------------------------------------------------------------------
+
+class Discussion(models.Model):
+    class ThreadType(models.TextChoices):
+        ANNOUNCEMENT = "ANNOUNCEMENT", "Announcement"
+        DISCUSSION = "DISCUSSION", "Discussion"
+        QUESTION = "QUESTION", "Question"
+
+    class_subject = models.ForeignKey(
+        ClassSubject, on_delete=models.CASCADE, related_name="discussions"
+    )
+    term = models.ForeignKey(Term, on_delete=models.CASCADE, related_name="discussions")
+    thread_type = models.CharField(max_length=15, choices=ThreadType.choices)
+    title = models.CharField(max_length=255)
+    body = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="discussions_created",
+        blank=True, null=True,
+    )
+    is_pinned = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "discussions"
+        ordering = ["-is_pinned", "-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.title} ({self.get_thread_type_display()})"
+
+
+class DiscussionReply(models.Model):
+    discussion = models.ForeignKey(
+        Discussion, on_delete=models.CASCADE, related_name="replies"
+    )
+    author = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="discussion_replies",
+        blank=True, null=True,
+    )
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "discussion_replies"
+        ordering = ["created_at"]
+
+    def __str__(self) -> str:
+        return f"Reply by {self.author} on {self.discussion}"
