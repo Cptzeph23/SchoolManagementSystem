@@ -22,6 +22,8 @@ from .models import (
     Guardian,
     LoginHistory,
     Program,
+    ReportCard,
+    ReportTemplate,
     ResultAmendmentRequest,
     School,
     Staff,
@@ -305,3 +307,26 @@ class ResultAmendmentRequestAdmin(admin.ModelAdmin):
 
     def has_add_permission(self, request):
         return False
+
+
+@admin.register(ReportTemplate)
+class ReportTemplateAdmin(admin.ModelAdmin):
+    list_display = (
+        "name", "school", "template_key", "show_position", "show_gpa",
+        "show_attendance", "is_default", "is_active",
+    )
+    list_filter = ("school", "template_key", "is_default", "is_active")
+
+
+@admin.register(ReportCard)
+class ReportCardAdmin(admin.ModelAdmin):
+    """Generation is via smsApp.services.generate_report_pdf() (called from
+    the report views) — editing pdf_file directly here would desync the
+    stored file from the underlying assembled data."""
+
+    list_display = (
+        "student", "term", "template", "is_finalized", "generated_by", "generated_at",
+    )
+    list_filter = ("term", "template", "is_finalized")
+    search_fields = ("student__admission_number",)
+    readonly_fields = ("pdf_file", "generated_by", "generated_at")
