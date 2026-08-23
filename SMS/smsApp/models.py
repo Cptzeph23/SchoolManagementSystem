@@ -1249,3 +1249,112 @@ class ResultAmendmentRequest(models.Model):
 
     def __str__(self) -> str:
         return f"{self.assessment_mark} - {self.original_mark} -> {self.proposed_mark} ({self.status})"
+
+
+# =============================================================================
+# Phase 9 — Report Book System
+# Spec ref §15: professional, configurable report generation. "Configurable"
+# is implemented as structured toggles/choices on ReportTemplate (which
+# sections to show, which HTML template file to render with) rather than
+# letting schools submit raw template markup — free-text template injection
+# would be a server-side template injection risk. The *business logic*
+# (services.assemble_report_data) never hard-codes layout; only the
+# presentation template (templates/reports/*.html) does, and which file to
+# use is itself configurable per school via `template_key`.
+# =============================================================================
+
+class ReportTemplate(models.Model):
+    """One school may want different layouts for different purposes (e.g.
+    a compact primary-school report vs a GPA-heavy senior-school one).
+    `template_key` selects a real Django template file — kept as a fixed
+    set of known-safe choices rather than an arbitrary path/string to
+    avoid template injection."""
+
+    class TemplateKey(models.TextChoices):
+        DEFAULT = "DEFAULT", "Default"
+        # Additional layouts are added here as new template files ship —
+        # never by accepting an arbitrary path from user input.
+
+    school = models.ForeignKey(
+        School, on_delete=models.CASCADE, related_name="report_templates"
+    )
+    name = models.CharField(max_length=150, help_text="e.g. 'Standard Term Report'")
+    template_key = models.CharField(
+        max_length=20, choices=TemplateKey.choices, default=TemplateKey.DEFAULT
+    )
+    show_position = models.BooleanField(
+        default=True,
+        help_text="Also requires School.enable_position_ranking to be True.",
+    )
+    show_gpa = models.BooleanField(default=False)
+    show_attendance = models.BooleanField(default=True)
+    footer_text = models.CharField(
+        max_length=255, blank=True,
+        help_text="e.g. a motto or accreditation line shown at the report footer.",
+    )
+    is_default = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "report_templates"
+        ordering = ["school", "name"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.school.code})"
+
+    def save(self, *args, **kwargs):
+        if self.is_default:
+            ReportTemplate.objects.filter(
+                school=self.school, is_default=True
+            ).exclude(pk=self.pk).update(is_default=False)
+        super().save(*args, **kwargs)
+
+
+class ReportCard(models.Model):
+    """One generated report for one student in one term. Comments (spec
+    §15 'Class teacher comment', 'Principal/head teacher comment') and
+    the finalized PDF are persisted here so 'Downloadable report' means
+    downloading an actual stored artifact, not re-rendering from
+    possibly-changed data after the fact."""
+
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="report_cards"
+    )
+    term = models.ForeignKey(
+        Term, on_delete=models.CASCADE, related_name="report_cards"
+    )
+    template = models.ForeignKey(
+        ReportTemplate, on_delete=models.PROTECT, related_name="report_cards"
+    )
+    class_teacher_comment = models.TextField(blank=True)
+    principal_comment = models.TextField(blank=True)
+    pdf_file = models.FileField(upload_to="reports/cards/", blank=True, null=True)
+    generated_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="report_cards_generated",
+        blank=True, null=True,
+    )
+    generated_at = models.DateTimeField(blank=True, null=True)
+    is_finalized = models.BooleanField(
+        default=False,
+        help_text="Once finalized, regenerating should create a new PDF "
+                   "revision rather than silently overwrite (spec §37/§38 "
+                   "'never silently change'). Enforcement lands with the "
+                   "generation view.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "report_cards"
+        ordering = ["-generated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["student", "term", "template"],
+                name="uniq_report_card_per_student_term_template",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.student} - {self.term}"
