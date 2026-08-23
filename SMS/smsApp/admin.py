@@ -34,6 +34,8 @@ from .models import (
     Subject,
     TeachingAssignment,
     Term,
+    Transcript,
+    TranscriptEntry,
     User,
 )
 
@@ -330,3 +332,44 @@ class ReportCardAdmin(admin.ModelAdmin):
     list_filter = ("term", "template", "is_finalized")
     search_fields = ("student__admission_number",)
     readonly_fields = ("pdf_file", "generated_by", "generated_at")
+
+
+class TranscriptEntryInline(admin.TabularInline):
+    model = TranscriptEntry
+    extra = 0
+    readonly_fields = (
+        "subject", "subject_name", "academic_year_label", "term_label",
+        "score", "grade", "grade_point", "credit_hours",
+    )
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(Transcript)
+class TranscriptAdmin(admin.ModelAdmin):
+    """A snapshotted permanent record (see models.Transcript docstring) —
+    generated only via smsApp.services.generate_transcript(); nothing here
+    is editable, since altering an issued transcript after the fact would
+    defeat its verification_code/content_hash tamper-evidence."""
+
+    list_display = (
+        "student", "generated_at", "academic_status", "graduation_status",
+        "gpa", "cgpa", "verification_code",
+    )
+    list_filter = ("academic_status", "graduation_status")
+    search_fields = ("student__admission_number", "verification_code")
+    readonly_fields = [f.name for f in Transcript._meta.fields]
+    inlines = [TranscriptEntryInline]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
