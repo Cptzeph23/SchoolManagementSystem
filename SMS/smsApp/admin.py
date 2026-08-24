@@ -53,6 +53,8 @@ from .models import (
     ReportCard,
     ReportTemplate,
     ResultAmendmentRequest,
+    Room,
+    Period,
     School,
     Staff,
     StaffQualification,
@@ -62,6 +64,7 @@ from .models import (
     Subject,
     TeachingAssignment,
     Term,
+    TimetableSlot,
     Transcript,
     TranscriptEntry,
     User,
@@ -653,3 +656,33 @@ class BorrowingAdmin(admin.ModelAdmin):
     )
     list_filter = ("status", "fine_paid")
     search_fields = ("book_copy__accession_number", "student__admission_number", "staff__staff_id")
+
+
+@admin.register(Room)
+class RoomAdmin(admin.ModelAdmin):
+    list_display = ("name", "school", "room_type", "capacity", "is_active")
+    list_filter = ("school", "room_type", "is_active")
+    search_fields = ("name",)
+
+
+@admin.register(Period)
+class PeriodAdmin(admin.ModelAdmin):
+    list_display = ("name", "school", "start_time", "end_time", "order", "is_break")
+    list_filter = ("school", "is_break")
+    search_fields = ("name",)
+
+
+@admin.register(TimetableSlot)
+class TimetableSlotAdmin(admin.ModelAdmin):
+    """Scheduling should go through smsApp.services.create_timetable_slot()
+    / reschedule_timetable_slot() so the three conflict checks (teacher,
+    room, class double-booking) run before a slot lands — creating rows
+    directly here still hits the DB constraints as a safety net, but
+    without the friendly per-conflict-type error messages."""
+
+    list_display = (
+        "class_group", "teaching_assignment", "day_of_week", "period", "room", "term",
+    )
+    list_filter = ("term", "day_of_week", "room")
+    search_fields = ("class_group__name", "teacher__staff_id")
+    readonly_fields = ("term", "teacher", "class_group")
