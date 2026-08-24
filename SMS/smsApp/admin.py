@@ -4,6 +4,7 @@ from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
 from .models import (
     AcademicYear,
+    Announcement,
     Assessment,
     AssessmentComponent,
     AssessmentMark,
@@ -40,6 +41,9 @@ from .models import (
     InvoiceLineItem,
     LibrarySettings,
     LoginHistory,
+    Notification,
+    NotificationDelivery,
+    NotificationPreference,
     Payment,
     Program,
     Publisher,
@@ -686,3 +690,37 @@ class TimetableSlotAdmin(admin.ModelAdmin):
     list_filter = ("term", "day_of_week", "room")
     search_fields = ("class_group__name", "teacher__staff_id")
     readonly_fields = ("term", "teacher", "class_group")
+
+
+@admin.register(Announcement)
+class AnnouncementAdmin(admin.ModelAdmin):
+    """Publishing is via smsApp.services.create_announcement() so the
+    role-aware Notification fan-out actually happens — creating a row
+    directly here does NOT notify anyone."""
+
+    list_display = ("title", "school", "audience", "is_published", "created_by", "created_at")
+    list_filter = ("school", "audience", "is_published")
+    search_fields = ("title",)
+
+
+class NotificationDeliveryInline(admin.TabularInline):
+    model = NotificationDelivery
+    extra = 0
+    readonly_fields = ("channel", "status", "provider_reference", "error_message", "sent_at")
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(Notification)
+class NotificationAdmin(admin.ModelAdmin):
+    list_display = ("recipient", "notification_type", "title", "is_read", "created_at")
+    list_filter = ("notification_type", "is_read")
+    search_fields = ("recipient__username", "title")
+    inlines = [NotificationDeliveryInline]
+
+
+@admin.register(NotificationPreference)
+class NotificationPreferenceAdmin(admin.ModelAdmin):
+    list_display = ("user", "in_app_enabled", "email_enabled", "sms_enabled", "push_enabled")
+    search_fields = ("user__username",)
