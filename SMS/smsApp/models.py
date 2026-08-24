@@ -2557,3 +2557,153 @@ class TimetableSlot(models.Model):
         self.teacher = self.teaching_assignment.teacher
         self.class_group = self.teaching_assignment.class_subject.class_group
         super().save(*args, **kwargs)
+
+
+# =============================================================================
+# Phase 15 — Communication Module (spec §22)
+# Spec: "SMS-ready architecture", "Push notification-ready architecture" —
+# the schema below supports these channels; only IN_APP and EMAIL actually
+# send anything (Django's own mail backend). SMS/PUSH create a
+# NotificationDelivery row with status PENDING and stay unsent until real
+# gateway credentials (e.g. Africa's Talking, Twilio, FCM) are configured —
+# same honest "architected, not fabricated" approach used for M-Pesa in
+# Phase 12. See services.send_notification() docstring for specifics.
+# =============================================================================
+
+class NotificationPreference(models.Model):
+    """Per-user opt-in/out per channel. IN_APP defaults on (it's the core,
+    zero-cost channel); SMS/PUSH default off since no live gateway is
+    configured yet — flipping them on before a gateway exists would just
+    silently queue undeliverable messages."""
+
+    user = models.OneToOneField(
+        "smsApp.User", on_delete=models.CASCADE, related_name="notification_preference"
+    )
+    in_app_enabled = models.BooleanField(default=True)
+    email_enabled = models.BooleanField(default=True)
+    sms_enabled = models.BooleanField(default=False)
+    push_enabled = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = "notification_preferences"
+
+    def __str__(self) -> str:
+        return f"Notification prefs - {self.user}"
+
+
+class Announcement(models.Model):
+    """Spec §22 'Announcements' — school-wide, not tied to one class or
+    subject (course-level announcements already exist as
+    Discussion(thread_type=ANNOUNCEMENT) from Phase 11). `audience` drives
+    which roles a Notification fan-out targets in
+    services.create_announcement()."""
+
+    class Audience(models.TextChoices):
+        ALL = "ALL", "Everyone"
+        STUDENTS = "STUDENTS", "Students"
+        PARENTS = "PARENTS", "Parents/Guardians"
+        STAFF = "STAFF", "All Staff"
+        TEACHERS = "TEACHERS", "Teachers"
+
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="announcements")
+    title = models.CharField(max_length=255)
+    body = models.TextField()
+    audience = models.CharField(max_length=10, choices=Audience.choices, default=Audience.ALL)
+    created_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="announcements_created",
+        blank=True, null=True,
+    )
+    is_published = models.BooleanField(default=True)
+    published_at = models.DateTimeField(blank=True, null=True)
+    expires_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "announcements"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.title
+
+
+class Notification(models.Model):
+    """Spec §22 'In-app notifications' + the role-aware examples given
+    (student result-published, parent report-available, finance
+    payment-received, teacher deadline-approaching). One row per
+    recipient per event — a broadcast announcement to 500 students
+    produces 500 Notification rows, not one shared row, so each
+    student's read/unread state is independent."""
+
+    class NotificationType(models.TextChoices):
+        RESULT_PUBLISHED = "RESULT_PUBLISHED", "Result Published"
+        REPORT_AVAILABLE = "REPORT_AVAILABLE", "Report Available"
+        PAYMENT_RECEIVED = "PAYMENT_RECEIVED", "Payment Received"
+        ASSIGNMENT_DEADLINE = "ASSIGNMENT_DEADLINE", "Assignment Deadline"
+        ANNOUNCEMENT = "ANNOUNCEMENT", "Announcement"
+        ATTENDANCE = "ATTENDANCE", "Attendance"
+        OTHER = "OTHER", "Other"
+
+    recipient = models.ForeignKey(
+        "smsApp.User", on_delete=models.CASCADE, related_name="notifications"
+    )
+    notification_type = models.CharField(
+        max_length=25, choices=NotificationType.choices, db_index=True
+    )
+    title = models.CharField(max_length=255)
+    message = models.TextField()
+    related_model = models.CharField(
+        max_length=100, blank=True, help_text="e.g. 'Invoice', 'ReportCard' — for click-through."
+    )
+    related_object_id = models.CharField(max_length=50, blank=True)
+    is_read = models.BooleanField(default=False, db_index=True)
+    read_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "notifications"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.recipient} - {self.title}"
+
+
+class NotificationDelivery(models.Model):
+    """One row per (Notification, channel) delivery attempt. Splitting
+    this from Notification itself lets one logical notification fan out
+    across multiple channels (in-app + email, say) with independent
+    success/failure tracking per channel."""
+
+    class Channel(models.TextChoices):
+        IN_APP = "IN_APP", "In-App"
+        EMAIL = "EMAIL", "Email"
+        SMS = "SMS", "SMS"
+        PUSH = "PUSH", "Push"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        SENT = "SENT", "Sent"
+        FAILED = "FAILED", "Failed"
+
+    notification = models.ForeignKey(
+        Notification, on_delete=models.CASCADE, related_name="deliveries"
+    )
+    channel = models.CharField(max_length=10, choices=Channel.choices)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    provider_reference = models.CharField(
+        max_length=255, blank=True, help_text="External message ID once a real gateway is wired up."
+    )
+    error_message = models.CharField(max_length=255, blank=True)
+    sent_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "notification_deliveries"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["notification", "channel"], name="uniq_delivery_per_notification_channel"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.notification} via {self.channel} ({self.status})"
