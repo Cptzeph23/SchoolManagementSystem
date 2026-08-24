@@ -1,688 +1,1546 @@
-# Absolute path: SMS/smsApp/admin.py
-from django.contrib import admin
-from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
+# Absolute path: SMS/smsApp/services.py
+"""
+Business logic / service layer.
 
-from .models import (
-    AcademicYear,
-    Assessment,
-    AssessmentComponent,
-    AssessmentMark,
-    AssessmentStructure,
-    AssessmentType,
-    Assignment,
-    AssignmentResource,
-    AssignmentSubmission,
-    AttendanceRecord,
-    Author,
-    Book,
-    BookCategory,
-    BookCopy,
-    Borrowing,
-    AttendanceSession,
-    AuditLog,
-    Campus,
-    Class,
-    ClassSubject,
-    CourseMaterial,
-    Department,
-    Discussion,
-    DiscussionReply,
-    Enrollment,
-    FeeCategory,
-    FeeConcession,
-    FeeStructure,
-    FeeStructureItem,
-    FinancialAdjustment,
-    GradeBand,
-    GradingScheme,
-    Guardian,
-    Invoice,
-    InvoiceLineItem,
-    LibrarySettings,
-    LoginHistory,
-    Payment,
-    Program,
-    Publisher,
-    Quiz,
-    QuizAnswer,
-    QuizAttempt,
-    QuizOption,
-    QuizQuestion,
-    Receipt,
-    Refund,
-    ReportCard,
-    ReportTemplate,
-    ResultAmendmentRequest,
-    Room,
-    Period,
-    School,
-    Staff,
-    StaffQualification,
-    Stream,
-    Student,
-    StudentGuardian,
-    Subject,
-    TeachingAssignment,
-    Term,
-    TimetableSlot,
-    Transcript,
-    TranscriptEntry,
-    User,
-)
+Per spec §3 'Separation of concerns', views must not contain business logic
+directly — they call into functions here. This keeps logic reusable between
+Django views today and DRF API views later (§3 'API-first architecture').
+"""
+from __future__ import annotations
+
+import datetime
+from decimal import Decimal
+from typing import Any
+
+from django.http import HttpRequest
+
+from .models import Assessment, AuditLog, ClassSubject, LoginHistory, Student, Term, User
 
 
-@admin.register(User)
-class UserAdmin(DjangoUserAdmin):
-    list_display = ("username", "email", "role", "is_active", "is_locked", "is_staff")
-    list_filter = ("role", "is_active", "is_locked", "is_staff")
-    search_fields = ("username", "email", "first_name", "last_name")
-    fieldsets = DjangoUserAdmin.fieldsets + (
-        ("SMS Profile", {"fields": ("role", "phone_number", "is_locked")}),
+def _client_ip(request: HttpRequest | None) -> str | None:
+    if request is None:
+        return None
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.META.get("REMOTE_ADDR")
+
+
+def log_audit(
+    *,
+    actor: User | None,
+    action: str,
+    request: HttpRequest | None = None,
+    target_model: str = "",
+    target_object_id: str | int = "",
+    description: str = "",
+    previous_value: dict[str, Any] | None = None,
+    new_value: dict[str, Any] | None = None,
+) -> AuditLog:
+    """Single write path for the audit trail (spec §5, §27, §33, §37, §38).
+    Every sensitive action (role changes, approvals, financial adjustments,
+    account lock/unlock, etc.) must go through this function rather than
+    writing to AuditLog directly, so the shape stays consistent."""
+    return AuditLog.objects.create(
+        actor=actor,
+        action=action,
+        target_model=target_model,
+        target_object_id=str(target_object_id) if target_object_id != "" else "",
+        description=description,
+        previous_value=previous_value,
+        new_value=new_value,
+        ip_address=_client_ip(request),
     )
 
 
-@admin.register(School)
-class SchoolAdmin(admin.ModelAdmin):
-    list_display = ("name", "code", "is_active", "created_at")
-    search_fields = ("name", "code")
-
-
-@admin.register(Campus)
-class CampusAdmin(admin.ModelAdmin):
-    list_display = ("name", "code", "school", "is_main", "is_active")
-    list_filter = ("school", "is_main", "is_active")
-    search_fields = ("name", "code")
-
-
-@admin.register(Department)
-class DepartmentAdmin(admin.ModelAdmin):
-    list_display = ("name", "code", "school", "campus", "head", "is_active")
-    list_filter = ("school", "campus", "is_active")
-    search_fields = ("name", "code")
-
-
-@admin.register(Program)
-class ProgramAdmin(admin.ModelAdmin):
-    list_display = ("name", "code", "school", "program_type", "is_active")
-    list_filter = ("school", "program_type", "is_active")
-    search_fields = ("name", "code")
-
-
-@admin.register(AcademicYear)
-class AcademicYearAdmin(admin.ModelAdmin):
-    list_display = ("name", "school", "start_date", "end_date", "is_current")
-    list_filter = ("school", "is_current")
-
-
-@admin.register(Term)
-class TermAdmin(admin.ModelAdmin):
-    list_display = ("name", "academic_year", "term_number", "start_date", "end_date", "is_current")
-    list_filter = ("academic_year__school", "is_current")
-
-
-@admin.register(Class)
-class ClassAdmin(admin.ModelAdmin):
-    list_display = ("name", "program", "school", "campus", "class_teacher", "is_active")
-    list_filter = ("school", "program", "campus", "is_active")
-    search_fields = ("name",)
-
-
-@admin.register(Stream)
-class StreamAdmin(admin.ModelAdmin):
-    list_display = ("name", "class_group", "capacity", "is_active")
-    list_filter = ("class_group__school", "is_active")
-    search_fields = ("name",)
-
-
-@admin.register(Guardian)
-class GuardianAdmin(admin.ModelAdmin):
-    list_display = ("first_name", "last_name", "relationship", "phone_number", "school", "is_active")
-    list_filter = ("school", "relationship", "is_active")
-    search_fields = ("first_name", "last_name", "phone_number", "email", "national_id")
-
-
-class StudentGuardianInline(admin.TabularInline):
-    model = StudentGuardian
-    extra = 1
-
-
-@admin.register(Student)
-class StudentAdmin(admin.ModelAdmin):
-    list_display = (
-        "admission_number", "user", "school", "current_class", "current_stream",
-        "status", "is_active",
+def record_login(
+    *, user: User, request: HttpRequest | None, was_successful: bool
+) -> LoginHistory:
+    """Spec §5 'View login history'. Called from the login view (Phase 4)."""
+    user_agent = request.META.get("HTTP_USER_AGENT", "")[:255] if request else ""
+    entry = LoginHistory.objects.create(
+        user=user,
+        ip_address=_client_ip(request),
+        user_agent=user_agent,
+        was_successful=was_successful,
     )
-    list_filter = ("school", "status", "current_class", "current_stream", "is_active")
-    search_fields = ("admission_number", "user__first_name", "user__last_name", "national_id")
-    inlines = [StudentGuardianInline]
-
-
-class StaffQualificationInline(admin.TabularInline):
-    model = StaffQualification
-    extra = 1
-
-
-@admin.register(Staff)
-class StaffAdmin(admin.ModelAdmin):
-    list_display = (
-        "staff_id", "user", "school", "department", "job_title",
-        "employment_status", "employment_type", "is_active",
+    log_audit(
+        actor=user,
+        action=AuditLog.Action.LOGIN if was_successful else AuditLog.Action.LOGIN_FAILED,
+        request=request,
+        target_model="User",
+        target_object_id=user.pk,
+        description="User logged in" if was_successful else "Failed login attempt",
     )
-    list_filter = ("school", "department", "employment_status", "employment_type", "is_active")
-    search_fields = ("staff_id", "user__first_name", "user__last_name", "job_title")
-    inlines = [StaffQualificationInline]
+    return entry
 
 
-@admin.register(AuditLog)
-class AuditLogAdmin(admin.ModelAdmin):
-    """Read-only in admin — audit rows must never be edited/deleted from
-    the UI (spec §37/§38 'never silently change'), only written via
-    smsApp.services.log_audit()."""
+def get_dashboard_url_for_role(user: User) -> str:
+    """Central place mapping a User -> dashboard URL name.
+    Used by the post-login router (Phase 4) and kept here, not hard-coded
+    in views, so Phase 6+ dashboards only need one line added here.
 
-    list_display = ("created_at", "actor", "action", "target_model", "target_object_id", "ip_address")
-    list_filter = ("action", "target_model")
-    search_fields = ("actor__username", "target_model", "target_object_id", "description")
-    readonly_fields = [f.name for f in AuditLog._meta.fields]
+    Accepts the full user (not just `role`) because `is_superuser` must
+    win regardless of `role` — see User.save() docstring for why `role`
+    alone can't be trusted for accounts created via createsuperuser."""
+    from django.urls import reverse
 
-    def has_add_permission(self, request):
-        return False
+    if user.is_superuser:
+        return reverse("dashboard:super_admin")
 
-    def has_change_permission(self, request, obj=None):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-
-@admin.register(LoginHistory)
-class LoginHistoryAdmin(admin.ModelAdmin):
-    list_display = ("created_at", "user", "was_successful", "ip_address")
-    list_filter = ("was_successful",)
-    search_fields = ("user__username",)
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_change_permission(self, request, obj=None):
-        return False
+    mapping = {
+        User.Role.SUPER_ADMIN: "dashboard:super_admin",
+        # Other roles route here as their dashboards are built
+        # (Staff Admin -> Phase 6, Academic Admin -> Phase 7, etc.)
+    }
+    url_name = mapping.get(user.role, "dashboard:coming_soon")
+    return reverse(url_name)
 
 
-@admin.register(Subject)
-class SubjectAdmin(admin.ModelAdmin):
-    list_display = ("name", "code", "school", "department", "subject_type", "credit_hours", "is_active")
-    list_filter = ("school", "department", "subject_type", "is_active")
-    search_fields = ("name", "code")
-    filter_horizontal = ("prerequisites",)
+def correct_attendance_record(
+    *,
+    record: "AttendanceRecord",
+    new_status: str,
+    corrected_by: User,
+    request: HttpRequest | None = None,
+    new_notes: str | None = None,
+) -> "AttendanceRecord":
+    """Spec §11: 'Academic Admin can... correct attendance with appropriate
+    permissions'. This is the single write path for corrections — callers
+    (views, Phase 7+) must not set `record.status = ...; record.save()`
+    directly, or the correction won't be captured in AuditLog (spec §5,
+    §27, §33 all require before/after values for sensitive edits).
 
+    Caller is responsible for the actual permission check (e.g.
+    RoleRequiredMixin on the view) — this function only records what
+    changed, it does not decide who is allowed to call it.
+    """
+    previous_value = {"status": record.status, "notes": record.notes}
 
-@admin.register(ClassSubject)
-class ClassSubjectAdmin(admin.ModelAdmin):
-    list_display = ("subject", "class_group", "is_active")
-    list_filter = ("class_group__school", "is_active")
-    search_fields = ("subject__name", "class_group__name")
+    record.status = new_status
+    if new_notes is not None:
+        record.notes = new_notes
+    record.recorded_by = corrected_by
+    record.save(update_fields=["status", "notes", "recorded_by", "updated_at"])
 
-
-@admin.register(TeachingAssignment)
-class TeachingAssignmentAdmin(admin.ModelAdmin):
-    list_display = ("class_subject", "teacher", "term", "is_active")
-    list_filter = ("term", "is_active")
-    search_fields = ("teacher__staff_id", "class_subject__subject__name")
-
-
-@admin.register(Enrollment)
-class EnrollmentAdmin(admin.ModelAdmin):
-    list_display = ("student", "class_subject", "academic_year", "status", "enrolled_on")
-    list_filter = ("academic_year", "status")
-    search_fields = ("student__admission_number", "class_subject__subject__name")
-
-
-class AttendanceRecordInline(admin.TabularInline):
-    model = AttendanceRecord
-    extra = 0
-
-
-@admin.register(AttendanceSession)
-class AttendanceSessionAdmin(admin.ModelAdmin):
-    list_display = ("class_subject", "date", "term", "taken_by", "is_locked")
-    list_filter = ("term", "is_locked", "class_subject__class_group__school")
-    search_fields = ("class_subject__subject__name",)
-    inlines = [AttendanceRecordInline]
-
-
-@admin.register(AttendanceRecord)
-class AttendanceRecordAdmin(admin.ModelAdmin):
-    """Direct editing here bypasses the audit trail in
-    smsApp.services.correct_attendance_record() — kept available for Super
-    Admin emergency fixes, but the in-app correction workflow (Phase 7+)
-    should be the normal path so corrections are logged."""
-
-    list_display = ("student", "session", "status", "recorded_by", "updated_at")
-    list_filter = ("status", "session__term")
-    search_fields = ("student__admission_number",)
-
-
-@admin.register(AssessmentType)
-class AssessmentTypeAdmin(admin.ModelAdmin):
-    list_display = ("name", "code", "school", "is_active")
-    list_filter = ("school", "is_active")
-    search_fields = ("name", "code")
-
-
-class AssessmentComponentInline(admin.TabularInline):
-    model = AssessmentComponent
-    extra = 1
-
-
-@admin.register(AssessmentStructure)
-class AssessmentStructureAdmin(admin.ModelAdmin):
-    list_display = ("name", "term", "subject", "school", "is_active")
-    list_filter = ("school", "term", "is_active")
-    search_fields = ("name",)
-    inlines = [AssessmentComponentInline]
-
-    def total_weight(self, obj):
-        return sum(c.weight_percentage for c in obj.components.all())
-    total_weight.short_description = "Total weight %"
-
-
-class GradeBandInline(admin.TabularInline):
-    model = GradeBand
-    extra = 1
-
-
-@admin.register(GradingScheme)
-class GradingSchemeAdmin(admin.ModelAdmin):
-    list_display = ("name", "school", "is_default", "is_active")
-    list_filter = ("school", "is_default", "is_active")
-    search_fields = ("name",)
-    inlines = [GradeBandInline]
-
-
-@admin.register(Assessment)
-class AssessmentAdmin(admin.ModelAdmin):
-    list_display = (
-        "title", "class_subject", "term", "component", "date",
-        "workflow_status", "is_published",
+    log_audit(
+        actor=corrected_by,
+        action=AuditLog.Action.UPDATE,
+        request=request,
+        target_model="AttendanceRecord",
+        target_object_id=record.pk,
+        description=f"Corrected attendance for {record.student} on {record.session.date}",
+        previous_value=previous_value,
+        new_value={"status": record.status, "notes": record.notes},
     )
-    list_filter = ("term", "workflow_status", "is_published", "class_subject__class_group__school")
-    search_fields = ("title",)
-    readonly_fields = (
-        "submitted_by", "submitted_at", "reviewed_by", "reviewed_at",
-        "verified_by", "verified_at", "approved_by", "approved_at",
-        "published_by", "published_at",
+    return record
+
+
+# =============================================================================
+# Phase 7 — Grading engine (spec §13). All lookups are data-driven off
+# GradingScheme/GradeBand/AssessmentComponent — nothing here hard-codes a
+# grade boundary or a weighting percentage.
+# =============================================================================
+
+def get_grade_for_mark(scheme, mark) -> "GradeBand | None":
+    """Spec §13: resolve a numeric mark to a GradeBand under the given
+    scheme. Returns None if no band covers the mark (a configuration gap
+    the caller/UI should surface, not silently default from)."""
+    return scheme.bands.filter(min_mark__lte=mark, max_mark__gte=mark).first()
+
+
+def validate_grade_bands_no_overlap(scheme) -> list[str]:
+    """Returns a list of human-readable overlap errors for the scheme's
+    bands, empty if none. Not a DB constraint (cross-row check) — called
+    from the admin/service layer before treating a scheme as usable."""
+    bands = list(scheme.bands.order_by("min_mark"))
+    errors: list[str] = []
+    for i in range(len(bands) - 1):
+        current, nxt = bands[i], bands[i + 1]
+        if current.max_mark >= nxt.min_mark:
+            errors.append(
+                f"'{current.grade}' ({current.min_mark}-{current.max_mark}) overlaps "
+                f"'{nxt.grade}' ({nxt.min_mark}-{nxt.max_mark})"
+            )
+    return errors
+
+
+def compute_weighted_average(
+    student, class_subject, term, *, published_only: bool = False
+) -> dict[str, Any]:
+    """Spec §12/§13: weighted total across all Assessments for a student
+    in a ClassSubject/Term, using each Assessment's linked
+    AssessmentComponent for weight and max_marks — no percentages are
+    hard-coded here, they're read entirely from the configured structure.
+
+    `published_only=True` restricts to Assessments whose workflow has
+    reached PUBLISHED (spec §14) — used by transcript generation (Phase
+    10), which must never include draft/unapproved marks in an official
+    academic record. Report books (Phase 9) intentionally leave this
+    False, since a term-in-progress report legitimately shows draft marks.
+
+    Returns a dict rather than a bare number because callers (report book,
+    Phase 15) need the raw weighted score, the count of graded components,
+    and whether every configured component has a mark yet.
+    """
+    assessments = (
+        class_subject.assessments
+        .filter(term=term)
+        .select_related("component")
+    )
+    if published_only:
+        assessments = assessments.filter(workflow_status=Assessment.WorkflowStatus.PUBLISHED)
+
+    weighted_total = Decimal("0")
+    weight_covered = Decimal("0")
+    components_graded = 0
+    components_total = assessments.count()
+
+    for assessment in assessments:
+        mark_row = assessment.marks.filter(student=student).first()
+        if mark_row is None:
+            continue
+        component = assessment.component
+        if component.max_marks <= 0:
+            continue
+        proportion = mark_row.marks_obtained / component.max_marks
+        weighted_total += proportion * component.weight_percentage
+        weight_covered += component.weight_percentage
+        components_graded += 1
+
+    return {
+        "weighted_total": weighted_total.quantize(Decimal("0.01")),
+        "weight_covered": weight_covered.quantize(Decimal("0.01")),
+        "components_graded": components_graded,
+        "components_total": components_total,
+        "is_complete": components_graded == components_total and components_total > 0,
+    }
+
+
+# =============================================================================
+# Phase 8 — Result Processing Workflow (spec §14)
+# DRAFT -> SUBMITTED -> REVIEWED -> VERIFIED -> APPROVED -> PUBLISHED.
+# Every transition is a separate, narrow function so each pipeline stage
+# can be permission-checked independently by the calling view (e.g. only
+# a Class Teacher may call review_assessment, only Academic Admin may call
+# verify_assessment) — this module does not decide who is allowed to call
+# it, only that the *sequence* is respected and every step is audited.
+# =============================================================================
+
+_WORKFLOW_ORDER = [
+    "DRAFT", "SUBMITTED", "REVIEWED", "VERIFIED", "APPROVED", "PUBLISHED",
+]
+
+
+def _require_status(assessment, expected: str) -> None:
+    if assessment.workflow_status != expected:
+        raise ValueError(
+            f"Cannot perform this transition from status "
+            f"'{assessment.workflow_status}' — expected '{expected}'."
+        )
+
+
+def transition_assessment_workflow(
+    *,
+    assessment: "Assessment",
+    to_status: str,
+    actor: User,
+    request: HttpRequest | None = None,
+) -> "Assessment":
+    """Single write path for every workflow stage change. `to_status` must
+    be the next status in _WORKFLOW_ORDER (no skipping stages, no going
+    backwards except via explicit rejection — see reject_assessment).
+
+    Enforces spec §9: 'Teachers must not be able to approve their own
+    final results' — the actor who submitted an assessment cannot also
+    be the one who approves it.
+    """
+    from django.utils import timezone
+
+    current_index = _WORKFLOW_ORDER.index(assessment.workflow_status)
+    try:
+        target_index = _WORKFLOW_ORDER.index(to_status)
+    except ValueError:
+        raise ValueError(f"'{to_status}' is not a valid forward workflow status.")
+
+    if target_index != current_index + 1:
+        raise ValueError(
+            f"Cannot jump from '{assessment.workflow_status}' to '{to_status}' — "
+            f"stages must be completed in order."
+        )
+
+    if to_status == Assessment.WorkflowStatus.APPROVED and assessment.submitted_by_id == actor.pk:
+        raise PermissionError(
+            "A teacher cannot approve their own submitted results — "
+            "independent approval is required (spec §9)."
+        )
+
+    now = timezone.now()
+    field_map = {
+        "SUBMITTED": ("submitted_by", "submitted_at"),
+        "REVIEWED": ("reviewed_by", "reviewed_at"),
+        "VERIFIED": ("verified_by", "verified_at"),
+        "APPROVED": ("approved_by", "approved_at"),
+        "PUBLISHED": ("published_by", "published_at"),
+    }
+    actor_field, timestamp_field = field_map[to_status]
+    setattr(assessment, actor_field, actor)
+    setattr(assessment, timestamp_field, now)
+    assessment.workflow_status = to_status
+    if to_status == Assessment.WorkflowStatus.PUBLISHED:
+        assessment.is_published = True
+
+    assessment.save()
+
+    log_audit(
+        actor=actor,
+        action=AuditLog.Action.PUBLISH if to_status == "PUBLISHED" else AuditLog.Action.APPROVE,
+        request=request,
+        target_model="Assessment",
+        target_object_id=assessment.pk,
+        description=f"Assessment moved to '{to_status}'",
+        previous_value={"workflow_status": _WORKFLOW_ORDER[current_index]},
+        new_value={"workflow_status": to_status},
+    )
+    return assessment
+
+
+def reject_assessment(
+    *, assessment: "Assessment", actor: User, reason: str, request: HttpRequest | None = None
+) -> "Assessment":
+    """Sends an assessment back to DRAFT for correction, from any
+    in-progress stage (not from PUBLISHED — use amendment requests
+    instead, since published results must not be silently reopened)."""
+    if assessment.workflow_status in (
+        Assessment.WorkflowStatus.DRAFT, Assessment.WorkflowStatus.PUBLISHED,
+    ):
+        raise ValueError(
+            f"Cannot reject an assessment in '{assessment.workflow_status}' status."
+        )
+
+    previous_status = assessment.workflow_status
+    assessment.workflow_status = Assessment.WorkflowStatus.DRAFT
+    assessment.save(update_fields=["workflow_status", "updated_at"])
+
+    log_audit(
+        actor=actor,
+        action=AuditLog.Action.UPDATE,
+        request=request,
+        target_model="Assessment",
+        target_object_id=assessment.pk,
+        description=f"Assessment rejected and returned to Draft: {reason}",
+        previous_value={"workflow_status": previous_status},
+        new_value={"workflow_status": "DRAFT"},
+    )
+    return assessment
+
+
+def request_result_amendment(
+    *,
+    assessment_mark: "AssessmentMark",
+    reason: str,
+    proposed_mark,
+    requested_by: User,
+    request: HttpRequest | None = None,
+) -> "ResultAmendmentRequest":
+    """Spec §14: the only way to change a mark once its Assessment has
+    been PUBLISHED. Captures original_mark as a snapshot so the audit
+    trail is accurate even if the mark changes again before this is
+    reviewed."""
+    from .models import ResultAmendmentRequest
+
+    amendment = ResultAmendmentRequest.objects.create(
+        assessment_mark=assessment_mark,
+        reason=reason,
+        original_mark=assessment_mark.marks_obtained,
+        proposed_mark=proposed_mark,
+        requested_by=requested_by,
+    )
+    log_audit(
+        actor=requested_by,
+        action=AuditLog.Action.OTHER,
+        request=request,
+        target_model="ResultAmendmentRequest",
+        target_object_id=amendment.pk,
+        description=reason,
+        previous_value={"mark": str(assessment_mark.marks_obtained)},
+        new_value={"proposed_mark": str(proposed_mark)},
+    )
+    return amendment
+
+
+def decide_result_amendment(
+    *,
+    amendment: "ResultAmendmentRequest",
+    approve: bool,
+    reviewed_by: User,
+    comment: str = "",
+    request: HttpRequest | None = None,
+) -> "ResultAmendmentRequest":
+    """Applies or rejects a pending amendment. Approving is the *only*
+    code path permitted to mutate marks.marks_obtained on a mark whose
+    Assessment is already PUBLISHED (spec §14 'prevent unrestricted
+    modification')."""
+    from django.utils import timezone
+    from .models import ResultAmendmentRequest
+
+    if amendment.status != ResultAmendmentRequest.Status.PENDING:
+        raise ValueError("This amendment request has already been decided.")
+
+    amendment.reviewed_by = reviewed_by
+    amendment.reviewed_at = timezone.now()
+    amendment.review_comment = comment
+
+    if approve:
+        amendment.status = ResultAmendmentRequest.Status.APPROVED
+        mark = amendment.assessment_mark
+        previous_marks = mark.marks_obtained
+        mark.marks_obtained = amendment.proposed_mark
+        mark.save(update_fields=["marks_obtained", "updated_at"], _bypass_publish_lock=True)
+
+        log_audit(
+            actor=reviewed_by,
+            action=AuditLog.Action.UPDATE,
+            request=request,
+            target_model="AssessmentMark",
+            target_object_id=mark.pk,
+            description=f"Amendment approved: {amendment.reason}",
+            previous_value={"marks_obtained": str(previous_marks)},
+            new_value={"marks_obtained": str(mark.marks_obtained)},
+        )
+    else:
+        amendment.status = ResultAmendmentRequest.Status.REJECTED
+        log_audit(
+            actor=reviewed_by,
+            action=AuditLog.Action.OTHER,
+            request=request,
+            target_model="ResultAmendmentRequest",
+            target_object_id=amendment.pk,
+            description=f"Amendment rejected: {comment}",
+        )
+
+    amendment.save(update_fields=["status", "reviewed_by", "reviewed_at", "review_comment"])
+    return amendment
+
+
+# =============================================================================
+# Phase 9 — Report Book System (spec §15). All layout lives in
+# templates/reports/*.html; nothing here hard-codes HTML/positioning —
+# this module only assembles the data dict the template renders.
+# =============================================================================
+
+def compute_class_term_rankings(*, class_group, term) -> dict[int, dict[str, Any]]:
+    """Spec §13: 'Make ranking configurable because some schools may
+    choose not to rank students' — callers must check
+    class_group.school.enable_position_ranking before using this for
+    display; it's computed unconditionally here so the check stays a
+    presentation decision, not a data-availability one.
+
+    Returns {student_id: {"average": Decimal, "position": int}} across
+    every student currently in the class, ranked by their average
+    percentage across all of their ClassSubjects for the term.
+    """
+    students = Student.objects.filter(current_class=class_group, is_active=True)
+    averages: list[tuple[int, Decimal]] = []
+
+    for student in students:
+        class_subjects = ClassSubject.objects.filter(
+            enrollments__student=student, enrollments__academic_year=term.academic_year
+        ).distinct()
+        if not class_subjects:
+            continue
+        totals = [
+            compute_weighted_average(student, cs, term)["weighted_total"]
+            for cs in class_subjects
+        ]
+        if totals:
+            averages.append((student.pk, sum(totals) / len(totals)))
+
+    averages.sort(key=lambda pair: pair[1], reverse=True)
+
+    results: dict[int, dict[str, Any]] = {}
+    for position, (student_id, average) in enumerate(averages, start=1):
+        results[student_id] = {"average": average, "position": position}
+    return results
+
+
+def assemble_report_data(*, student: "Student", term: "Term") -> dict[str, Any]:
+    """Spec §15: gathers every field the report layout needs — school
+    identity, student identity, per-subject marks/grades, attendance,
+    position (if enabled) — into one plain dict. The template decides how
+    to lay it out; this function never renders HTML or decides layout."""
+    from .models import AttendanceRecord, GradingScheme
+
+    school = student.school
+    class_subjects = ClassSubject.objects.filter(
+        enrollments__student=student, enrollments__academic_year=term.academic_year
+    ).distinct().select_related("subject")
+
+    grading_scheme = GradingScheme.objects.filter(school=school, is_default=True).first()
+
+    subject_rows = []
+    percentage_totals = []
+    for class_subject in class_subjects:
+        summary = compute_weighted_average(student, class_subject, term)
+        band = None
+        if grading_scheme and summary["weight_covered"] > 0:
+            band = get_grade_for_mark(grading_scheme, summary["weighted_total"])
+        subject_rows.append(
+            {
+                "subject": class_subject.subject.name,
+                "score": summary["weighted_total"],
+                "grade": band.grade if band else "-",
+                "grade_point": band.grade_point if band else None,
+                "is_complete": summary["is_complete"],
+            }
+        )
+        if summary["weight_covered"] > 0:
+            percentage_totals.append(summary["weighted_total"])
+
+    average = (
+        (sum(percentage_totals) / len(percentage_totals)).quantize(Decimal("0.01"))
+        if percentage_totals else None
     )
 
+    ranking = None
+    if school.enable_position_ranking and student.current_class_id:
+        rankings = compute_class_term_rankings(class_group=student.current_class, term=term)
+        ranking = rankings.get(student.pk)
 
-@admin.register(AssessmentMark)
-class AssessmentMarkAdmin(admin.ModelAdmin):
-    list_display = ("student", "assessment", "marks_obtained", "recorded_by", "updated_at")
-    list_filter = ("assessment__term",)
-    search_fields = ("student__admission_number",)
-
-
-@admin.register(ResultAmendmentRequest)
-class ResultAmendmentRequestAdmin(admin.ModelAdmin):
-    """List/review only — approving or rejecting must go through
-    smsApp.services.decide_result_amendment() so the mark change and
-    audit log stay in sync. Direct admin edits to `status` here would
-    silently desync the mark from the request."""
-
-    list_display = (
-        "assessment_mark", "original_mark", "proposed_mark", "status",
-        "requested_by", "requested_at",
+    attendance_qs = AttendanceRecord.objects.filter(
+        student=student, session__term=term
     )
-    list_filter = ("status",)
-    search_fields = ("assessment_mark__student__admission_number", "reason")
-    readonly_fields = (
-        "assessment_mark", "original_mark", "proposed_mark", "requested_by",
-        "requested_at", "reviewed_by", "reviewed_at",
+    attendance_summary = {
+        "present": attendance_qs.filter(status="PRESENT").count(),
+        "absent": attendance_qs.filter(status="ABSENT").count(),
+        "late": attendance_qs.filter(status="LATE").count(),
+        "excused": attendance_qs.filter(status="EXCUSED").count(),
+    }
+
+    return {
+        "school": school,
+        "student": student,
+        "class_group": student.current_class,
+        "stream": student.current_stream,
+        "academic_year": term.academic_year,
+        "term": term,
+        "subject_rows": subject_rows,
+        "average": average,
+        "position": ranking["position"] if ranking else None,
+        "class_size": len(
+            [k for k in (compute_class_term_rankings(
+                class_group=student.current_class, term=term
+            ) if student.current_class_id else {})]
+        ) if ranking else None,
+        "attendance_summary": attendance_summary,
+    }
+
+
+def render_report_html(*, report_card: "ReportCard") -> str:
+    """Renders report_card's configured template with freshly assembled
+    data. Template choice and which sections to show come entirely from
+    ReportTemplate (spec §15 'Allow report templates to be configurable.
+    Do not hard-code the report layout into business logic') — this
+    function contains no layout decisions itself."""
+    from django.template.loader import render_to_string
+
+    template_paths = {
+        "DEFAULT": "reports/default.html",
+    }
+    template_path = template_paths[report_card.template.template_key]
+
+    context = assemble_report_data(student=report_card.student, term=report_card.term)
+    context.update(
+        {
+            "template_config": report_card.template,
+            "class_teacher_comment": report_card.class_teacher_comment,
+            "principal_comment": report_card.principal_comment,
+        }
+    )
+    return render_to_string(template_path, context)
+
+
+def generate_report_pdf(
+    *, report_card: "ReportCard", generated_by: User, request: HttpRequest | None = None
+) -> "ReportCard":
+    """Spec §15 'PDF report' / 'Downloadable report'. Renders via
+    render_report_html() then converts with WeasyPrint (HTML/CSS -> PDF),
+    so the PDF and the on-screen HTML report always come from the exact
+    same template and data-assembly code — no separate PDF-only layout
+    to fall out of sync."""
+    from django.core.files.base import ContentFile
+    from django.utils import timezone
+    from weasyprint import HTML
+
+    html_content = render_report_html(report_card=report_card)
+    pdf_bytes = HTML(string=html_content).write_pdf()
+
+    filename = f"report_{report_card.student.admission_number}_{report_card.term_id}.pdf"
+    report_card.pdf_file.save(filename, ContentFile(pdf_bytes), save=False)
+    report_card.generated_by = generated_by
+    report_card.generated_at = timezone.now()
+    report_card.save()
+
+    log_audit(
+        actor=generated_by,
+        action=AuditLog.Action.OTHER,
+        request=request,
+        target_model="ReportCard",
+        target_object_id=report_card.pk,
+        description=f"Generated report PDF for {report_card.student}",
+    )
+    return report_card
+
+
+def generate_batch_reports(
+    *,
+    class_group,
+    term: "Term",
+    template: "ReportTemplate",
+    generated_by: User,
+    request: HttpRequest | None = None,
+) -> list["ReportCard"]:
+    """Spec §15 'Batch reports'. Creates/updates one ReportCard per active
+    student in the class and generates each PDF. Returns the list so the
+    calling view can present a summary/zip download."""
+    from .models import ReportCard as ReportCardModel
+
+    cards = []
+    for student in Student.objects.filter(current_class=class_group, is_active=True):
+        card, _ = ReportCardModel.objects.get_or_create(
+            student=student, term=term, template=template
+        )
+        generate_report_pdf(report_card=card, generated_by=generated_by, request=request)
+        cards.append(card)
+    return cards
+
+
+# =============================================================================
+# Phase 10 — Transcript System (spec §16). See Transcript/TranscriptEntry
+# docstrings in models.py for why entries are snapshotted rather than
+# recomputed live, and for the "secure PDF" interpretation.
+# =============================================================================
+
+def generate_transcript(
+    *, student: "Student", generated_by: User, request: HttpRequest | None = None
+) -> "Transcript":
+    """Builds a full cumulative transcript from every PUBLISHED assessment
+    across every term/class_subject the student has been enrolled in,
+    snapshots it into TranscriptEntry rows, computes GPA/CGPA, renders the
+    PDF, and stamps a verification_code + content_hash."""
+    import hashlib
+
+    from django.core.files.base import ContentFile
+    from django.template.loader import render_to_string
+    from django.utils import timezone
+    from weasyprint import HTML
+
+    from .models import ClassSubject as ClassSubjectModel, GradingScheme, Transcript as TranscriptModel
+
+    school = student.school
+    grading_scheme = GradingScheme.objects.filter(school=school, is_default=True).first()
+
+    class_subjects = (
+        ClassSubjectModel.objects.filter(enrollments__student=student)
+        .distinct()
+        .select_related("subject", "class_group")
     )
 
-    def has_add_permission(self, request):
-        return False
+    entry_rows = []
+    latest_term = None
+    for class_subject in class_subjects:
+        terms = Term.objects.filter(
+            assessments__class_subject=class_subject,
+            assessments__marks__student=student,
+            assessments__workflow_status=Assessment.WorkflowStatus.PUBLISHED,
+        ).distinct()
 
+        for term in terms:
+            summary = compute_weighted_average(
+                student, class_subject, term, published_only=True
+            )
+            if summary["components_graded"] == 0:
+                continue
 
-@admin.register(ReportTemplate)
-class ReportTemplateAdmin(admin.ModelAdmin):
-    list_display = (
-        "name", "school", "template_key", "show_position", "show_gpa",
-        "show_attendance", "is_default", "is_active",
+            band = None
+            if grading_scheme:
+                band = get_grade_for_mark(grading_scheme, summary["weighted_total"])
+
+            entry_rows.append(
+                {
+                    "subject": class_subject.subject,
+                    "subject_name": class_subject.subject.name,
+                    "academic_year_label": term.academic_year.name,
+                    "term_label": term.name,
+                    "score": summary["weighted_total"],
+                    "grade": band.grade if band else "",
+                    "grade_point": band.grade_point if band else None,
+                    "credit_hours": class_subject.subject.credit_hours,
+                    "term_obj": term,
+                }
+            )
+            if latest_term is None or term.start_date > latest_term.start_date:
+                latest_term = term
+
+    def _grade_points(rows):
+        return [r["grade_point"] for r in rows if r["grade_point"] is not None]
+
+    cgpa = None
+    all_points = _grade_points(entry_rows)
+    if all_points:
+        weighted_sum = Decimal("0")
+        weight_sum = Decimal("0")
+        for row in entry_rows:
+            if row["grade_point"] is None:
+                continue
+            credit = row["credit_hours"] or Decimal("1")
+            weighted_sum += row["grade_point"] * credit
+            weight_sum += credit
+        cgpa = (weighted_sum / weight_sum).quantize(Decimal("0.01")) if weight_sum else None
+
+    gpa = None
+    if latest_term is not None:
+        latest_points = _grade_points(
+            [r for r in entry_rows if r["term_obj"] == latest_term]
+        )
+        if latest_points:
+            gpa = (sum(latest_points) / len(latest_points)).quantize(Decimal("0.01"))
+
+    graduation_status = TranscriptModel.GraduationStatus.IN_PROGRESS
+    if student.status == Student.Status.GRADUATED:
+        graduation_status = TranscriptModel.GraduationStatus.GRADUATED
+    elif student.status in (
+        Student.Status.WITHDRAWN, Student.Status.EXPELLED, Student.Status.TRANSFERRED,
+    ):
+        graduation_status = TranscriptModel.GraduationStatus.NOT_GRADUATED
+
+    transcript = TranscriptModel.objects.create(
+        student=student,
+        generated_by=generated_by,
+        academic_status=student.status,
+        graduation_status=graduation_status,
+        gpa=gpa,
+        cgpa=cgpa,
     )
-    list_filter = ("school", "template_key", "is_default", "is_active")
 
+    for row in entry_rows:
+        transcript.entries.create(
+            subject=row["subject"],
+            subject_name=row["subject_name"],
+            academic_year_label=row["academic_year_label"],
+            term_label=row["term_label"],
+            score=row["score"],
+            grade=row["grade"],
+            grade_point=row["grade_point"],
+            credit_hours=row["credit_hours"],
+        )
 
-@admin.register(ReportCard)
-class ReportCardAdmin(admin.ModelAdmin):
-    """Generation is via smsApp.services.generate_report_pdf() (called from
-    the report views) — editing pdf_file directly here would desync the
-    stored file from the underlying assembled data."""
-
-    list_display = (
-        "student", "term", "template", "is_finalized", "generated_by", "generated_at",
+    # Content hash over a canonical representation of what was issued, so
+    # a later dispute can prove whether a PDF matches what was generated.
+    canonical = "|".join(
+        f"{r['subject_name']}:{r['term_label']}:{r['score']}:{r['grade']}"
+        for r in sorted(entry_rows, key=lambda r: (r["academic_year_label"], r["term_label"], r["subject_name"]))
     )
-    list_filter = ("term", "template", "is_finalized")
-    search_fields = ("student__admission_number",)
-    readonly_fields = ("pdf_file", "generated_by", "generated_at")
+    canonical += f"|gpa={gpa}|cgpa={cgpa}|status={student.status}"
+    transcript.content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    transcript.save(update_fields=["content_hash"])
 
-
-class TranscriptEntryInline(admin.TabularInline):
-    model = TranscriptEntry
-    extra = 0
-    readonly_fields = (
-        "subject", "subject_name", "academic_year_label", "term_label",
-        "score", "grade", "grade_point", "credit_hours",
+    html_content = render_to_string(
+        "reports/transcript.html",
+        {
+            "school": school,
+            "student": student,
+            "transcript": transcript,
+            "entries": transcript.entries.all(),
+        },
+    )
+    pdf_bytes = HTML(string=html_content).write_pdf()
+    transcript.pdf_file.save(
+        f"transcript_{student.admission_number}_{transcript.pk}.pdf",
+        ContentFile(pdf_bytes), save=True,
     )
 
-    def has_add_permission(self, request, obj=None):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-
-@admin.register(Transcript)
-class TranscriptAdmin(admin.ModelAdmin):
-    """A snapshotted permanent record (see models.Transcript docstring) —
-    generated only via smsApp.services.generate_transcript(); nothing here
-    is editable, since altering an issued transcript after the fact would
-    defeat its verification_code/content_hash tamper-evidence."""
-
-    list_display = (
-        "student", "generated_at", "academic_status", "graduation_status",
-        "gpa", "cgpa", "verification_code",
+    log_audit(
+        actor=generated_by,
+        action=AuditLog.Action.OTHER,
+        request=request,
+        target_model="Transcript",
+        target_object_id=transcript.pk,
+        description=f"Generated transcript for {student}",
     )
-    list_filter = ("academic_status", "graduation_status")
-    search_fields = ("student__admission_number", "verification_code")
-    readonly_fields = [f.name for f in Transcript._meta.fields]
-    inlines = [TranscriptEntryInline]
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_change_permission(self, request, obj=None):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
+    return transcript
 
 
-@admin.register(CourseMaterial)
-class CourseMaterialAdmin(admin.ModelAdmin):
-    list_display = ("title", "material_type", "class_subject", "term", "is_published", "order")
-    list_filter = ("material_type", "term", "is_published")
-    search_fields = ("title",)
+def verify_transcript(verification_code) -> dict[str, Any]:
+    """Spec §16 'Generate secure PDF documents' — the verification half of
+    that: given the UUID printed on an issued transcript, confirm it's
+    genuine without exposing the full academic record to whoever holds
+    the code."""
+    from .models import Transcript as TranscriptModel
+
+    transcript = TranscriptModel.objects.filter(verification_code=verification_code).first()
+    if transcript is None:
+        return {"valid": False}
+
+    return {
+        "valid": True,
+        "student_name": transcript.student.user.get_full_name()
+        or transcript.student.user.username,
+        "admission_number": transcript.student.admission_number,
+        "generated_at": transcript.generated_at,
+        "cgpa": transcript.cgpa,
+        "graduation_status": transcript.get_graduation_status_display(),
+    }
 
 
-class AssignmentResourceInline(admin.TabularInline):
-    model = AssignmentResource
-    extra = 0
+# =============================================================================
+# Phase 11 — LMS Module (spec §10)
+# =============================================================================
+
+def submit_assignment(
+    *,
+    assignment: "Assignment",
+    student: Student,
+    submitted_file=None,
+    submitted_text: str = "",
+    request: HttpRequest | None = None,
+):
+    """Spec §10 'Upload submissions' / 'Resubmit where permitted'. Single
+    write path for both first submission and resubmission — enforces:
+    - a first submission is always allowed (while published);
+    - a second+ submission requires assignment.allow_resubmission;
+    - `is_late` is computed against the deadline at submission time and
+      never recomputed later, so it stays an honest historical record
+      even if the deadline is edited afterward.
+    """
+    from django.utils import timezone
+
+    from .models import AssignmentSubmission
+
+    existing = AssignmentSubmission.objects.filter(
+        assignment=assignment, student=student
+    ).first()
+
+    if existing is not None and not assignment.allow_resubmission:
+        raise ValueError(
+            "This assignment does not allow resubmission; a submission "
+            "already exists for this student."
+        )
+
+    now = timezone.now()
+    is_late = now > assignment.deadline
+
+    if existing is None:
+        submission = AssignmentSubmission.objects.create(
+            assignment=assignment, student=student,
+            submitted_file=submitted_file, submitted_text=submitted_text,
+            is_late=is_late, status=AssignmentSubmission.Status.SUBMITTED,
+        )
+    else:
+        previous_value = {
+            "submitted_text": existing.submitted_text,
+            "attempt_number": existing.attempt_number,
+        }
+        existing.submitted_file = submitted_file
+        existing.submitted_text = submitted_text
+        existing.attempt_number += 1
+        existing.is_late = is_late
+        existing.status = AssignmentSubmission.Status.RESUBMITTED
+        # A resubmission supersedes any prior grade — re-grading is required.
+        existing.marks_obtained = None
+        existing.feedback = ""
+        existing.graded_by = None
+        existing.graded_at = None
+        existing.save()
+        submission = existing
+
+        log_audit(
+            actor=student.user, action=AuditLog.Action.UPDATE, request=request,
+            target_model="AssignmentSubmission", target_object_id=submission.pk,
+            description=f"Resubmitted {assignment.title}",
+            previous_value=previous_value,
+            new_value={"attempt_number": submission.attempt_number},
+        )
+
+    return submission
 
 
-@admin.register(Assignment)
-class AssignmentAdmin(admin.ModelAdmin):
-    list_display = (
-        "title", "class_subject", "term", "deadline", "max_marks",
-        "allow_resubmission", "is_published",
+def grade_assignment_submission(
+    *,
+    submission: "AssignmentSubmission",
+    marks_obtained: Decimal,
+    feedback: str,
+    graded_by: Staff,
+    request: HttpRequest | None = None,
+):
+    """Spec §10 'Mark assignments' / 'Provide feedback' (Teacher Dashboard,
+    §9)."""
+    from django.utils import timezone
+
+    from .models import AssignmentSubmission
+
+    if marks_obtained > submission.assignment.max_marks:
+        raise ValueError(
+            f"marks_obtained ({marks_obtained}) cannot exceed "
+            f"the assignment's max_marks ({submission.assignment.max_marks})."
+        )
+
+    submission.marks_obtained = marks_obtained
+    submission.feedback = feedback
+    submission.graded_by = graded_by
+    submission.graded_at = timezone.now()
+    submission.status = AssignmentSubmission.Status.GRADED
+    submission.save()
+
+    log_audit(
+        actor=graded_by.user, action=AuditLog.Action.OTHER, request=request,
+        target_model="AssignmentSubmission", target_object_id=submission.pk,
+        description=f"Graded submission for {submission.assignment.title}",
+        new_value={"marks_obtained": str(marks_obtained)},
     )
-    list_filter = ("term", "submission_format", "allow_resubmission", "is_published")
-    search_fields = ("title",)
-    inlines = [AssignmentResourceInline]
+    return submission
 
 
-@admin.register(AssignmentSubmission)
-class AssignmentSubmissionAdmin(admin.ModelAdmin):
-    """Grading should go through smsApp.services.grade_assignment_submission()
-    so marks changes stay audit-logged — this admin view is for
-    oversight/browsing, not the primary grading workflow."""
+def submit_quiz_attempt(
+    *,
+    attempt: "QuizAttempt",
+    answers: dict[int, dict],
+) -> "QuizAttempt":
+    """Spec §10 'Implement automatic marking where appropriate'.
 
-    list_display = (
-        "student", "assignment", "attempt_number", "status", "is_late",
-        "marks_obtained", "submitted_at",
+    `answers` maps question_id -> {"option_ids": [...]} for
+    MULTIPLE_CHOICE/TRUE_FALSE/MULTIPLE_ANSWER, or {"text": "..."} for
+    SHORT_ANSWER.
+
+    Auto-grades objective question types by exact-match: a MULTIPLE_CHOICE
+    or TRUE_FALSE question is correct if the single selected option is the
+    correct one; a MULTIPLE_ANSWER question is correct only if the
+    selected set exactly equals the correct set (no partial credit in
+    this MVP — see docstring note below for extending to partial credit).
+    SHORT_ANSWER questions are recorded but left ungraded
+    (marks_awarded=None) for manual grading.
+    """
+    from django.utils import timezone
+
+    from .models import QuizAnswer
+
+    auto_score = Decimal("0")
+    has_ungraded_manual = False
+
+    for question in attempt.quiz.questions.all():
+        payload = answers.get(question.pk, {})
+        answer = QuizAnswer.objects.create(attempt=attempt, question=question)
+
+        if question.question_type == question.QuestionType.SHORT_ANSWER:
+            answer.text_answer = payload.get("text", "")
+            answer.marks_awarded = None
+            answer.save()
+            has_ungraded_manual = True
+            continue
+
+        option_ids = set(payload.get("option_ids", []))
+        answer.selected_options.set(option_ids)
+
+        correct_ids = set(
+            question.options.filter(is_correct=True).values_list("pk", flat=True)
+        )
+        is_correct = option_ids == correct_ids
+        answer.marks_awarded = question.marks if is_correct else Decimal("0")
+        answer.save()
+        auto_score += answer.marks_awarded
+
+    attempt.auto_score = auto_score
+    attempt.submitted_at = timezone.now()
+    attempt.is_fully_graded = not has_ungraded_manual
+    attempt.save()
+    return attempt
+
+
+def grade_quiz_short_answer(
+    *, answer: "QuizAnswer", marks_awarded: Decimal
+) -> "QuizAnswer":
+    """Manual grading step for SHORT_ANSWER questions within an attempt.
+    Once every short-answer question in the attempt has been graded,
+    the attempt is marked fully graded and its manual_score is totaled."""
+    if marks_awarded > answer.question.marks:
+        raise ValueError(
+            f"marks_awarded ({marks_awarded}) cannot exceed the "
+            f"question's marks ({answer.question.marks})."
+        )
+
+    answer.marks_awarded = marks_awarded
+    answer.save()
+
+    attempt = answer.attempt
+    manual_questions = attempt.quiz.questions.filter(
+        question_type="SHORT_ANSWER"
     )
-    list_filter = ("status", "is_late", "assignment__term")
-    search_fields = ("student__admission_number", "assignment__title")
+    manual_answers = attempt.answers.filter(question__in=manual_questions)
+
+    if not manual_answers.filter(marks_awarded__isnull=True).exists():
+        attempt.manual_score = sum(
+            (a.marks_awarded or Decimal("0")) for a in manual_answers
+        )
+        attempt.is_fully_graded = True
+        attempt.save()
+
+    return answer
 
 
-class QuizOptionInline(admin.TabularInline):
-    model = QuizOption
-    extra = 2
+# =============================================================================
+# Phase 12 — Finance (spec §19). Spec: "All financial modifications must
+# be audited" and "Do not expose academic grades to Finance Admin" — every
+# write path here calls log_audit(), and none of these functions touch
+# AssessmentMark/SubjectResult/grades in any way.
+# =============================================================================
 
+def generate_invoice_for_student(
+    *,
+    student: Student,
+    fee_structure,
+    academic_year,
+    term,
+    issued_by: User,
+    due_date,
+    request: HttpRequest | None = None,
+):
+    """Spec §19 'Invoices'. Snapshots FeeStructureItem amounts into
+    InvoiceLineItem rows and applies any active FeeConcession for this
+    student/academic_year (Discount/Scholarship/Waiver) as negative-effect
+    lines — so the invoice total is fixed at generation time and won't
+    silently drift if the fee structure or concessions change later."""
+    from django.utils import timezone
 
-@admin.register(QuizQuestion)
-class QuizQuestionAdmin(admin.ModelAdmin):
-    list_display = ("question_text", "quiz", "question_type", "marks", "order")
-    list_filter = ("quiz", "question_type")
-    inlines = [QuizOptionInline]
+    from .models import FeeConcession, Invoice, InvoiceLineItem
 
-
-class QuizQuestionInline(admin.TabularInline):
-    model = QuizQuestion
-    extra = 1
-    show_change_link = True
-
-
-@admin.register(Quiz)
-class QuizAdmin(admin.ModelAdmin):
-    list_display = ("title", "class_subject", "term", "max_attempts", "is_published")
-    list_filter = ("term", "is_published")
-    search_fields = ("title",)
-    inlines = [QuizQuestionInline]
-
-
-@admin.register(QuizAttempt)
-class QuizAttemptAdmin(admin.ModelAdmin):
-    """Auto-grading runs via smsApp.services.submit_quiz_attempt(); manual
-    short-answer grading via grade_quiz_short_answer() — both keep
-    auto_score/manual_score/is_fully_graded in sync. Editing scores
-    directly here bypasses that and is for emergency correction only."""
-
-    list_display = (
-        "student", "quiz", "attempt_number", "auto_score", "manual_score",
-        "is_fully_graded", "submitted_at",
+    invoice = Invoice.objects.create(
+        student=student, school=student.school, academic_year=academic_year,
+        term=term, fee_structure=fee_structure, total_amount=Decimal("0"),
+        issue_date=timezone.now().date(), due_date=due_date, created_by=issued_by,
     )
-    list_filter = ("quiz", "is_fully_graded")
-    search_fields = ("student__admission_number",)
 
+    total = Decimal("0")
+    for item in fee_structure.items.all():
+        InvoiceLineItem.objects.create(
+            invoice=invoice, category=item.category,
+            line_type=InvoiceLineItem.LineType.FEE,
+            description=item.category.name, amount=item.amount,
+        )
+        total += item.amount
 
-class DiscussionReplyInline(admin.TabularInline):
-    model = DiscussionReply
-    extra = 0
+    concessions = FeeConcession.objects.filter(
+        student=student, academic_year=academic_year, is_active=True
+    ).filter(_term_matches_q(term))
 
+    for concession in concessions:
+        if concession.percentage is not None:
+            reduction = (total * concession.percentage / Decimal("100")).quantize(Decimal("0.01"))
+        else:
+            reduction = concession.fixed_amount
+        reduction = min(reduction, total)  # never let a concession push the invoice negative
+        InvoiceLineItem.objects.create(
+            invoice=invoice, line_type=concession.concession_type,
+            description=concession.description or concession.get_concession_type_display(),
+            amount=reduction,
+        )
+        total -= reduction
 
-@admin.register(Discussion)
-class DiscussionAdmin(admin.ModelAdmin):
-    list_display = ("title", "thread_type", "class_subject", "term", "created_by", "is_pinned", "created_at")
-    list_filter = ("thread_type", "term", "is_pinned")
-    search_fields = ("title",)
-    inlines = [DiscussionReplyInline]
+    invoice.total_amount = max(total, Decimal("0"))
+    invoice.save(update_fields=["total_amount"])
 
-
-# ---------------------------------------------------------------------
-# Finance (Phase 12, spec §19). list_display/search_fields intentionally
-# expose only minimal student identity (name, admission number) — never
-# join into academic data (grades, assessments) from these registrations,
-# per spec 'Do not expose academic grades to Finance Admin'.
-# ---------------------------------------------------------------------
-
-@admin.register(FeeCategory)
-class FeeCategoryAdmin(admin.ModelAdmin):
-    list_display = ("name", "code", "school", "is_active")
-    list_filter = ("school", "is_active")
-    search_fields = ("name", "code")
-
-
-class FeeStructureItemInline(admin.TabularInline):
-    model = FeeStructureItem
-    extra = 1
-
-
-@admin.register(FeeStructure)
-class FeeStructureAdmin(admin.ModelAdmin):
-    list_display = ("name", "academic_year", "term", "class_group", "program", "is_active")
-    list_filter = ("school", "academic_year", "term", "is_active")
-    search_fields = ("name",)
-    inlines = [FeeStructureItemInline]
-
-
-@admin.register(FeeConcession)
-class FeeConcessionAdmin(admin.ModelAdmin):
-    list_display = (
-        "student", "concession_type", "academic_year", "term",
-        "percentage", "fixed_amount", "approved_by", "is_active",
+    log_audit(
+        actor=issued_by, action=AuditLog.Action.CREATE, request=request,
+        target_model="Invoice", target_object_id=invoice.pk,
+        description=f"Generated invoice {invoice.invoice_number} for {student}",
+        new_value={"total_amount": str(invoice.total_amount)},
     )
-    list_filter = ("concession_type", "academic_year", "is_active")
-    search_fields = ("student__admission_number",)
+    return invoice
 
 
-class InvoiceLineItemInline(admin.TabularInline):
-    model = InvoiceLineItem
-    extra = 0
+def _term_matches_q(term):
+    """Helper: a concession applies if it's for this exact term, OR it has
+    no term set (meaning it applies to the whole academic year)."""
+    from django.db.models import Q
+    return Q(term=term) | Q(term__isnull=True)
 
 
-@admin.register(Invoice)
-class InvoiceAdmin(admin.ModelAdmin):
-    """Generation is via smsApp.services.generate_invoice_for_student() so
-    line items and total_amount stay consistent — editing total_amount
-    directly here would desync it from the line items."""
+def _recompute_invoice_status(invoice) -> None:
+    from .models import Invoice, Payment
 
-    list_display = (
-        "invoice_number", "student", "academic_year", "term",
-        "total_amount", "status", "due_date",
+    paid_total = invoice.payments.filter(
+        status=Payment.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+
+    if invoice.status == Invoice.Status.CANCELLED:
+        return
+    if paid_total <= 0:
+        invoice.status = Invoice.Status.UNPAID
+    elif paid_total < invoice.total_amount:
+        invoice.status = Invoice.Status.PARTIALLY_PAID
+    else:
+        invoice.status = Invoice.Status.PAID
+    invoice.save(update_fields=["status"])
+
+
+def _sum(field_name):
+    from django.db.models import Sum
+    return Sum(field_name)
+
+
+def record_payment(
+    *,
+    invoice,
+    amount: Decimal,
+    payment_method: str,
+    payment_date,
+    received_by: User,
+    payer_name: str = "",
+    gateway_reference: str = "",
+    notes: str = "",
+    request: HttpRequest | None = None,
+):
+    """Spec §19 'Payments', 'Partial payments'. Rejects a payment that
+    would push the invoice's paid total over its `total_amount` — this
+    MVP treats overpayment as an input error rather than silently
+    creating a credit balance; revisit if your fee policy needs credits.
+
+    On success: updates invoice.status (§19 'Balances'), auto-generates
+    a Receipt (spec requires receipts to exist for payments), and writes
+    an AuditLog entry (spec §19 'All financial modifications must be
+    audited')."""
+    from .models import Invoice, Payment, Receipt
+
+    if amount <= 0:
+        raise ValueError("Payment amount must be positive.")
+
+    already_paid = invoice.payments.filter(
+        status=Payment.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+
+    if already_paid + amount > invoice.total_amount:
+        raise ValueError(
+            f"Payment of {amount} would exceed the invoice's remaining "
+            f"balance of {invoice.total_amount - already_paid}."
+        )
+
+    payment = Payment.objects.create(
+        invoice=invoice, amount=amount, payment_method=payment_method,
+        payment_date=payment_date, received_by=received_by,
+        payer_name=payer_name, gateway_reference=gateway_reference, notes=notes,
+        status=Payment.Status.COMPLETED,
     )
-    list_filter = ("status", "academic_year", "term")
-    search_fields = ("invoice_number", "student__admission_number")
-    inlines = [InvoiceLineItemInline]
-    readonly_fields = ("invoice_number", "total_amount")
+    Receipt.objects.create(payment=payment, issued_by=received_by)
+    _recompute_invoice_status(invoice)
 
-
-@admin.register(Payment)
-class PaymentAdmin(admin.ModelAdmin):
-    """Recording is via smsApp.services.record_payment() so the invoice
-    status and Receipt stay in sync — this view is for oversight."""
-
-    list_display = (
-        "payment_number", "invoice", "amount", "payment_method",
-        "status", "payment_date",
+    log_audit(
+        actor=received_by, action=AuditLog.Action.CREATE, request=request,
+        target_model="Payment", target_object_id=payment.pk,
+        description=f"Recorded payment {payment.payment_number} against {invoice.invoice_number}",
+        new_value={"amount": str(amount), "method": payment_method},
     )
-    list_filter = ("payment_method", "status")
-    search_fields = ("payment_number", "invoice__invoice_number", "gateway_reference")
-    readonly_fields = ("payment_number",)
+    return payment
 
 
-@admin.register(Receipt)
-class ReceiptAdmin(admin.ModelAdmin):
-    """Created only by smsApp.services.record_payment() — never manually."""
+def request_refund(
+    *, payment, amount: Decimal, reason: str, requested_by: User,
+    request: HttpRequest | None = None,
+):
+    """Spec §19 'Refunds' — always a new record against the Payment, never
+    an edit/deletion of the Payment itself (spec §38)."""
+    from .models import Refund
 
-    list_display = ("receipt_number", "payment", "issued_by", "issued_at")
-    search_fields = ("receipt_number",)
-    readonly_fields = ("receipt_number", "payment", "issued_by", "issued_at")
+    if amount > payment.amount:
+        raise ValueError("Refund amount cannot exceed the original payment amount.")
 
-    def has_add_permission(self, request):
-        return False
-
-
-@admin.register(Refund)
-class RefundAdmin(admin.ModelAdmin):
-    """Approve/reject only via smsApp.services.decide_refund() so the
-    linked invoice's status is recomputed consistently."""
-
-    list_display = ("refund_number", "payment", "amount", "status", "requested_at")
-    list_filter = ("status",)
-    search_fields = ("refund_number", "payment__payment_number")
-    readonly_fields = ("refund_number",)
-
-
-@admin.register(FinancialAdjustment)
-class FinancialAdjustmentAdmin(admin.ModelAdmin):
-    list_display = ("invoice", "adjustment_type", "amount", "created_by", "created_at")
-    list_filter = ("adjustment_type",)
-    search_fields = ("invoice__invoice_number",)
-
-
-@admin.register(LibrarySettings)
-class LibrarySettingsAdmin(admin.ModelAdmin):
-    list_display = ("school", "loan_period_days", "max_books_per_student", "fine_per_day")
-
-
-@admin.register(BookCategory)
-class BookCategoryAdmin(admin.ModelAdmin):
-    list_display = ("name", "school")
-    list_filter = ("school",)
-    search_fields = ("name",)
-
-
-@admin.register(Author)
-class AuthorAdmin(admin.ModelAdmin):
-    list_display = ("name",)
-    search_fields = ("name",)
-
-
-@admin.register(Publisher)
-class PublisherAdmin(admin.ModelAdmin):
-    list_display = ("name",)
-    search_fields = ("name",)
-
-
-class BookCopyInline(admin.TabularInline):
-    model = BookCopy
-    extra = 1
-
-
-@admin.register(Book)
-class BookAdmin(admin.ModelAdmin):
-    list_display = ("title", "isbn", "category", "publisher", "publication_year", "is_active")
-    list_filter = ("school", "category", "is_active")
-    search_fields = ("title", "isbn")
-    filter_horizontal = ("authors",)
-    inlines = [BookCopyInline]
-
-
-@admin.register(BookCopy)
-class BookCopyAdmin(admin.ModelAdmin):
-    list_display = ("accession_number", "book", "condition", "status", "shelf_location")
-    list_filter = ("status", "condition")
-    search_fields = ("accession_number", "book__title")
-
-
-@admin.register(Borrowing)
-class BorrowingAdmin(admin.ModelAdmin):
-    """Issuing/returning goes through smsApp.services.borrow_book() /
-    return_book() so BookCopy.status and fines stay consistent — this
-    view is for oversight, not the primary circulation-desk workflow."""
-
-    list_display = (
-        "book_copy", "student", "staff", "status", "borrowed_date",
-        "due_date", "returned_date", "fine_amount", "fine_paid",
+    refund = Refund.objects.create(
+        payment=payment, amount=amount, reason=reason, requested_by=requested_by,
     )
-    list_filter = ("status", "fine_paid")
-    search_fields = ("book_copy__accession_number", "student__admission_number", "staff__staff_id")
-
-
-@admin.register(Room)
-class RoomAdmin(admin.ModelAdmin):
-    list_display = ("name", "school", "room_type", "capacity", "is_active")
-    list_filter = ("school", "room_type", "is_active")
-    search_fields = ("name",)
-
-
-@admin.register(Period)
-class PeriodAdmin(admin.ModelAdmin):
-    list_display = ("name", "school", "start_time", "end_time", "order", "is_break")
-    list_filter = ("school", "is_break")
-    search_fields = ("name",)
-
-
-@admin.register(TimetableSlot)
-class TimetableSlotAdmin(admin.ModelAdmin):
-    """Scheduling should go through smsApp.services.create_timetable_slot()
-    / reschedule_timetable_slot() so the three conflict checks (teacher,
-    room, class double-booking) run before a slot lands — creating rows
-    directly here still hits the DB constraints as a safety net, but
-    without the friendly per-conflict-type error messages."""
-
-    list_display = (
-        "class_group", "teaching_assignment", "day_of_week", "period", "room", "term",
+    log_audit(
+        actor=requested_by, action=AuditLog.Action.CREATE, request=request,
+        target_model="Refund", target_object_id=refund.pk,
+        description=f"Requested refund {refund.refund_number} for {payment.payment_number}",
+        new_value={"amount": str(amount), "reason": reason},
     )
-    list_filter = ("term", "day_of_week", "room")
-    search_fields = ("class_group__name", "teacher__staff_id")
-    readonly_fields = ("term", "teacher", "class_group")
+    return refund
+
+
+def decide_refund(
+    *,
+    refund,
+    approve: bool,
+    decided_by: User,
+    refund_method: str = "",
+    reference_number: str = "",
+    request: HttpRequest | None = None,
+):
+    """Approving a refund reverses the underlying payment's contribution
+    to the invoice's paid total (by recomputing invoice status from
+    scratch, since Payment.status stays COMPLETED — the refund is tracked
+    separately rather than mutating the original payment record, per
+    spec §38)."""
+    from .models import Refund
+
+    if refund.status != Refund.Status.REQUESTED:
+        raise ValueError(f"Refund is already {refund.status}; cannot decide it again.")
+
+    from django.utils import timezone
+
+    previous_status = refund.status
+    refund.decided_by = decided_by
+    refund.decided_at = timezone.now()
+
+    if approve:
+        refund.status = Refund.Status.APPROVED
+        refund.refund_method = refund_method
+        refund.reference_number = reference_number
+        refund.save()
+        refund.status = Refund.Status.COMPLETED
+        refund.save(update_fields=["status"])
+        _recompute_invoice_status_after_refund(refund)
+    else:
+        refund.status = Refund.Status.REJECTED
+        refund.save()
+
+    log_audit(
+        actor=decided_by, action=AuditLog.Action.APPROVE if approve else AuditLog.Action.OTHER,
+        request=request, target_model="Refund", target_object_id=refund.pk,
+        description=f"{'Approved' if approve else 'Rejected'} refund {refund.refund_number}",
+        previous_value={"status": previous_status}, new_value={"status": refund.status},
+    )
+    return refund
+
+
+def _recompute_invoice_status_after_refund(refund) -> None:
+    """A completed refund effectively reduces what's been paid against the
+    invoice. Since Payment rows stay immutable, status is recomputed as
+    (sum of completed payments) - (sum of completed refunds on those
+    payments) compared to total_amount."""
+    from .models import Invoice, Payment, Refund
+
+    invoice = refund.payment.invoice
+    paid_total = invoice.payments.filter(
+        status=Payment.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+    refunded_total = Refund.objects.filter(
+        payment__invoice=invoice, status=Refund.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+
+    net_paid = paid_total - refunded_total
+    if invoice.status == Invoice.Status.CANCELLED:
+        return
+    if net_paid <= 0:
+        invoice.status = Invoice.Status.UNPAID
+    elif net_paid < invoice.total_amount:
+        invoice.status = Invoice.Status.PARTIALLY_PAID
+    else:
+        invoice.status = Invoice.Status.PAID
+    invoice.save(update_fields=["status"])
+
+
+def apply_financial_adjustment(
+    *, invoice, adjustment_type: str, amount: Decimal, reason: str,
+    created_by: User, request: HttpRequest | None = None,
+):
+    """Spec §19 'Adjustments'. A signed correction to what's owed, applied
+    as a new record rather than editing the invoice's original line
+    items — spec §38 'prefer correction over destructive deletion'."""
+    from .models import FinancialAdjustment
+
+    adjustment = FinancialAdjustment.objects.create(
+        invoice=invoice, adjustment_type=adjustment_type, amount=amount,
+        reason=reason, created_by=created_by,
+    )
+    invoice.total_amount = invoice.total_amount + amount
+    invoice.save(update_fields=["total_amount"])
+    _recompute_invoice_status(invoice)
+
+    log_audit(
+        actor=created_by, action=AuditLog.Action.UPDATE, request=request,
+        target_model="Invoice", target_object_id=invoice.pk,
+        description=f"Applied {adjustment_type} of {amount} to {invoice.invoice_number}",
+        new_value={"adjustment_amount": str(amount), "new_total": str(invoice.total_amount)},
+    )
+    return adjustment
+
+
+def compute_student_account_summary(*, student: Student) -> dict[str, Any]:
+    """Spec §19 'Student accounts', 'Balances', 'Arrears'. Aggregates
+    across every invoice for the student — deliberately returns only
+    financial totals, no academic data (spec: 'Do not expose academic
+    grades to Finance Admin')."""
+    from django.utils import timezone
+
+    from .models import Invoice, Payment
+
+    invoices = Invoice.objects.filter(student=student).exclude(
+        status=Invoice.Status.CANCELLED
+    )
+    total_billed = invoices.aggregate(total=_sum("total_amount"))["total"] or Decimal("0")
+
+    total_paid = Payment.objects.filter(
+        invoice__student=student, status=Payment.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+
+    today = timezone.now().date()
+    arrears = invoices.filter(
+        due_date__lt=today
+    ).exclude(status=Invoice.Status.PAID).aggregate(
+        total=_sum("total_amount")
+    )["total"] or Decimal("0")
+
+    return {
+        "total_billed": total_billed,
+        "total_paid": total_paid,
+        "outstanding_balance": total_billed - total_paid,
+        "arrears": arrears,
+    }
+
+
+# =============================================================================
+# Phase 13 — Library Module (spec §20)
+# =============================================================================
+
+def borrow_book(
+    *,
+    book_copy,
+    student: Student | None = None,
+    staff=None,
+    issued_by,
+    request: HttpRequest | None = None,
+):
+    """Spec §20 'Borrowing', 'Due dates'. Exactly one of student/staff must
+    be given (enforced again here, not just by the DB constraint, so the
+    error message is clear before hitting the database). Blocks borrowing
+    if the copy isn't AVAILABLE, or if a student is already at their
+    school's configured book limit."""
+    from django.utils import timezone
+
+    from .models import BookCopy, Borrowing, LibrarySettings
+
+    if bool(student) == bool(staff):
+        raise ValueError("Exactly one of student or staff must be provided.")
+
+    if book_copy.status != BookCopy.Status.AVAILABLE:
+        raise ValueError(f"'{book_copy}' is not available (status: {book_copy.status}).")
+
+    school = student.school if student else staff.school
+    settings_row, _ = LibrarySettings.objects.get_or_create(school=school)
+
+    if student is not None:
+        active_count = Borrowing.objects.filter(
+            student=student, status=Borrowing.Status.BORROWED
+        ).count()
+        if active_count >= settings_row.max_books_per_student:
+            raise ValueError(
+                f"{student} has reached the maximum of "
+                f"{settings_row.max_books_per_student} borrowed books."
+            )
+
+    today = timezone.now().date()
+    borrowing = Borrowing.objects.create(
+        book_copy=book_copy, student=student, staff=staff, issued_by=issued_by,
+        borrowed_date=today,
+        due_date=today + datetime.timedelta(days=settings_row.loan_period_days),
+    )
+    book_copy.status = BookCopy.Status.BORROWED
+    book_copy.save(update_fields=["status"])
+
+    log_audit(
+        actor=issued_by.user if hasattr(issued_by, "user") else issued_by,
+        action=AuditLog.Action.CREATE, request=request,
+        target_model="Borrowing", target_object_id=borrowing.pk,
+        description=f"Issued '{book_copy}' to {student or staff}",
+    )
+    return borrowing
+
+
+def return_book(
+    *, borrowing, returned_to, request: HttpRequest | None = None,
+):
+    """Spec §20 'Returns', 'Fines'. Computes a fine from
+    LibrarySettings.fine_per_day if returned after the due date; the copy
+    goes back to AVAILABLE so it can be lent again."""
+    from django.utils import timezone
+
+    from .models import BookCopy, Borrowing, LibrarySettings
+
+    if borrowing.status != Borrowing.Status.BORROWED:
+        raise ValueError(f"This borrowing is already {borrowing.status}, cannot return it.")
+
+    today = timezone.now().date()
+    borrower_school = borrowing.student.school if borrowing.student else borrowing.staff.school
+    settings_row, _ = LibrarySettings.objects.get_or_create(school=borrower_school)
+
+    days_late = max((today - borrowing.due_date).days, 0)
+    fine = (Decimal(days_late) * settings_row.fine_per_day).quantize(Decimal("0.01"))
+
+    borrowing.returned_date = today
+    borrowing.status = Borrowing.Status.RETURNED
+    borrowing.fine_amount = fine
+    borrowing.returned_to = returned_to
+    borrowing.save()
+
+    borrowing.book_copy.status = BookCopy.Status.AVAILABLE
+    borrowing.book_copy.save(update_fields=["status"])
+
+    log_audit(
+        actor=returned_to.user if hasattr(returned_to, "user") else returned_to,
+        action=AuditLog.Action.UPDATE, request=request,
+        target_model="Borrowing", target_object_id=borrowing.pk,
+        description=f"Returned '{borrowing.book_copy}'"
+        + (f" (fine: {fine})" if fine > 0 else ""),
+    )
+    return borrowing
+
+
+def mark_book_lost(*, borrowing, marked_by, request: HttpRequest | None = None):
+    """Spec §20 'Fines' implicitly covers loss too — a lost copy is removed
+    from circulation (BookCopy.status -> LOST) rather than silently staying
+    AVAILABLE or BORROWED forever."""
+    from .models import BookCopy, Borrowing
+
+    if borrowing.status != Borrowing.Status.BORROWED:
+        raise ValueError(f"This borrowing is already {borrowing.status}.")
+
+    borrowing.status = Borrowing.Status.LOST
+    borrowing.save(update_fields=["status"])
+
+    borrowing.book_copy.status = BookCopy.Status.LOST
+    borrowing.book_copy.save(update_fields=["status"])
+
+    log_audit(
+        actor=marked_by.user if hasattr(marked_by, "user") else marked_by,
+        action=AuditLog.Action.UPDATE, request=request,
+        target_model="Borrowing", target_object_id=borrowing.pk,
+        description=f"Marked '{borrowing.book_copy}' as lost",
+    )
+    return borrowing
+
+
+def pay_library_fine(
+    *, borrowing, amount_paid: Decimal, received_by, request: HttpRequest | None = None,
+):
+    """Standalone within the library module rather than routed through the
+    Finance module's Payment/Invoice models — keeps library fines simple
+    to record at the circulation desk. Revisit if the school wants unified
+    billing across fees and library fines."""
+    if amount_paid < borrowing.fine_amount:
+        raise ValueError(
+            f"Amount paid ({amount_paid}) is less than the fine owed "
+            f"({borrowing.fine_amount})."
+        )
+
+    borrowing.fine_paid = True
+    borrowing.save(update_fields=["fine_paid"])
+
+    log_audit(
+        actor=received_by.user if hasattr(received_by, "user") else received_by,
+        action=AuditLog.Action.OTHER, request=request,
+        target_model="Borrowing", target_object_id=borrowing.pk,
+        description=f"Library fine of {borrowing.fine_amount} paid",
+    )
+    return borrowing
+
+
+# =============================================================================
+# Phase 14 — Timetable Module (spec §21)
+# =============================================================================
+
+def create_timetable_slot(
+    *,
+    teaching_assignment,
+    day_of_week: str,
+    period,
+    room=None,
+    request: HttpRequest | None = None,
+):
+    """Spec §21 'Prevent scheduling conflicts where possible. Detect:
+    Teacher double-booking, Room double-booking, Class double-booking'.
+
+    Runs explicit pre-checks first so the error message says exactly
+    which of the three conflict types was hit (a raw IntegrityError from
+    the composite DB constraints — see TimetableSlot.Meta — wouldn't
+    distinguish between them). The DB constraints remain as a second,
+    unconditional line of defense against races/direct DB writes.
+    """
+    from .models import TimetableSlot
+
+    term = teaching_assignment.term
+    teacher = teaching_assignment.teacher
+    class_group = teaching_assignment.class_subject.class_group
+
+    if TimetableSlot.objects.filter(
+        teacher=teacher, term=term, day_of_week=day_of_week, period=period
+    ).exists():
+        raise ValueError(
+            f"{teacher} already has a lesson scheduled on "
+            f"{day_of_week} during {period}."
+        )
+
+    if room is not None and TimetableSlot.objects.filter(
+        room=room, term=term, day_of_week=day_of_week, period=period
+    ).exists():
+        raise ValueError(f"{room} is already booked on {day_of_week} during {period}.")
+
+    if TimetableSlot.objects.filter(
+        class_group=class_group, term=term, day_of_week=day_of_week, period=period
+    ).exists():
+        raise ValueError(
+            f"{class_group} already has a lesson scheduled on "
+            f"{day_of_week} during {period}."
+        )
+
+    slot = TimetableSlot.objects.create(
+        teaching_assignment=teaching_assignment, room=room,
+        day_of_week=day_of_week, period=period,
+    )
+
+    log_audit(
+        actor=teacher.user, action=AuditLog.Action.CREATE, request=request,
+        target_model="TimetableSlot", target_object_id=slot.pk,
+        description=f"Scheduled {slot}",
+    )
+    return slot
+
+
+def reschedule_timetable_slot(
+    *, slot, day_of_week: str = None, period=None, room=None,
+    changed_by, request: HttpRequest | None = None,
+):
+    """Moving a slot re-runs the same three conflict checks against the
+    new day/period/room before committing — implemented as delete-then-
+    recreate via create_timetable_slot() so the checks and audit trail
+    stay in exactly one place rather than duplicating validation logic.
+    Wrapped in transaction.atomic() so a failed reschedule can never leave
+    the timetable with neither the old nor the new slot — either the
+    move fully succeeds, or the original slot is left exactly as it was."""
+    from django.db import transaction
+
+    from .models import TimetableSlot
+
+    new_day = day_of_week if day_of_week is not None else slot.day_of_week
+    new_period = period if period is not None else slot.period
+    new_room = room if room is not None else slot.room
+
+    teaching_assignment = slot.teaching_assignment
+    old_description = str(slot)
+
+    with transaction.atomic():
+        slot.delete()
+        try:
+            new_slot = create_timetable_slot(
+                teaching_assignment=teaching_assignment, day_of_week=new_day,
+                period=new_period, room=new_room, request=request,
+            )
+        except ValueError:
+            # Raising inside the atomic block rolls back the delete()
+            # automatically — the original slot's row is restored exactly
+            # as it was, no manual re-create needed.
+            raise
+
+    log_audit(
+        actor=changed_by, action=AuditLog.Action.UPDATE, request=request,
+        target_model="TimetableSlot", target_object_id=new_slot.pk,
+        description=f"Rescheduled '{old_description}' -> '{new_slot}'",
+    )
+    return new_slot
