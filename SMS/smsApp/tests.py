@@ -19,20 +19,35 @@ from .models import (
     AttendanceRecord,
     AttendanceSession,
     AuditLog,
+    Book,
+    BookCategory,
+    BookCopy,
+    Borrowing,
     Class,
     ClassSubject,
     Discussion,
     DiscussionReply,
     Enrollment,
+    FeeCategory,
+    FeeConcession,
+    FeeStructure,
+    FeeStructureItem,
+    FinancialAdjustment,
     GradeBand,
     GradingScheme,
     Guardian,
+    Invoice,
+    InvoiceLineItem,
+    LibrarySettings,
     LoginHistory,
+    Payment,
     Program,
     Quiz,
     QuizAttempt,
     QuizOption,
     QuizQuestion,
+    Receipt,
+    Refund,
     ReportCard,
     ReportTemplate,
     ResultAmendmentRequest,
@@ -46,18 +61,28 @@ from .models import (
     Transcript,
 )
 from .services import (
+    apply_financial_adjustment,
+    borrow_book,
     correct_attendance_record,
     compute_weighted_average,
+    compute_student_account_summary,
+    decide_refund,
     decide_result_amendment,
     generate_batch_reports,
+    generate_invoice_for_student,
     generate_report_pdf,
     generate_transcript,
     get_grade_for_mark,
     grade_assignment_submission,
     grade_quiz_short_answer,
+    mark_book_lost,
+    pay_library_fine,
+    record_payment,
     reject_assessment,
+    request_refund,
     request_result_amendment,
     render_report_html,
+    return_book,
     submit_assignment,
     submit_quiz_attempt,
     transition_assessment_workflow,
@@ -1362,3 +1387,393 @@ class LMSTests(TestCase):
             discussion=discussion, author=self.student.user, content="Thanks for the update!"
         )
         self.assertEqual(discussion.replies.count(), 1)
+
+
+class FinanceTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+        self.tuition = FeeCategory.objects.create(
+            school=self.school, name="Tuition", code="TUITION"
+        )
+        self.transport = FeeCategory.objects.create(
+            school=self.school, name="Transport", code="TRANSPORT"
+        )
+        self.structure = FeeStructure.objects.create(
+            school=self.school, academic_year=self.academic_year, term=self.term,
+            name="Term 1 Fees",
+        )
+        FeeStructureItem.objects.create(
+            structure=self.structure, category=self.tuition, amount=Decimal("50000")
+        )
+        FeeStructureItem.objects.create(
+            structure=self.structure, category=self.transport, amount=Decimal("10000")
+        )
+
+        student_user = User.objects.create_user(
+            username="financestudent", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM900",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        self.finance_admin = User.objects.create_user(
+            username="financeadmin", password="pass12345", role=User.Role.FINANCE_ADMIN
+        )
+
+    def test_generate_invoice_sums_structure_items(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        self.assertEqual(invoice.total_amount, Decimal("60000"))
+        self.assertEqual(invoice.line_items.count(), 2)
+        self.assertEqual(invoice.status, Invoice.Status.UNPAID)
+        self.assertTrue(invoice.invoice_number.startswith("INV-"))
+
+    def test_percentage_concession_reduces_invoice_total(self):
+        FeeConcession.objects.create(
+            student=self.student, academic_year=self.academic_year,
+            concession_type=FeeConcession.ConcessionType.SCHOLARSHIP,
+            percentage=Decimal("20.00"),
+        )
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        # 60000 - 20% = 48000
+        self.assertEqual(invoice.total_amount, Decimal("48000.00"))
+        scholarship_line = invoice.line_items.get(
+            line_type=FeeConcession.ConcessionType.SCHOLARSHIP
+        )
+        self.assertEqual(scholarship_line.amount, Decimal("12000.00"))
+
+    def test_fixed_amount_concession_applied(self):
+        FeeConcession.objects.create(
+            student=self.student, academic_year=self.academic_year,
+            concession_type=FeeConcession.ConcessionType.WAIVER,
+            fixed_amount=Decimal("5000"),
+        )
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        self.assertEqual(invoice.total_amount, Decimal("55000"))
+
+    def test_concession_cannot_push_invoice_negative(self):
+        FeeConcession.objects.create(
+            student=self.student, academic_year=self.academic_year,
+            concession_type=FeeConcession.ConcessionType.WAIVER,
+            fixed_amount=Decimal("999999"),
+        )
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        self.assertEqual(invoice.total_amount, Decimal("0"))
+
+    def test_partial_payment_sets_invoice_partially_paid_and_generates_receipt(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        payment = record_payment(
+            invoice=invoice, amount=Decimal("20000"), payment_method=Payment.Method.CASH,
+            payment_date=datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc),
+            received_by=self.finance_admin,
+        )
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, Invoice.Status.PARTIALLY_PAID)
+        self.assertTrue(hasattr(payment, "receipt"))
+        self.assertTrue(payment.receipt.receipt_number.startswith("RCT-"))
+
+    def test_full_payment_marks_invoice_paid(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        record_payment(
+            invoice=invoice, amount=Decimal("60000"), payment_method=Payment.Method.MPESA,
+            payment_date=datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc),
+            received_by=self.finance_admin, gateway_reference="QGH7XYZ123",
+        )
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, Invoice.Status.PAID)
+
+    def test_overpayment_is_rejected(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        with self.assertRaises(ValueError):
+            record_payment(
+                invoice=invoice, amount=Decimal("70000"), payment_method=Payment.Method.CASH,
+                payment_date=datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc),
+                received_by=self.finance_admin,
+            )
+
+    def test_refund_approval_reduces_invoice_paid_status(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        payment = record_payment(
+            invoice=invoice, amount=Decimal("60000"), payment_method=Payment.Method.CASH,
+            payment_date=datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc),
+            received_by=self.finance_admin,
+        )
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, Invoice.Status.PAID)
+
+        refund = request_refund(
+            payment=payment, amount=Decimal("10000"), reason="Overcharged transport fee",
+            requested_by=self.finance_admin,
+        )
+        decide_refund(refund=refund, approve=True, decided_by=self.finance_admin)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, Invoice.Status.PARTIALLY_PAID)
+
+    def test_cannot_decide_same_refund_twice(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        payment = record_payment(
+            invoice=invoice, amount=Decimal("60000"), payment_method=Payment.Method.CASH,
+            payment_date=datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc),
+            received_by=self.finance_admin,
+        )
+        refund = request_refund(
+            payment=payment, amount=Decimal("5000"), reason="Test", requested_by=self.finance_admin,
+        )
+        decide_refund(refund=refund, approve=True, decided_by=self.finance_admin)
+        with self.assertRaises(ValueError):
+            decide_refund(refund=refund, approve=True, decided_by=self.finance_admin)
+
+    def test_financial_adjustment_changes_invoice_total_and_status(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        record_payment(
+            invoice=invoice, amount=Decimal("60000"), payment_method=Payment.Method.CASH,
+            payment_date=datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc),
+            received_by=self.finance_admin,
+        )
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, Invoice.Status.PAID)
+
+        apply_financial_adjustment(
+            invoice=invoice, adjustment_type=FinancialAdjustment.AdjustmentType.CORRECTION,
+            amount=Decimal("5000"), reason="Missed a late library fine",
+            created_by=self.finance_admin,
+        )
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.total_amount, Decimal("65000"))
+        self.assertEqual(invoice.status, Invoice.Status.PARTIALLY_PAID)
+
+    def test_account_summary_reports_outstanding_and_arrears(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_admin, due_date=datetime.date(2020, 1, 1),  # overdue
+        )
+        record_payment(
+            invoice=invoice, amount=Decimal("10000"), payment_method=Payment.Method.CASH,
+            payment_date=datetime.datetime(2020, 1, 15, tzinfo=datetime.timezone.utc),
+            received_by=self.finance_admin,
+        )
+        summary = compute_student_account_summary(student=self.student)
+        self.assertEqual(summary["total_billed"], Decimal("60000"))
+        self.assertEqual(summary["total_paid"], Decimal("10000"))
+        self.assertEqual(summary["outstanding_balance"], Decimal("50000"))
+        self.assertEqual(summary["arrears"], Decimal("60000"))  # still not PAID and overdue
+
+    def test_invoice_line_item_amounts_are_non_negative(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                invoice = Invoice.objects.create(
+                    invoice_number="INV-TEST1", student=self.student, school=self.school,
+                    academic_year=self.academic_year, term=self.term,
+                    fee_structure=self.structure, total_amount=Decimal("100"),
+                    issue_date=datetime.date(2026, 1, 1), due_date=datetime.date(2026, 2, 1),
+                )
+                InvoiceLineItem.objects.create(
+                    invoice=invoice, line_type="FEE", amount=Decimal("-100"),
+                )
+
+
+class LibraryTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        LibrarySettings.objects.create(
+            school=self.school, loan_period_days=14, max_books_per_student=2,
+            fine_per_day=Decimal("10.00"),
+        )
+        self.category = BookCategory.objects.create(school=self.school, name="Fiction")
+        self.book = Book.objects.create(
+            school=self.school, title="The Hobbit", isbn="9780618968633",
+            category=self.category,
+        )
+        self.copy1 = BookCopy.objects.create(book=self.book, accession_number="ACC001")
+        self.copy2 = BookCopy.objects.create(book=self.book, accession_number="ACC002")
+
+        student_user = User.objects.create_user(
+            username="librarystudent", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM950",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        librarian_user = User.objects.create_user(
+            username="librarian1", password="pass12345", role=User.Role.LIBRARIAN
+        )
+        self.librarian = Staff.objects.create(
+            user=librarian_user, school=self.school, staff_id="STF950",
+            job_title="Librarian", date_hired=datetime.date(2024, 1, 1),
+        )
+
+    def test_borrow_book_marks_copy_borrowed(self):
+        borrowing = borrow_book(
+            book_copy=self.copy1, student=self.student, issued_by=self.librarian,
+        )
+        self.copy1.refresh_from_db()
+        self.assertEqual(self.copy1.status, BookCopy.Status.BORROWED)
+        self.assertEqual(borrowing.due_date - borrowing.borrowed_date, datetime.timedelta(days=14))
+
+    def test_cannot_borrow_unavailable_copy(self):
+        borrow_book(book_copy=self.copy1, student=self.student, issued_by=self.librarian)
+        student_user2 = User.objects.create_user(
+            username="librarystudent2", password="pass12345", role=User.Role.STUDENT
+        )
+        student2 = Student.objects.create(
+            user=student_user2, school=self.school, admission_number="ADM951",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        with self.assertRaises(ValueError):
+            borrow_book(book_copy=self.copy1, student=student2, issued_by=self.librarian)
+
+    def test_borrower_must_be_exactly_one_of_student_or_staff(self):
+        with self.assertRaises(ValueError):
+            borrow_book(book_copy=self.copy1, issued_by=self.librarian)
+        with self.assertRaises(ValueError):
+            borrow_book(
+                book_copy=self.copy1, student=self.student, staff=self.librarian,
+                issued_by=self.librarian,
+            )
+
+    def test_student_book_limit_enforced(self):
+        book2 = Book.objects.create(school=self.school, title="The Two Towers")
+        copy_b2 = BookCopy.objects.create(book=book2, accession_number="ACC010")
+        book3 = Book.objects.create(school=self.school, title="Return of the King")
+        copy_b3 = BookCopy.objects.create(book=book3, accession_number="ACC011")
+
+        borrow_book(book_copy=self.copy1, student=self.student, issued_by=self.librarian)
+        borrow_book(book_copy=copy_b2, student=self.student, issued_by=self.librarian)
+        # max_books_per_student=2 for this school -> third borrow must fail.
+        with self.assertRaises(ValueError):
+            borrow_book(book_copy=copy_b3, student=self.student, issued_by=self.librarian)
+
+    def test_return_on_time_has_no_fine(self):
+        borrowing = borrow_book(
+            book_copy=self.copy1, student=self.student, issued_by=self.librarian,
+        )
+        return_book(borrowing=borrowing, returned_to=self.librarian)
+        borrowing.refresh_from_db()
+        self.assertEqual(borrowing.status, Borrowing.Status.RETURNED)
+        self.assertEqual(borrowing.fine_amount, Decimal("0.00"))
+        self.copy1.refresh_from_db()
+        self.assertEqual(self.copy1.status, BookCopy.Status.AVAILABLE)
+
+    def test_late_return_computes_fine(self):
+        borrowing = borrow_book(
+            book_copy=self.copy1, student=self.student, issued_by=self.librarian,
+        )
+        # Force the due date into the past to simulate lateness.
+        borrowing.due_date = datetime.date.today() - datetime.timedelta(days=3)
+        borrowing.save(update_fields=["due_date"])
+
+        return_book(borrowing=borrowing, returned_to=self.librarian)
+        borrowing.refresh_from_db()
+        # 3 days late * 10.00/day = 30.00
+        self.assertEqual(borrowing.fine_amount, Decimal("30.00"))
+
+    def test_cannot_return_already_returned_borrowing(self):
+        borrowing = borrow_book(
+            book_copy=self.copy1, student=self.student, issued_by=self.librarian,
+        )
+        return_book(borrowing=borrowing, returned_to=self.librarian)
+        with self.assertRaises(ValueError):
+            return_book(borrowing=borrowing, returned_to=self.librarian)
+
+    def test_mark_book_lost_updates_copy_status(self):
+        borrowing = borrow_book(
+            book_copy=self.copy1, student=self.student, issued_by=self.librarian,
+        )
+        mark_book_lost(borrowing=borrowing, marked_by=self.librarian)
+        borrowing.refresh_from_db()
+        self.copy1.refresh_from_db()
+        self.assertEqual(borrowing.status, Borrowing.Status.LOST)
+        self.assertEqual(self.copy1.status, BookCopy.Status.LOST)
+
+    def test_pay_fine_requires_full_amount(self):
+        borrowing = borrow_book(
+            book_copy=self.copy1, student=self.student, issued_by=self.librarian,
+        )
+        borrowing.due_date = datetime.date.today() - datetime.timedelta(days=2)
+        borrowing.save(update_fields=["due_date"])
+        return_book(borrowing=borrowing, returned_to=self.librarian)
+        borrowing.refresh_from_db()
+
+        with self.assertRaises(ValueError):
+            pay_library_fine(
+                borrowing=borrowing, amount_paid=Decimal("5.00"), received_by=self.librarian,
+            )
+        pay_library_fine(
+            borrowing=borrowing, amount_paid=borrowing.fine_amount, received_by=self.librarian,
+        )
+        borrowing.refresh_from_db()
+        self.assertTrue(borrowing.fine_paid)
+
+    def test_staff_can_also_borrow(self):
+        borrowing = borrow_book(
+            book_copy=self.copy2, staff=self.librarian, issued_by=self.librarian,
+        )
+        self.assertEqual(borrowing.staff, self.librarian)
+        self.assertIsNone(borrowing.student)
+
+    def test_active_borrowing_unique_per_copy_at_db_level(self):
+        borrow_book(book_copy=self.copy1, student=self.student, issued_by=self.librarian)
+        student_user2 = User.objects.create_user(
+            username="librarystudent3", password="pass12345", role=User.Role.STUDENT
+        )
+        student2 = Student.objects.create(
+            user=student_user2, school=self.school, admission_number="ADM952",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        # Bypass the service-layer status check to confirm the DB itself
+        # enforces at most one active (unreturned) borrowing per copy.
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Borrowing.objects.create(
+                    book_copy=self.copy1, student=student2,
+                    borrowed_date=datetime.date.today(),
+                    due_date=datetime.date.today() + datetime.timedelta(days=14),
+                )
