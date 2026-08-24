@@ -2433,3 +2433,127 @@ class Borrowing(models.Model):
     def __str__(self) -> str:
         borrower = self.student or self.staff
         return f"{self.book_copy} - {borrower} ({self.status})"
+
+
+# =============================================================================
+# Phase 14 — Timetable Module (spec §21)
+# Design: TimetableSlot reuses TeachingAssignment (Phase 5) rather than
+# taking separate teacher/class_subject inputs — a lesson can only be
+# scheduled for a pairing that's already a validated "this teacher teaches
+# this subject to this class this term" record. `teacher`/`class_group`/
+# `term` are denormalized copies auto-populated from teaching_assignment
+# in save() (never set independently) purely so Django can express real
+# DB-level UniqueConstraints on them — composite constraints can't reach
+# through a FK join, so this redundancy buys genuine double-booking
+# prevention at the database layer, not just an application-level check.
+# =============================================================================
+
+class Room(models.Model):
+    class RoomType(models.TextChoices):
+        CLASSROOM = "CLASSROOM", "Classroom"
+        LAB = "LAB", "Laboratory"
+        LIBRARY = "LIBRARY", "Library"
+        HALL = "HALL", "Hall"
+        OTHER = "OTHER", "Other"
+
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="rooms")
+    name = models.CharField(max_length=100)
+    room_type = models.CharField(max_length=10, choices=RoomType.choices, default=RoomType.CLASSROOM)
+    capacity = models.PositiveIntegerField(default=0, help_text="0 = not tracked")
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "rooms"
+        ordering = ["school", "name"]
+        constraints = [
+            models.UniqueConstraint(fields=["school", "name"], name="uniq_room_name_per_school")
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.school.code})"
+
+
+class Period(models.Model):
+    """A named timeslot (e.g. 'Period 1', 8:00-8:40). `is_break` marks
+    non-teaching slots (break/lunch) so they can be excluded from
+    scheduling without deleting them from the daily structure display."""
+
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="periods")
+    name = models.CharField(max_length=50)
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    order = models.PositiveIntegerField(default=0)
+    is_break = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = "periods"
+        ordering = ["school", "order"]
+        constraints = [
+            models.UniqueConstraint(fields=["school", "name"], name="uniq_period_name_per_school"),
+            models.CheckConstraint(
+                condition=models.Q(end_time__gt=models.F("start_time")),
+                name="period_end_after_start",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.start_time}-{self.end_time})"
+
+
+class TimetableSlot(models.Model):
+    class DayOfWeek(models.TextChoices):
+        MONDAY = "MON", "Monday"
+        TUESDAY = "TUE", "Tuesday"
+        WEDNESDAY = "WED", "Wednesday"
+        THURSDAY = "THU", "Thursday"
+        FRIDAY = "FRI", "Friday"
+        SATURDAY = "SAT", "Saturday"
+
+    teaching_assignment = models.ForeignKey(
+        TeachingAssignment, on_delete=models.CASCADE, related_name="timetable_slots"
+    )
+    room = models.ForeignKey(
+        Room, on_delete=models.SET_NULL, related_name="timetable_slots", blank=True, null=True
+    )
+    day_of_week = models.CharField(max_length=3, choices=DayOfWeek.choices)
+    period = models.ForeignKey(Period, on_delete=models.CASCADE, related_name="timetable_slots")
+
+    # Denormalized from teaching_assignment — see module docstring above.
+    # Never set these directly; save() derives them every time.
+    term = models.ForeignKey(Term, on_delete=models.CASCADE, related_name="timetable_slots", editable=False)
+    teacher = models.ForeignKey(
+        Staff, on_delete=models.CASCADE, related_name="timetable_slots", editable=False
+    )
+    class_group = models.ForeignKey(
+        Class, on_delete=models.CASCADE, related_name="timetable_slots", editable=False
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "timetable_slots"
+        ordering = ["term", "day_of_week", "period"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["teacher", "term", "day_of_week", "period"],
+                name="uniq_teacher_timetable_slot",
+            ),
+            models.UniqueConstraint(
+                fields=["room", "term", "day_of_week", "period"],
+                condition=models.Q(room__isnull=False),
+                name="uniq_room_timetable_slot",
+            ),
+            models.UniqueConstraint(
+                fields=["class_group", "term", "day_of_week", "period"],
+                name="uniq_class_timetable_slot",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.class_group} - {self.teaching_assignment.class_subject.subject} - {self.get_day_of_week_display()} {self.period}"
+
+    def save(self, *args, **kwargs):
+        self.term = self.teaching_assignment.term
+        self.teacher = self.teaching_assignment.teacher
+        self.class_group = self.teaching_assignment.class_subject.class_group
+        super().save(*args, **kwargs)
