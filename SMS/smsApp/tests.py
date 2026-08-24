@@ -9,6 +9,7 @@ from django.urls import reverse
 
 from .models import (
     AcademicYear,
+    Announcement,
     Assessment,
     AssessmentComponent,
     AssessmentMark,
@@ -40,6 +41,9 @@ from .models import (
     InvoiceLineItem,
     LibrarySettings,
     LoginHistory,
+    Notification,
+    NotificationDelivery,
+    NotificationPreference,
     Payment,
     Program,
     Quiz,
@@ -67,6 +71,7 @@ from .services import (
     apply_financial_adjustment,
     borrow_book,
     correct_attendance_record,
+    create_announcement,
     create_timetable_slot,
     compute_weighted_average,
     compute_student_account_summary,
@@ -80,6 +85,11 @@ from .services import (
     grade_assignment_submission,
     grade_quiz_short_answer,
     mark_book_lost,
+    mark_notification_read,
+    notify_assignment_deadline_approaching,
+    notify_payment_received,
+    notify_report_available,
+    notify_result_published,
     pay_library_fine,
     record_payment,
     reject_assessment,
@@ -88,6 +98,7 @@ from .services import (
     request_result_amendment,
     render_report_html,
     return_book,
+    send_notification,
     submit_assignment,
     submit_quiz_attempt,
     transition_assessment_workflow,
@@ -1962,4 +1973,133 @@ class TimetableTests(TestCase):
             with transaction.atomic():
                 TimetableSlot.objects.create(
                     teaching_assignment=self.ta_math_b, day_of_week="MON", period=self.period1,
+                )
+
+
+class CommunicationTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.student_user = User.objects.create_user(
+            username="commstudent", password="pass12345", role=User.Role.STUDENT,
+            email="student@example.com",
+        )
+        self.student = Student.objects.create(
+            user=self.student_user, school=self.school, admission_number="ADM960",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        self.teacher_user = User.objects.create_user(
+            username="commteacher", password="pass12345", role=User.Role.TEACHER,
+            email="teacher@example.com",
+        )
+        self.finance_user = User.objects.create_user(
+            username="commfinance", password="pass12345", role=User.Role.FINANCE_ADMIN,
+            email="finance@example.com",
+        )
+
+    def test_send_notification_creates_in_app_delivery_by_default(self):
+        notification = send_notification(
+            recipient=self.student_user, notification_type="OTHER",
+            title="Test", body="Test body",
+        )
+        self.assertEqual(notification.deliveries.count(), 1)
+        delivery = notification.deliveries.first()
+        self.assertEqual(delivery.channel, NotificationDelivery.Channel.IN_APP)
+        self.assertEqual(delivery.status, NotificationDelivery.Status.SENT)
+
+    def test_email_channel_actually_sends_via_django_mail(self):
+        from django.core import mail
+
+        send_notification(
+            recipient=self.student_user, notification_type="OTHER",
+            title="Test Email", body="Test email body", channels=["EMAIL"],
+        )
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["student@example.com"])
+        self.assertEqual(mail.outbox[0].subject, "Test Email")
+
+    def test_sms_channel_marks_failed_honestly_not_silently_skipped(self):
+        prefs = NotificationPreference.objects.create(
+            user=self.student_user, sms_enabled=True
+        )
+        notification = send_notification(
+            recipient=self.student_user, notification_type="OTHER",
+            title="Test", body="Test", channels=["SMS"],
+        )
+        sms_delivery = notification.deliveries.get(channel=NotificationDelivery.Channel.SMS)
+        self.assertEqual(sms_delivery.status, NotificationDelivery.Status.FAILED)
+        self.assertIn("not configured", sms_delivery.error_message)
+
+    def test_disabled_channel_is_not_attempted_at_all(self):
+        # Default NotificationPreference has email_enabled=True but let's
+        # explicitly disable it and confirm no delivery row is created.
+        NotificationPreference.objects.create(user=self.student_user, email_enabled=False)
+        notification = send_notification(
+            recipient=self.student_user, notification_type="OTHER",
+            title="Test", body="Test", channels=["EMAIL"],
+        )
+        self.assertFalse(
+            notification.deliveries.filter(channel=NotificationDelivery.Channel.EMAIL).exists()
+        )
+
+    def test_mark_notification_read_sets_timestamp(self):
+        notification = send_notification(
+            recipient=self.student_user, notification_type="OTHER", title="Test", body="Test",
+        )
+        self.assertFalse(notification.is_read)
+        mark_notification_read(notification=notification)
+        notification.refresh_from_db()
+        self.assertTrue(notification.is_read)
+        self.assertIsNotNone(notification.read_at)
+
+    def test_result_published_notification_matches_spec_example(self):
+        notification = notify_result_published(student=self.student, subject_name="Mathematics")
+        self.assertEqual(notification.message, "Your Mathematics results have been published.")
+
+    def test_payment_received_notification_matches_spec_example(self):
+        notification = notify_payment_received(
+            recipient=self.finance_user, amount=Decimal("5000"), invoice_number="INV-ABC123",
+        )
+        self.assertIn("received", notification.message.lower())
+        self.assertEqual(notification.title, "Payment Received")
+
+    def test_report_available_skips_guardian_with_no_linked_user(self):
+        guardian = Guardian.objects.create(
+            school=self.school, first_name="Jane", last_name="Doe",
+            relationship="Mother", phone_number="+254700000000",
+        )
+        result = notify_report_available(guardian=guardian, student=self.student, term="Term 2")
+        self.assertIsNone(result)
+
+    def test_create_announcement_notifies_matching_audience_only(self):
+        parent_user = User.objects.create_user(
+            username="commparent", password="pass12345", role=User.Role.PARENT,
+            email="parent@example.com",
+        )
+        Guardian.objects.create(
+            user=parent_user, school=self.school, first_name="Jane", last_name="Doe",
+            relationship="Mother", phone_number="+254700000000",
+        )
+
+        create_announcement(
+            school=self.school, title="Sports Day", body="Sports day is next Friday.",
+            audience=Announcement.Audience.STUDENTS, created_by=self.teacher_user,
+        )
+        self.assertTrue(
+            Notification.objects.filter(recipient=self.student_user, title="Sports Day").exists()
+        )
+        self.assertFalse(
+            Notification.objects.filter(recipient=parent_user, title="Sports Day").exists()
+        )
+
+    def test_notification_delivery_unique_per_notification_channel(self):
+        notification = Notification.objects.create(
+            recipient=self.student_user, notification_type="OTHER", title="T", message="M",
+        )
+        NotificationDelivery.objects.create(
+            notification=notification, channel=NotificationDelivery.Channel.IN_APP,
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                NotificationDelivery.objects.create(
+                    notification=notification, channel=NotificationDelivery.Channel.IN_APP,
                 )
