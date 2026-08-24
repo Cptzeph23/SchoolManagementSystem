@@ -4,3 +4,4 @@
 __pycache__
 .dead__/
 .vscode
+.venv/
