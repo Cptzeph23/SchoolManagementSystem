@@ -1440,3 +1440,107 @@ def pay_library_fine(
         description=f"Library fine of {borrowing.fine_amount} paid",
     )
     return borrowing
+
+
+# =============================================================================
+# Phase 14 — Timetable Module (spec §21)
+# =============================================================================
+
+def create_timetable_slot(
+    *,
+    teaching_assignment,
+    day_of_week: str,
+    period,
+    room=None,
+    request: HttpRequest | None = None,
+):
+    """Spec §21 'Prevent scheduling conflicts where possible. Detect:
+    Teacher double-booking, Room double-booking, Class double-booking'.
+
+    Runs explicit pre-checks first so the error message says exactly
+    which of the three conflict types was hit (a raw IntegrityError from
+    the composite DB constraints — see TimetableSlot.Meta — wouldn't
+    distinguish between them). The DB constraints remain as a second,
+    unconditional line of defense against races/direct DB writes.
+    """
+    from .models import TimetableSlot
+
+    term = teaching_assignment.term
+    teacher = teaching_assignment.teacher
+    class_group = teaching_assignment.class_subject.class_group
+
+    if TimetableSlot.objects.filter(
+        teacher=teacher, term=term, day_of_week=day_of_week, period=period
+    ).exists():
+        raise ValueError(
+            f"{teacher} already has a lesson scheduled on "
+            f"{day_of_week} during {period}."
+        )
+
+    if room is not None and TimetableSlot.objects.filter(
+        room=room, term=term, day_of_week=day_of_week, period=period
+    ).exists():
+        raise ValueError(f"{room} is already booked on {day_of_week} during {period}.")
+
+    if TimetableSlot.objects.filter(
+        class_group=class_group, term=term, day_of_week=day_of_week, period=period
+    ).exists():
+        raise ValueError(
+            f"{class_group} already has a lesson scheduled on "
+            f"{day_of_week} during {period}."
+        )
+
+    slot = TimetableSlot.objects.create(
+        teaching_assignment=teaching_assignment, room=room,
+        day_of_week=day_of_week, period=period,
+    )
+
+    log_audit(
+        actor=teacher.user, action=AuditLog.Action.CREATE, request=request,
+        target_model="TimetableSlot", target_object_id=slot.pk,
+        description=f"Scheduled {slot}",
+    )
+    return slot
+
+
+def reschedule_timetable_slot(
+    *, slot, day_of_week: str = None, period=None, room=None,
+    changed_by, request: HttpRequest | None = None,
+):
+    """Moving a slot re-runs the same three conflict checks against the
+    new day/period/room before committing — implemented as delete-then-
+    recreate via create_timetable_slot() so the checks and audit trail
+    stay in exactly one place rather than duplicating validation logic.
+    Wrapped in transaction.atomic() so a failed reschedule can never leave
+    the timetable with neither the old nor the new slot — either the
+    move fully succeeds, or the original slot is left exactly as it was."""
+    from django.db import transaction
+
+    from .models import TimetableSlot
+
+    new_day = day_of_week if day_of_week is not None else slot.day_of_week
+    new_period = period if period is not None else slot.period
+    new_room = room if room is not None else slot.room
+
+    teaching_assignment = slot.teaching_assignment
+    old_description = str(slot)
+
+    with transaction.atomic():
+        slot.delete()
+        try:
+            new_slot = create_timetable_slot(
+                teaching_assignment=teaching_assignment, day_of_week=new_day,
+                period=new_period, room=new_room, request=request,
+            )
+        except ValueError:
+            # Raising inside the atomic block rolls back the delete()
+            # automatically — the original slot's row is restored exactly
+            # as it was, no manual re-create needed.
+            raise
+
+    log_audit(
+        actor=changed_by, action=AuditLog.Action.UPDATE, request=request,
+        target_model="TimetableSlot", target_object_id=new_slot.pk,
+        description=f"Rescheduled '{old_description}' -> '{new_slot}'",
+    )
+    return new_slot
