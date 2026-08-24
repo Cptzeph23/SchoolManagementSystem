@@ -13,6 +13,11 @@ from .models import (
     AssignmentResource,
     AssignmentSubmission,
     AttendanceRecord,
+    Author,
+    Book,
+    BookCategory,
+    BookCopy,
+    Borrowing,
     AttendanceSession,
     AuditLog,
     Campus,
@@ -23,16 +28,28 @@ from .models import (
     Discussion,
     DiscussionReply,
     Enrollment,
+    FeeCategory,
+    FeeConcession,
+    FeeStructure,
+    FeeStructureItem,
+    FinancialAdjustment,
     GradeBand,
     GradingScheme,
     Guardian,
+    Invoice,
+    InvoiceLineItem,
+    LibrarySettings,
     LoginHistory,
+    Payment,
     Program,
+    Publisher,
     Quiz,
     QuizAnswer,
     QuizAttempt,
     QuizOption,
     QuizQuestion,
+    Receipt,
+    Refund,
     ReportCard,
     ReportTemplate,
     ResultAmendmentRequest,
@@ -475,3 +492,164 @@ class DiscussionAdmin(admin.ModelAdmin):
     list_filter = ("thread_type", "term", "is_pinned")
     search_fields = ("title",)
     inlines = [DiscussionReplyInline]
+
+
+# ---------------------------------------------------------------------
+# Finance (Phase 12, spec §19). list_display/search_fields intentionally
+# expose only minimal student identity (name, admission number) — never
+# join into academic data (grades, assessments) from these registrations,
+# per spec 'Do not expose academic grades to Finance Admin'.
+# ---------------------------------------------------------------------
+
+@admin.register(FeeCategory)
+class FeeCategoryAdmin(admin.ModelAdmin):
+    list_display = ("name", "code", "school", "is_active")
+    list_filter = ("school", "is_active")
+    search_fields = ("name", "code")
+
+
+class FeeStructureItemInline(admin.TabularInline):
+    model = FeeStructureItem
+    extra = 1
+
+
+@admin.register(FeeStructure)
+class FeeStructureAdmin(admin.ModelAdmin):
+    list_display = ("name", "academic_year", "term", "class_group", "program", "is_active")
+    list_filter = ("school", "academic_year", "term", "is_active")
+    search_fields = ("name",)
+    inlines = [FeeStructureItemInline]
+
+
+@admin.register(FeeConcession)
+class FeeConcessionAdmin(admin.ModelAdmin):
+    list_display = (
+        "student", "concession_type", "academic_year", "term",
+        "percentage", "fixed_amount", "approved_by", "is_active",
+    )
+    list_filter = ("concession_type", "academic_year", "is_active")
+    search_fields = ("student__admission_number",)
+
+
+class InvoiceLineItemInline(admin.TabularInline):
+    model = InvoiceLineItem
+    extra = 0
+
+
+@admin.register(Invoice)
+class InvoiceAdmin(admin.ModelAdmin):
+    """Generation is via smsApp.services.generate_invoice_for_student() so
+    line items and total_amount stay consistent — editing total_amount
+    directly here would desync it from the line items."""
+
+    list_display = (
+        "invoice_number", "student", "academic_year", "term",
+        "total_amount", "status", "due_date",
+    )
+    list_filter = ("status", "academic_year", "term")
+    search_fields = ("invoice_number", "student__admission_number")
+    inlines = [InvoiceLineItemInline]
+    readonly_fields = ("invoice_number", "total_amount")
+
+
+@admin.register(Payment)
+class PaymentAdmin(admin.ModelAdmin):
+    """Recording is via smsApp.services.record_payment() so the invoice
+    status and Receipt stay in sync — this view is for oversight."""
+
+    list_display = (
+        "payment_number", "invoice", "amount", "payment_method",
+        "status", "payment_date",
+    )
+    list_filter = ("payment_method", "status")
+    search_fields = ("payment_number", "invoice__invoice_number", "gateway_reference")
+    readonly_fields = ("payment_number",)
+
+
+@admin.register(Receipt)
+class ReceiptAdmin(admin.ModelAdmin):
+    """Created only by smsApp.services.record_payment() — never manually."""
+
+    list_display = ("receipt_number", "payment", "issued_by", "issued_at")
+    search_fields = ("receipt_number",)
+    readonly_fields = ("receipt_number", "payment", "issued_by", "issued_at")
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(Refund)
+class RefundAdmin(admin.ModelAdmin):
+    """Approve/reject only via smsApp.services.decide_refund() so the
+    linked invoice's status is recomputed consistently."""
+
+    list_display = ("refund_number", "payment", "amount", "status", "requested_at")
+    list_filter = ("status",)
+    search_fields = ("refund_number", "payment__payment_number")
+    readonly_fields = ("refund_number",)
+
+
+@admin.register(FinancialAdjustment)
+class FinancialAdjustmentAdmin(admin.ModelAdmin):
+    list_display = ("invoice", "adjustment_type", "amount", "created_by", "created_at")
+    list_filter = ("adjustment_type",)
+    search_fields = ("invoice__invoice_number",)
+
+
+@admin.register(LibrarySettings)
+class LibrarySettingsAdmin(admin.ModelAdmin):
+    list_display = ("school", "loan_period_days", "max_books_per_student", "fine_per_day")
+
+
+@admin.register(BookCategory)
+class BookCategoryAdmin(admin.ModelAdmin):
+    list_display = ("name", "school")
+    list_filter = ("school",)
+    search_fields = ("name",)
+
+
+@admin.register(Author)
+class AuthorAdmin(admin.ModelAdmin):
+    list_display = ("name",)
+    search_fields = ("name",)
+
+
+@admin.register(Publisher)
+class PublisherAdmin(admin.ModelAdmin):
+    list_display = ("name",)
+    search_fields = ("name",)
+
+
+class BookCopyInline(admin.TabularInline):
+    model = BookCopy
+    extra = 1
+
+
+@admin.register(Book)
+class BookAdmin(admin.ModelAdmin):
+    list_display = ("title", "isbn", "category", "publisher", "publication_year", "is_active")
+    list_filter = ("school", "category", "is_active")
+    search_fields = ("title", "isbn")
+    filter_horizontal = ("authors",)
+    inlines = [BookCopyInline]
+
+
+@admin.register(BookCopy)
+class BookCopyAdmin(admin.ModelAdmin):
+    list_display = ("accession_number", "book", "condition", "status", "shelf_location")
+    list_filter = ("status", "condition")
+    search_fields = ("accession_number", "book__title")
+
+
+@admin.register(Borrowing)
+class BorrowingAdmin(admin.ModelAdmin):
+    """Issuing/returning goes through smsApp.services.borrow_book() /
+    return_book() so BookCopy.status and fines stay consistent — this
+    view is for oversight, not the primary circulation-desk workflow."""
+
+    list_display = (
+        "book_copy", "student", "staff", "status", "borrowed_date",
+        "due_date", "returned_date", "fine_amount", "fine_paid",
+    )
+    list_filter = ("status", "fine_paid")
+    search_fields = ("book_copy__accession_number", "student__admission_number", "staff__staff_id")
