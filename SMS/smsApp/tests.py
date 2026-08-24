@@ -51,6 +51,8 @@ from .models import (
     ReportCard,
     ReportTemplate,
     ResultAmendmentRequest,
+    Room,
+    Period,
     School,
     Staff,
     Student,
@@ -58,12 +60,14 @@ from .models import (
     Subject,
     TeachingAssignment,
     Term,
+    TimetableSlot,
     Transcript,
 )
 from .services import (
     apply_financial_adjustment,
     borrow_book,
     correct_attendance_record,
+    create_timetable_slot,
     compute_weighted_average,
     compute_student_account_summary,
     decide_refund,
@@ -79,6 +83,7 @@ from .services import (
     pay_library_fine,
     record_payment,
     reject_assessment,
+    reschedule_timetable_slot,
     request_refund,
     request_result_amendment,
     render_report_html,
@@ -1776,4 +1781,185 @@ class LibraryTests(TestCase):
                     book_copy=self.copy1, student=student2,
                     borrowed_date=datetime.date.today(),
                     due_date=datetime.date.today() + datetime.timedelta(days=14),
+                )
+
+
+class TimetableTests(TestCase):
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_a = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10A"
+        )
+        self.class_b = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10B"
+        )
+        self.math = Subject.objects.create(school=self.school, code="MATH", name="Mathematics")
+        self.english = Subject.objects.create(school=self.school, code="ENG", name="English")
+        self.cs_math_a = ClassSubject.objects.create(class_group=self.class_a, subject=self.math)
+        self.cs_english_a = ClassSubject.objects.create(class_group=self.class_a, subject=self.english)
+        self.cs_math_b = ClassSubject.objects.create(class_group=self.class_b, subject=self.math)
+
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+
+        teacher_user = User.objects.create_user(
+            username="ttteacher", password="pass12345", role=User.Role.TEACHER
+        )
+        self.teacher = Staff.objects.create(
+            user=teacher_user, school=self.school, staff_id="STF970",
+            job_title="Maths Teacher", date_hired=datetime.date(2024, 1, 1),
+        )
+        teacher_user2 = User.objects.create_user(
+            username="ttteacher2", password="pass12345", role=User.Role.TEACHER
+        )
+        self.teacher2 = Staff.objects.create(
+            user=teacher_user2, school=self.school, staff_id="STF971",
+            job_title="English Teacher", date_hired=datetime.date(2024, 1, 1),
+        )
+
+        self.ta_math_a = TeachingAssignment.objects.create(
+            class_subject=self.cs_math_a, teacher=self.teacher, term=self.term
+        )
+        self.ta_english_a = TeachingAssignment.objects.create(
+            class_subject=self.cs_english_a, teacher=self.teacher2, term=self.term
+        )
+        self.ta_math_b = TeachingAssignment.objects.create(
+            class_subject=self.cs_math_b, teacher=self.teacher, term=self.term
+        )
+
+        self.room1 = Room.objects.create(school=self.school, name="Room 1")
+        self.period1 = Period.objects.create(
+            school=self.school, name="Period 1",
+            start_time=datetime.time(8, 0), end_time=datetime.time(8, 40), order=1,
+        )
+        self.period2 = Period.objects.create(
+            school=self.school, name="Period 2",
+            start_time=datetime.time(8, 40), end_time=datetime.time(9, 20), order=2,
+        )
+
+    def test_create_slot_denormalizes_term_teacher_class_group(self):
+        slot = create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1, room=self.room1,
+        )
+        self.assertEqual(slot.term, self.term)
+        self.assertEqual(slot.teacher, self.teacher)
+        self.assertEqual(slot.class_group, self.class_a)
+
+    def test_teacher_double_booking_detected(self):
+        create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1,
+        )
+        # Same teacher (self.teacher), same day/period, different class -> conflict.
+        with self.assertRaises(ValueError):
+            create_timetable_slot(
+                teaching_assignment=self.ta_math_b, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+                period=self.period1,
+            )
+
+    def test_room_double_booking_detected(self):
+        create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1, room=self.room1,
+        )
+        # Different teacher/class but same room, day, period -> conflict.
+        with self.assertRaises(ValueError):
+            create_timetable_slot(
+                teaching_assignment=self.ta_english_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+                period=self.period1, room=self.room1,
+            )
+
+    def test_class_double_booking_detected(self):
+        create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1,
+        )
+        # Same class (class_a), same day/period, different subject/teacher -> conflict.
+        with self.assertRaises(ValueError):
+            create_timetable_slot(
+                teaching_assignment=self.ta_english_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+                period=self.period1,
+            )
+
+    def test_no_conflict_across_different_terms(self):
+        term2 = Term.objects.create(
+            academic_year=self.academic_year, name="Term 2", term_number=2,
+            start_date=datetime.date(2026, 5, 1), end_date=datetime.date(2026, 8, 1),
+        )
+        ta_math_a_term2 = TeachingAssignment.objects.create(
+            class_subject=self.cs_math_a, teacher=self.teacher, term=term2
+        )
+        create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1,
+        )
+        # Same teacher/day/period but a DIFFERENT term -> not a real conflict
+        # (terms don't overlap in time), must succeed.
+        slot2 = create_timetable_slot(
+            teaching_assignment=ta_math_a_term2, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1,
+        )
+        self.assertEqual(slot2.term, term2)
+
+    def test_no_conflict_different_day_or_period(self):
+        create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1,
+        )
+        # Same teacher, different period -> no conflict.
+        slot2 = create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period2,
+        )
+        self.assertIsNotNone(slot2.pk)
+
+    def test_reschedule_moves_slot_successfully(self):
+        slot = create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1,
+        )
+        moved = reschedule_timetable_slot(
+            slot=slot, period=self.period2, changed_by=self.teacher.user,
+        )
+        self.assertEqual(moved.period, self.period2)
+        self.assertEqual(TimetableSlot.objects.filter(teaching_assignment=self.ta_math_a).count(), 1)
+
+    def test_reschedule_into_conflict_restores_original_slot(self):
+        create_timetable_slot(
+            teaching_assignment=self.ta_english_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period2,
+        )
+        original_slot = create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1,
+        )
+        with self.assertRaises(ValueError):
+            # class_a already has English at period2 -> class double-booking.
+            reschedule_timetable_slot(
+                slot=original_slot, period=self.period2, changed_by=self.teacher.user,
+            )
+        # The original Monday/Period1 slot must still exist — no gap left behind.
+        self.assertTrue(
+            TimetableSlot.objects.filter(
+                teaching_assignment=self.ta_math_a, day_of_week="MON", period=self.period1
+            ).exists()
+        )
+
+    def test_db_constraint_enforces_teacher_conflict_even_bypassing_service(self):
+        create_timetable_slot(
+            teaching_assignment=self.ta_math_a, day_of_week=TimetableSlot.DayOfWeek.MONDAY,
+            period=self.period1,
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                TimetableSlot.objects.create(
+                    teaching_assignment=self.ta_math_b, day_of_week="MON", period=self.period1,
                 )
