@@ -8,6 +8,7 @@ Django views today and DRF API views later (§3 'API-first architecture').
 """
 from __future__ import annotations
 
+import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -984,3 +985,458 @@ def grade_quiz_short_answer(
         attempt.save()
 
     return answer
+
+
+# =============================================================================
+# Phase 12 — Finance (spec §19). Spec: "All financial modifications must
+# be audited" and "Do not expose academic grades to Finance Admin" — every
+# write path here calls log_audit(), and none of these functions touch
+# AssessmentMark/SubjectResult/grades in any way.
+# =============================================================================
+
+def generate_invoice_for_student(
+    *,
+    student: Student,
+    fee_structure,
+    academic_year,
+    term,
+    issued_by: User,
+    due_date,
+    request: HttpRequest | None = None,
+):
+    """Spec §19 'Invoices'. Snapshots FeeStructureItem amounts into
+    InvoiceLineItem rows and applies any active FeeConcession for this
+    student/academic_year (Discount/Scholarship/Waiver) as negative-effect
+    lines — so the invoice total is fixed at generation time and won't
+    silently drift if the fee structure or concessions change later."""
+    from django.utils import timezone
+
+    from .models import FeeConcession, Invoice, InvoiceLineItem
+
+    invoice = Invoice.objects.create(
+        student=student, school=student.school, academic_year=academic_year,
+        term=term, fee_structure=fee_structure, total_amount=Decimal("0"),
+        issue_date=timezone.now().date(), due_date=due_date, created_by=issued_by,
+    )
+
+    total = Decimal("0")
+    for item in fee_structure.items.all():
+        InvoiceLineItem.objects.create(
+            invoice=invoice, category=item.category,
+            line_type=InvoiceLineItem.LineType.FEE,
+            description=item.category.name, amount=item.amount,
+        )
+        total += item.amount
+
+    concessions = FeeConcession.objects.filter(
+        student=student, academic_year=academic_year, is_active=True
+    ).filter(_term_matches_q(term))
+
+    for concession in concessions:
+        if concession.percentage is not None:
+            reduction = (total * concession.percentage / Decimal("100")).quantize(Decimal("0.01"))
+        else:
+            reduction = concession.fixed_amount
+        reduction = min(reduction, total)  # never let a concession push the invoice negative
+        InvoiceLineItem.objects.create(
+            invoice=invoice, line_type=concession.concession_type,
+            description=concession.description or concession.get_concession_type_display(),
+            amount=reduction,
+        )
+        total -= reduction
+
+    invoice.total_amount = max(total, Decimal("0"))
+    invoice.save(update_fields=["total_amount"])
+
+    log_audit(
+        actor=issued_by, action=AuditLog.Action.CREATE, request=request,
+        target_model="Invoice", target_object_id=invoice.pk,
+        description=f"Generated invoice {invoice.invoice_number} for {student}",
+        new_value={"total_amount": str(invoice.total_amount)},
+    )
+    return invoice
+
+
+def _term_matches_q(term):
+    """Helper: a concession applies if it's for this exact term, OR it has
+    no term set (meaning it applies to the whole academic year)."""
+    from django.db.models import Q
+    return Q(term=term) | Q(term__isnull=True)
+
+
+def _recompute_invoice_status(invoice) -> None:
+    from .models import Invoice, Payment
+
+    paid_total = invoice.payments.filter(
+        status=Payment.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+
+    if invoice.status == Invoice.Status.CANCELLED:
+        return
+    if paid_total <= 0:
+        invoice.status = Invoice.Status.UNPAID
+    elif paid_total < invoice.total_amount:
+        invoice.status = Invoice.Status.PARTIALLY_PAID
+    else:
+        invoice.status = Invoice.Status.PAID
+    invoice.save(update_fields=["status"])
+
+
+def _sum(field_name):
+    from django.db.models import Sum
+    return Sum(field_name)
+
+
+def record_payment(
+    *,
+    invoice,
+    amount: Decimal,
+    payment_method: str,
+    payment_date,
+    received_by: User,
+    payer_name: str = "",
+    gateway_reference: str = "",
+    notes: str = "",
+    request: HttpRequest | None = None,
+):
+    """Spec §19 'Payments', 'Partial payments'. Rejects a payment that
+    would push the invoice's paid total over its `total_amount` — this
+    MVP treats overpayment as an input error rather than silently
+    creating a credit balance; revisit if your fee policy needs credits.
+
+    On success: updates invoice.status (§19 'Balances'), auto-generates
+    a Receipt (spec requires receipts to exist for payments), and writes
+    an AuditLog entry (spec §19 'All financial modifications must be
+    audited')."""
+    from .models import Invoice, Payment, Receipt
+
+    if amount <= 0:
+        raise ValueError("Payment amount must be positive.")
+
+    already_paid = invoice.payments.filter(
+        status=Payment.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+
+    if already_paid + amount > invoice.total_amount:
+        raise ValueError(
+            f"Payment of {amount} would exceed the invoice's remaining "
+            f"balance of {invoice.total_amount - already_paid}."
+        )
+
+    payment = Payment.objects.create(
+        invoice=invoice, amount=amount, payment_method=payment_method,
+        payment_date=payment_date, received_by=received_by,
+        payer_name=payer_name, gateway_reference=gateway_reference, notes=notes,
+        status=Payment.Status.COMPLETED,
+    )
+    Receipt.objects.create(payment=payment, issued_by=received_by)
+    _recompute_invoice_status(invoice)
+
+    log_audit(
+        actor=received_by, action=AuditLog.Action.CREATE, request=request,
+        target_model="Payment", target_object_id=payment.pk,
+        description=f"Recorded payment {payment.payment_number} against {invoice.invoice_number}",
+        new_value={"amount": str(amount), "method": payment_method},
+    )
+    return payment
+
+
+def request_refund(
+    *, payment, amount: Decimal, reason: str, requested_by: User,
+    request: HttpRequest | None = None,
+):
+    """Spec §19 'Refunds' — always a new record against the Payment, never
+    an edit/deletion of the Payment itself (spec §38)."""
+    from .models import Refund
+
+    if amount > payment.amount:
+        raise ValueError("Refund amount cannot exceed the original payment amount.")
+
+    refund = Refund.objects.create(
+        payment=payment, amount=amount, reason=reason, requested_by=requested_by,
+    )
+    log_audit(
+        actor=requested_by, action=AuditLog.Action.CREATE, request=request,
+        target_model="Refund", target_object_id=refund.pk,
+        description=f"Requested refund {refund.refund_number} for {payment.payment_number}",
+        new_value={"amount": str(amount), "reason": reason},
+    )
+    return refund
+
+
+def decide_refund(
+    *,
+    refund,
+    approve: bool,
+    decided_by: User,
+    refund_method: str = "",
+    reference_number: str = "",
+    request: HttpRequest | None = None,
+):
+    """Approving a refund reverses the underlying payment's contribution
+    to the invoice's paid total (by recomputing invoice status from
+    scratch, since Payment.status stays COMPLETED — the refund is tracked
+    separately rather than mutating the original payment record, per
+    spec §38)."""
+    from .models import Refund
+
+    if refund.status != Refund.Status.REQUESTED:
+        raise ValueError(f"Refund is already {refund.status}; cannot decide it again.")
+
+    from django.utils import timezone
+
+    previous_status = refund.status
+    refund.decided_by = decided_by
+    refund.decided_at = timezone.now()
+
+    if approve:
+        refund.status = Refund.Status.APPROVED
+        refund.refund_method = refund_method
+        refund.reference_number = reference_number
+        refund.save()
+        refund.status = Refund.Status.COMPLETED
+        refund.save(update_fields=["status"])
+        _recompute_invoice_status_after_refund(refund)
+    else:
+        refund.status = Refund.Status.REJECTED
+        refund.save()
+
+    log_audit(
+        actor=decided_by, action=AuditLog.Action.APPROVE if approve else AuditLog.Action.OTHER,
+        request=request, target_model="Refund", target_object_id=refund.pk,
+        description=f"{'Approved' if approve else 'Rejected'} refund {refund.refund_number}",
+        previous_value={"status": previous_status}, new_value={"status": refund.status},
+    )
+    return refund
+
+
+def _recompute_invoice_status_after_refund(refund) -> None:
+    """A completed refund effectively reduces what's been paid against the
+    invoice. Since Payment rows stay immutable, status is recomputed as
+    (sum of completed payments) - (sum of completed refunds on those
+    payments) compared to total_amount."""
+    from .models import Invoice, Payment, Refund
+
+    invoice = refund.payment.invoice
+    paid_total = invoice.payments.filter(
+        status=Payment.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+    refunded_total = Refund.objects.filter(
+        payment__invoice=invoice, status=Refund.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+
+    net_paid = paid_total - refunded_total
+    if invoice.status == Invoice.Status.CANCELLED:
+        return
+    if net_paid <= 0:
+        invoice.status = Invoice.Status.UNPAID
+    elif net_paid < invoice.total_amount:
+        invoice.status = Invoice.Status.PARTIALLY_PAID
+    else:
+        invoice.status = Invoice.Status.PAID
+    invoice.save(update_fields=["status"])
+
+
+def apply_financial_adjustment(
+    *, invoice, adjustment_type: str, amount: Decimal, reason: str,
+    created_by: User, request: HttpRequest | None = None,
+):
+    """Spec §19 'Adjustments'. A signed correction to what's owed, applied
+    as a new record rather than editing the invoice's original line
+    items — spec §38 'prefer correction over destructive deletion'."""
+    from .models import FinancialAdjustment
+
+    adjustment = FinancialAdjustment.objects.create(
+        invoice=invoice, adjustment_type=adjustment_type, amount=amount,
+        reason=reason, created_by=created_by,
+    )
+    invoice.total_amount = invoice.total_amount + amount
+    invoice.save(update_fields=["total_amount"])
+    _recompute_invoice_status(invoice)
+
+    log_audit(
+        actor=created_by, action=AuditLog.Action.UPDATE, request=request,
+        target_model="Invoice", target_object_id=invoice.pk,
+        description=f"Applied {adjustment_type} of {amount} to {invoice.invoice_number}",
+        new_value={"adjustment_amount": str(amount), "new_total": str(invoice.total_amount)},
+    )
+    return adjustment
+
+
+def compute_student_account_summary(*, student: Student) -> dict[str, Any]:
+    """Spec §19 'Student accounts', 'Balances', 'Arrears'. Aggregates
+    across every invoice for the student — deliberately returns only
+    financial totals, no academic data (spec: 'Do not expose academic
+    grades to Finance Admin')."""
+    from django.utils import timezone
+
+    from .models import Invoice, Payment
+
+    invoices = Invoice.objects.filter(student=student).exclude(
+        status=Invoice.Status.CANCELLED
+    )
+    total_billed = invoices.aggregate(total=_sum("total_amount"))["total"] or Decimal("0")
+
+    total_paid = Payment.objects.filter(
+        invoice__student=student, status=Payment.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+
+    today = timezone.now().date()
+    arrears = invoices.filter(
+        due_date__lt=today
+    ).exclude(status=Invoice.Status.PAID).aggregate(
+        total=_sum("total_amount")
+    )["total"] or Decimal("0")
+
+    return {
+        "total_billed": total_billed,
+        "total_paid": total_paid,
+        "outstanding_balance": total_billed - total_paid,
+        "arrears": arrears,
+    }
+
+
+# =============================================================================
+# Phase 13 — Library Module (spec §20)
+# =============================================================================
+
+def borrow_book(
+    *,
+    book_copy,
+    student: Student | None = None,
+    staff=None,
+    issued_by,
+    request: HttpRequest | None = None,
+):
+    """Spec §20 'Borrowing', 'Due dates'. Exactly one of student/staff must
+    be given (enforced again here, not just by the DB constraint, so the
+    error message is clear before hitting the database). Blocks borrowing
+    if the copy isn't AVAILABLE, or if a student is already at their
+    school's configured book limit."""
+    from django.utils import timezone
+
+    from .models import BookCopy, Borrowing, LibrarySettings
+
+    if bool(student) == bool(staff):
+        raise ValueError("Exactly one of student or staff must be provided.")
+
+    if book_copy.status != BookCopy.Status.AVAILABLE:
+        raise ValueError(f"'{book_copy}' is not available (status: {book_copy.status}).")
+
+    school = student.school if student else staff.school
+    settings_row, _ = LibrarySettings.objects.get_or_create(school=school)
+
+    if student is not None:
+        active_count = Borrowing.objects.filter(
+            student=student, status=Borrowing.Status.BORROWED
+        ).count()
+        if active_count >= settings_row.max_books_per_student:
+            raise ValueError(
+                f"{student} has reached the maximum of "
+                f"{settings_row.max_books_per_student} borrowed books."
+            )
+
+    today = timezone.now().date()
+    borrowing = Borrowing.objects.create(
+        book_copy=book_copy, student=student, staff=staff, issued_by=issued_by,
+        borrowed_date=today,
+        due_date=today + datetime.timedelta(days=settings_row.loan_period_days),
+    )
+    book_copy.status = BookCopy.Status.BORROWED
+    book_copy.save(update_fields=["status"])
+
+    log_audit(
+        actor=issued_by.user if hasattr(issued_by, "user") else issued_by,
+        action=AuditLog.Action.CREATE, request=request,
+        target_model="Borrowing", target_object_id=borrowing.pk,
+        description=f"Issued '{book_copy}' to {student or staff}",
+    )
+    return borrowing
+
+
+def return_book(
+    *, borrowing, returned_to, request: HttpRequest | None = None,
+):
+    """Spec §20 'Returns', 'Fines'. Computes a fine from
+    LibrarySettings.fine_per_day if returned after the due date; the copy
+    goes back to AVAILABLE so it can be lent again."""
+    from django.utils import timezone
+
+    from .models import BookCopy, Borrowing, LibrarySettings
+
+    if borrowing.status != Borrowing.Status.BORROWED:
+        raise ValueError(f"This borrowing is already {borrowing.status}, cannot return it.")
+
+    today = timezone.now().date()
+    borrower_school = borrowing.student.school if borrowing.student else borrowing.staff.school
+    settings_row, _ = LibrarySettings.objects.get_or_create(school=borrower_school)
+
+    days_late = max((today - borrowing.due_date).days, 0)
+    fine = (Decimal(days_late) * settings_row.fine_per_day).quantize(Decimal("0.01"))
+
+    borrowing.returned_date = today
+    borrowing.status = Borrowing.Status.RETURNED
+    borrowing.fine_amount = fine
+    borrowing.returned_to = returned_to
+    borrowing.save()
+
+    borrowing.book_copy.status = BookCopy.Status.AVAILABLE
+    borrowing.book_copy.save(update_fields=["status"])
+
+    log_audit(
+        actor=returned_to.user if hasattr(returned_to, "user") else returned_to,
+        action=AuditLog.Action.UPDATE, request=request,
+        target_model="Borrowing", target_object_id=borrowing.pk,
+        description=f"Returned '{borrowing.book_copy}'"
+        + (f" (fine: {fine})" if fine > 0 else ""),
+    )
+    return borrowing
+
+
+def mark_book_lost(*, borrowing, marked_by, request: HttpRequest | None = None):
+    """Spec §20 'Fines' implicitly covers loss too — a lost copy is removed
+    from circulation (BookCopy.status -> LOST) rather than silently staying
+    AVAILABLE or BORROWED forever."""
+    from .models import BookCopy, Borrowing
+
+    if borrowing.status != Borrowing.Status.BORROWED:
+        raise ValueError(f"This borrowing is already {borrowing.status}.")
+
+    borrowing.status = Borrowing.Status.LOST
+    borrowing.save(update_fields=["status"])
+
+    borrowing.book_copy.status = BookCopy.Status.LOST
+    borrowing.book_copy.save(update_fields=["status"])
+
+    log_audit(
+        actor=marked_by.user if hasattr(marked_by, "user") else marked_by,
+        action=AuditLog.Action.UPDATE, request=request,
+        target_model="Borrowing", target_object_id=borrowing.pk,
+        description=f"Marked '{borrowing.book_copy}' as lost",
+    )
+    return borrowing
+
+
+def pay_library_fine(
+    *, borrowing, amount_paid: Decimal, received_by, request: HttpRequest | None = None,
+):
+    """Standalone within the library module rather than routed through the
+    Finance module's Payment/Invoice models — keeps library fines simple
+    to record at the circulation desk. Revisit if the school wants unified
+    billing across fees and library fines."""
+    if amount_paid < borrowing.fine_amount:
+        raise ValueError(
+            f"Amount paid ({amount_paid}) is less than the fine owed "
+            f"({borrowing.fine_amount})."
+        )
+
+    borrowing.fine_paid = True
+    borrowing.save(update_fields=["fine_paid"])
+
+    log_audit(
+        actor=received_by.user if hasattr(received_by, "user") else received_by,
+        action=AuditLog.Action.OTHER, request=request,
+        target_model="Borrowing", target_object_id=borrowing.pk,
+        description=f"Library fine of {borrowing.fine_amount} paid",
+    )
+    return borrowing
