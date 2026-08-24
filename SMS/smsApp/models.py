@@ -1811,3 +1811,625 @@ class DiscussionReply(models.Model):
 
     def __str__(self) -> str:
         return f"Reply by {self.author} on {self.discussion}"
+
+
+# =============================================================================
+# Phase 12 — Finance (spec §19, §23, §38)
+#
+# §23 'Financial and Academic Separation': Finance Admin must see fees,
+# payments, invoices, financial reporting — never academic grades — and
+# must see only the minimum student identity needed to process accounts.
+# These models don't FK into Assessment/AssessmentMark/GradingScheme at
+# all, by design, so a Finance Admin-scoped view/serializer can never
+# accidentally join into academic data. Enforcement of the *view-layer*
+# boundary (which fields a Finance Admin's screens expose) lands with the
+# Finance Admin dashboard build-out; this data layer just makes the leak
+# structurally impossible rather than policy-only.
+#
+# §38 'Financial Data Integrity': "Payments should never be casually
+# deleted. Prefer reversal/refund/adjustment/correction over destructive
+# deletion." Payment and Invoice have no soft-delete/cancel path that
+# removes rows — Refund and FinancialAdjustment are additive, linked
+# records instead. "Every financial transaction should have a unique
+# identifier" / "Receipts should have unique numbers" -> invoice_number,
+# payment_number, and receipt_number are all unique, auto-generated in
+# save() if left blank.
+# =============================================================================
+
+def _generate_unique_code(prefix: str) -> str:
+    """Simple collision-safe identifier generator used for invoice/payment/
+    receipt numbers. Not strictly sequential (a sequential-per-school
+    counter would need row locking to stay race-safe under concurrent
+    writes) — uniqueness and human-legibility matter more here than
+    sequential ordering, per spec §38's actual requirement."""
+    return f"{prefix}-{uuid.uuid4().hex[:10].upper()}"
+
+
+class FeeCategory(models.Model):
+    """Spec §19 'Fee categories' — e.g. Tuition, Transport, Boarding, Exam Fee."""
+
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="fee_categories")
+    name = models.CharField(max_length=150)
+    code = models.CharField(max_length=20)
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "fee_categories"
+        ordering = ["school", "name"]
+        verbose_name_plural = "Fee categories"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["school", "code"], name="uniq_fee_category_code_per_school"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.school.code})"
+
+
+class FeeStructure(models.Model):
+    """Spec §19 'Fee structures' scoped by Academic Year / Term / Class or
+    Program — a named, reusable billing template. `class_group`/`program`
+    are both optional: leaving both blank means the structure applies
+    school-wide for that year/term."""
+
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="fee_structures")
+    academic_year = models.ForeignKey(
+        AcademicYear, on_delete=models.CASCADE, related_name="fee_structures"
+    )
+    term = models.ForeignKey(
+        Term, on_delete=models.CASCADE, related_name="fee_structures", blank=True, null=True
+    )
+    class_group = models.ForeignKey(
+        Class, on_delete=models.SET_NULL, related_name="fee_structures", blank=True, null=True
+    )
+    program = models.ForeignKey(
+        Program, on_delete=models.SET_NULL, related_name="fee_structures", blank=True, null=True
+    )
+    name = models.CharField(max_length=150)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "fee_structures"
+        ordering = ["-academic_year", "name"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.academic_year})"
+
+
+class FeeStructureItem(models.Model):
+    structure = models.ForeignKey(
+        FeeStructure, on_delete=models.CASCADE, related_name="items"
+    )
+    category = models.ForeignKey(
+        FeeCategory, on_delete=models.PROTECT, related_name="structure_items"
+    )
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    is_mandatory = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "fee_structure_items"
+        ordering = ["structure", "category"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["structure", "category"], name="uniq_category_per_structure"
+            ),
+            models.CheckConstraint(condition=models.Q(amount__gte=0), name="fee_item_amount_non_negative"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.category.name} - {self.amount} ({self.structure.name})"
+
+
+class FeeConcession(models.Model):
+    """Spec §19 'Discounts', 'Scholarships', 'Waivers' — unified under one
+    model with a type discriminator since all three reduce what a
+    specific student owes and share the same approval/audit shape; only
+    the label and typical reason differ."""
+
+    class ConcessionType(models.TextChoices):
+        DISCOUNT = "DISCOUNT", "Discount"
+        SCHOLARSHIP = "SCHOLARSHIP", "Scholarship"
+        WAIVER = "WAIVER", "Waiver"
+
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="fee_concessions"
+    )
+    academic_year = models.ForeignKey(
+        AcademicYear, on_delete=models.CASCADE, related_name="fee_concessions"
+    )
+    term = models.ForeignKey(
+        Term, on_delete=models.CASCADE, related_name="fee_concessions", blank=True, null=True
+    )
+    concession_type = models.CharField(max_length=15, choices=ConcessionType.choices)
+    description = models.CharField(max_length=255, blank=True)
+    percentage = models.DecimalField(
+        max_digits=5, decimal_places=2, blank=True, null=True,
+        help_text="Use either percentage OR fixed_amount, not both.",
+    )
+    fixed_amount = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
+    approved_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="fee_concessions_approved",
+        blank=True, null=True,
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "fee_concessions"
+        ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(percentage__isnull=False, fixed_amount__isnull=True)
+                    | models.Q(percentage__isnull=True, fixed_amount__isnull=False)
+                ),
+                name="fee_concession_exactly_one_of_percentage_or_amount",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.get_concession_type_display()} - {self.student} ({self.academic_year})"
+
+
+class Invoice(models.Model):
+    """Spec §19 'Invoices'. `total_amount` is a stored snapshot of the sum
+    of InvoiceLineItem amounts at generation time — not recomputed live —
+    so an invoice a student already started paying against can't silently
+    change total if fee structure amounts are edited afterward."""
+
+    class Status(models.TextChoices):
+        UNPAID = "UNPAID", "Unpaid"
+        PARTIALLY_PAID = "PARTIALLY_PAID", "Partially Paid"
+        PAID = "PAID", "Paid"
+        OVERDUE = "OVERDUE", "Overdue"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    invoice_number = models.CharField(max_length=30, unique=True, editable=False, blank=True)
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name="invoices")
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="invoices")
+    academic_year = models.ForeignKey(
+        AcademicYear, on_delete=models.CASCADE, related_name="invoices"
+    )
+    term = models.ForeignKey(
+        Term, on_delete=models.CASCADE, related_name="invoices", blank=True, null=True
+    )
+    fee_structure = models.ForeignKey(
+        FeeStructure, on_delete=models.PROTECT, related_name="invoices"
+    )
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=15, choices=Status.choices, default=Status.UNPAID, db_index=True)
+    issue_date = models.DateField()
+    due_date = models.DateField()
+    created_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="invoices_created",
+        blank=True, null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "invoices"
+        ordering = ["-issue_date"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(total_amount__gte=0), name="invoice_total_non_negative"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.invoice_number} - {self.student}"
+
+    def save(self, *args, **kwargs):
+        if not self.invoice_number:
+            self.invoice_number = _generate_unique_code("INV")
+        super().save(*args, **kwargs)
+
+
+class InvoiceLineItem(models.Model):
+    """A positive FEE line or a negative-effect DISCOUNT/SCHOLARSHIP/
+    WAIVER/ADJUSTMENT line. `amount` is always stored positive; `line_type`
+    determines whether it adds to or subtracts from the invoice total —
+    keeps the arithmetic explicit rather than relying on sign conventions
+    that are easy to get backwards."""
+
+    class LineType(models.TextChoices):
+        FEE = "FEE", "Fee"
+        DISCOUNT = "DISCOUNT", "Discount"
+        SCHOLARSHIP = "SCHOLARSHIP", "Scholarship"
+        WAIVER = "WAIVER", "Waiver"
+        ADJUSTMENT = "ADJUSTMENT", "Adjustment"
+
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="line_items")
+    category = models.ForeignKey(
+        FeeCategory, on_delete=models.SET_NULL, related_name="invoice_line_items",
+        blank=True, null=True,
+    )
+    line_type = models.CharField(max_length=15, choices=LineType.choices, default=LineType.FEE)
+    description = models.CharField(max_length=255, blank=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+
+    class Meta:
+        db_table = "invoice_line_items"
+        ordering = ["invoice", "id"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gte=0), name="invoice_line_amount_non_negative"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.get_line_type_display()}: {self.amount} ({self.invoice.invoice_number})"
+
+    @property
+    def signed_amount(self):
+        return -self.amount if self.line_type != self.LineType.FEE else self.amount
+
+
+class Payment(models.Model):
+    """Spec §19 'Payments', 'Partial payments' — one Invoice can have many
+    Payments. §19 'Architect for: Cash, Bank, Card, Mobile money, M-Pesa/
+    Daraja, Other payment gateways' — `payment_method` covers the type;
+    `gateway_reference` holds the external transaction ID (e.g. an M-Pesa
+    Daraja checkout receipt) for gateway-based methods, left blank for cash."""
+
+    class Method(models.TextChoices):
+        CASH = "CASH", "Cash"
+        BANK_TRANSFER = "BANK_TRANSFER", "Bank Transfer"
+        CARD = "CARD", "Card"
+        MOBILE_MONEY = "MOBILE_MONEY", "Mobile Money"
+        MPESA = "MPESA", "M-Pesa / Daraja"
+        OTHER_GATEWAY = "OTHER_GATEWAY", "Other Payment Gateway"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        COMPLETED = "COMPLETED", "Completed"
+        FAILED = "FAILED", "Failed"
+        REVERSED = "REVERSED", "Reversed"
+
+    payment_number = models.CharField(max_length=30, unique=True, editable=False, blank=True)
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="payments")
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    payment_method = models.CharField(max_length=15, choices=Method.choices)
+    gateway_reference = models.CharField(max_length=100, blank=True)
+    status = models.CharField(max_length=15, choices=Status.choices, default=Status.COMPLETED)
+    payer_name = models.CharField(
+        max_length=150, blank=True,
+        help_text="Who physically paid (may differ from the student), e.g. a guardian's name.",
+    )
+    received_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="payments_received",
+        blank=True, null=True,
+    )
+    notes = models.CharField(max_length=255, blank=True)
+    payment_date = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "payments"
+        ordering = ["-payment_date"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name="payment_amount_positive"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.payment_number} - {self.amount} ({self.invoice.invoice_number})"
+
+    def save(self, *args, **kwargs):
+        if not self.payment_number:
+            self.payment_number = _generate_unique_code("PAY")
+        super().save(*args, **kwargs)
+
+
+class Receipt(models.Model):
+    """Spec §38 'Receipts should have unique numbers'. One Receipt per
+    completed Payment, generated automatically by
+    services.record_payment() — never created manually, so a receipt
+    can't exist without a real underlying payment."""
+
+    receipt_number = models.CharField(max_length=30, unique=True, editable=False, blank=True)
+    payment = models.OneToOneField(Payment, on_delete=models.PROTECT, related_name="receipt")
+    issued_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="receipts_issued",
+        blank=True, null=True,
+    )
+    issued_at = models.DateTimeField(auto_now_add=True)
+    pdf_file = models.FileField(upload_to="finance/receipts/", blank=True, null=True)
+
+    class Meta:
+        db_table = "receipts"
+        ordering = ["-issued_at"]
+
+    def __str__(self) -> str:
+        return self.receipt_number
+
+    def save(self, *args, **kwargs):
+        if not self.receipt_number:
+            self.receipt_number = _generate_unique_code("RCT")
+        super().save(*args, **kwargs)
+
+
+class Refund(models.Model):
+    """Spec §19 'Refunds', §38 'Prefer reversal/refund ... over destructive
+    deletion' — a Refund is always a new linked record against an existing
+    Payment, never a deletion or edit of the Payment itself."""
+
+    class Status(models.TextChoices):
+        REQUESTED = "REQUESTED", "Requested"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+        COMPLETED = "COMPLETED", "Completed"
+
+    refund_number = models.CharField(max_length=30, unique=True, editable=False, blank=True)
+    payment = models.ForeignKey(Payment, on_delete=models.PROTECT, related_name="refunds")
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    reason = models.TextField()
+    status = models.CharField(max_length=15, choices=Status.choices, default=Status.REQUESTED)
+    requested_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="refunds_requested",
+        blank=True, null=True,
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+    decided_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="refunds_decided",
+        blank=True, null=True,
+    )
+    decided_at = models.DateTimeField(blank=True, null=True)
+    refund_method = models.CharField(max_length=15, choices=Payment.Method.choices, blank=True)
+    reference_number = models.CharField(max_length=100, blank=True)
+
+    class Meta:
+        db_table = "refunds"
+        ordering = ["-requested_at"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name="refund_amount_positive"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.refund_number} - {self.amount} ({self.status})"
+
+    def save(self, *args, **kwargs):
+        if not self.refund_number:
+            self.refund_number = _generate_unique_code("RFD")
+        super().save(*args, **kwargs)
+
+
+class FinancialAdjustment(models.Model):
+    """Spec §19 'Adjustments' / §38 'Prefer ... correction over destructive
+    deletion'. A signed correction applied to an Invoice's effective
+    balance without editing the invoice's original line items — so the
+    original billed amount always remains visible/auditable."""
+
+    class AdjustmentType(models.TextChoices):
+        CORRECTION = "CORRECTION", "Correction"
+        WRITE_OFF = "WRITE_OFF", "Write-off"
+        OTHER = "OTHER", "Other"
+
+    invoice = models.ForeignKey(
+        Invoice, on_delete=models.CASCADE, related_name="adjustments"
+    )
+    adjustment_type = models.CharField(max_length=15, choices=AdjustmentType.choices)
+    amount = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        help_text="Positive increases the balance owed, negative decreases it.",
+    )
+    reason = models.TextField()
+    created_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="financial_adjustments_created",
+        blank=True, null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "financial_adjustments"
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.get_adjustment_type_display()} {self.amount} ({self.invoice.invoice_number})"
+
+
+# =============================================================================
+# Phase 13 — Library Module (spec §20)
+# =============================================================================
+
+class LibrarySettings(models.Model):
+    """Spec §3 'do not hard-code' — loan period and fine rate are
+    school-configurable rather than baked into borrow/return logic."""
+
+    school = models.OneToOneField(
+        School, on_delete=models.CASCADE, related_name="library_settings"
+    )
+    loan_period_days = models.PositiveIntegerField(default=14)
+    max_books_per_student = models.PositiveIntegerField(default=3)
+    fine_per_day = models.DecimalField(max_digits=8, decimal_places=2, default=Decimal("0.00"))
+
+    class Meta:
+        db_table = "library_settings"
+        verbose_name_plural = "Library settings"
+
+    def __str__(self) -> str:
+        return f"Library settings ({self.school.code})"
+
+
+class BookCategory(models.Model):
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="book_categories")
+    name = models.CharField(max_length=150)
+    description = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "book_categories"
+        ordering = ["school", "name"]
+        verbose_name_plural = "Book categories"
+        constraints = [
+            models.UniqueConstraint(fields=["school", "name"], name="uniq_book_category_per_school")
+        ]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Author(models.Model):
+    """Not school-scoped — an author's identity is reference data shared
+    across the whole catalog, not something a specific school owns."""
+
+    name = models.CharField(max_length=255)
+    bio = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "authors"
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Publisher(models.Model):
+    """Not school-scoped, same reasoning as Author."""
+
+    name = models.CharField(max_length=255)
+    address = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "publishers"
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Book(models.Model):
+    """A catalog entry (title/edition), not a physical item — physical
+    items are BookCopy, below. One Book can have many BookCopy rows."""
+
+    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name="books")
+    title = models.CharField(max_length=255)
+    isbn = models.CharField(max_length=20, blank=True)
+    category = models.ForeignKey(
+        BookCategory, on_delete=models.SET_NULL, related_name="books", blank=True, null=True
+    )
+    publisher = models.ForeignKey(
+        Publisher, on_delete=models.SET_NULL, related_name="books", blank=True, null=True
+    )
+    authors = models.ManyToManyField(Author, blank=True, related_name="books")
+    publication_year = models.PositiveIntegerField(blank=True, null=True)
+    edition = models.CharField(max_length=50, blank=True)
+    description = models.TextField(blank=True)
+    cover_image = models.ImageField(upload_to="library/covers/", blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "books"
+        ordering = ["title"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["school", "isbn"],
+                condition=models.Q(isbn__gt=""),
+                name="uniq_isbn_per_school_when_set",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return self.title
+
+
+class BookCopy(models.Model):
+    """Spec §20 'Copies' — one physical item on the shelf. Multiple copies
+    of the same Book each get their own accession number and lifecycle
+    (a copy can be lost/damaged/withdrawn independently of its siblings)."""
+
+    class Condition(models.TextChoices):
+        NEW = "NEW", "New"
+        GOOD = "GOOD", "Good"
+        FAIR = "FAIR", "Fair"
+        POOR = "POOR", "Poor"
+        DAMAGED = "DAMAGED", "Damaged"
+
+    class Status(models.TextChoices):
+        AVAILABLE = "AVAILABLE", "Available"
+        BORROWED = "BORROWED", "Borrowed"
+        RESERVED = "RESERVED", "Reserved"
+        LOST = "LOST", "Lost"
+        WITHDRAWN = "WITHDRAWN", "Withdrawn"
+
+    book = models.ForeignKey(Book, on_delete=models.CASCADE, related_name="copies")
+    accession_number = models.CharField(max_length=30)
+    condition = models.CharField(max_length=10, choices=Condition.choices, default=Condition.GOOD)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.AVAILABLE, db_index=True)
+    shelf_location = models.CharField(max_length=100, blank=True)
+    acquired_date = models.DateField(blank=True, null=True)
+
+    class Meta:
+        db_table = "book_copies"
+        ordering = ["book", "accession_number"]
+        verbose_name_plural = "Book copies"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["book", "accession_number"], name="uniq_accession_number_per_book"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.book.title} - {self.accession_number}"
+
+
+class Borrowing(models.Model):
+    """Spec §20 'Students', 'Staff', 'Borrowing', 'Returns', 'Due dates',
+    'Fines'. Borrower is exactly one of `student` or `staff` (constraint
+    below) — both roles can borrow, per the spec's explicit listing of
+    both under this module."""
+
+    class Status(models.TextChoices):
+        BORROWED = "BORROWED", "Borrowed"
+        RETURNED = "RETURNED", "Returned"
+        LOST = "LOST", "Lost"
+
+    book_copy = models.ForeignKey(
+        BookCopy, on_delete=models.PROTECT, related_name="borrowings"
+    )
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="library_borrowings",
+        blank=True, null=True,
+    )
+    staff = models.ForeignKey(
+        Staff, on_delete=models.CASCADE, related_name="library_borrowings",
+        blank=True, null=True,
+    )
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.BORROWED, db_index=True)
+    borrowed_date = models.DateField()
+    due_date = models.DateField()
+    returned_date = models.DateField(blank=True, null=True)
+    fine_amount = models.DecimalField(max_digits=8, decimal_places=2, default=Decimal("0.00"))
+    fine_paid = models.BooleanField(default=False)
+    issued_by = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, related_name="borrowings_issued",
+        blank=True, null=True, help_text="The librarian/staff who issued the copy.",
+    )
+    returned_to = models.ForeignKey(
+        Staff, on_delete=models.SET_NULL, related_name="borrowings_received",
+        blank=True, null=True,
+    )
+    notes = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "library_borrowings"
+        ordering = ["-borrowed_date"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(student__isnull=False, staff__isnull=True)
+                    | models.Q(student__isnull=True, staff__isnull=False)
+                ),
+                name="borrowing_exactly_one_of_student_or_staff",
+            ),
+            models.UniqueConstraint(
+                fields=["book_copy"],
+                condition=models.Q(returned_date__isnull=True),
+                name="uniq_active_borrowing_per_copy",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(fine_amount__gte=0), name="library_fine_non_negative"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        borrower = self.student or self.staff
+        return f"{self.book_copy} - {borrower} ({self.status})"
