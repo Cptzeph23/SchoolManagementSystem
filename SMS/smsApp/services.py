@@ -1544,3 +1544,249 @@ def reschedule_timetable_slot(
         description=f"Rescheduled '{old_description}' -> '{new_slot}'",
     )
     return new_slot
+
+
+# =============================================================================
+# Phase 15 — Communication Module (spec §22)
+#
+# Channel honesty: EMAIL works for real right now, using Django's
+# configured mail backend (console backend in dev, SMTP in prod — set up
+# since Phase 1). SMS and PUSH are architected — Channel choices,
+# per-delivery status tracking, NotificationPreference opt-in — but not
+# wired to a live provider. Sending to those channels marks the delivery
+# FAILED with a clear "gateway not configured" message rather than
+# pretending to succeed; wiring a real provider (e.g. Africa's Talking or
+# Twilio for SMS, FCM/APNs for push) needs real credentials from the
+# school and should be a dedicated follow-up, not fabricated here.
+# =============================================================================
+
+def _deliver_email(*, notification, delivery) -> None:
+    from django.core.mail import send_mail
+    from django.utils import timezone
+
+    recipient_email = notification.recipient.email
+    if not recipient_email:
+        delivery.status = delivery.Status.FAILED
+        delivery.error_message = "Recipient has no email address on file."
+        delivery.save(update_fields=["status", "error_message"])
+        return
+
+    try:
+        send_mail(
+            subject=notification.title, message=notification.message,
+            from_email=None,  # uses DEFAULT_FROM_EMAIL
+            recipient_list=[recipient_email], fail_silently=False,
+        )
+        delivery.status = delivery.Status.SENT
+        delivery.sent_at = timezone.now()
+        delivery.save(update_fields=["status", "sent_at"])
+    except Exception as exc:  # noqa: BLE001 — any backend failure must be recorded, not raised
+        delivery.status = delivery.Status.FAILED
+        delivery.error_message = str(exc)[:255]
+        delivery.save(update_fields=["status", "error_message"])
+
+
+def _deliver_sms(*, notification, delivery) -> None:
+    """No live SMS gateway is configured. Marks the attempt FAILED with an
+    honest reason rather than silently no-op'ing as if it succeeded."""
+    delivery.status = delivery.Status.FAILED
+    delivery.error_message = "SMS gateway not configured."
+    delivery.save(update_fields=["status", "error_message"])
+
+
+def _deliver_push(*, notification, delivery) -> None:
+    """No live push gateway (FCM/APNs) is configured — same honesty as
+    _deliver_sms."""
+    delivery.status = delivery.Status.FAILED
+    delivery.error_message = "Push gateway not configured."
+    delivery.save(update_fields=["status", "error_message"])
+
+
+_CHANNEL_HANDLERS = {
+    "EMAIL": _deliver_email,
+    "SMS": _deliver_sms,
+    "PUSH": _deliver_push,
+}
+
+
+def send_notification(
+    *,
+    recipient: User,
+    notification_type: str,
+    title: str,
+    body: str,
+    channels: list[str] | None = None,
+    related_model: str = "",
+    related_object_id: str | int = "",
+    request: HttpRequest | None = None,
+):
+    """Spec §22: role-aware in-app/email/SMS/push notifications.
+
+    An in-app Notification row is always created (zero-cost, no gateway
+    needed). Additional channels are attempted only if both requested
+    AND the recipient's NotificationPreference has that channel enabled
+    — a recipient who has opted out of email never gets an email attempt
+    logged as failed, they simply don't get one.
+    """
+    from .models import Notification, NotificationDelivery, NotificationPreference
+
+    prefs, _ = NotificationPreference.objects.get_or_create(user=recipient)
+
+    notification = Notification.objects.create(
+        recipient=recipient, notification_type=notification_type,
+        title=title, message=body, related_model=related_model,
+        related_object_id=str(related_object_id) if related_object_id != "" else "",
+    )
+
+    # In-app is implicit/free — record it as SENT immediately, no dispatch needed.
+    if prefs.in_app_enabled:
+        NotificationDelivery.objects.create(
+            notification=notification, channel=NotificationDelivery.Channel.IN_APP,
+            status=NotificationDelivery.Status.SENT,
+        )
+
+    channel_enabled = {
+        "EMAIL": prefs.email_enabled, "SMS": prefs.sms_enabled, "PUSH": prefs.push_enabled,
+    }
+    for channel in (channels or []):
+        if channel not in _CHANNEL_HANDLERS:
+            continue
+        if not channel_enabled.get(channel, False):
+            continue
+        delivery = NotificationDelivery.objects.create(
+            notification=notification, channel=channel,
+            status=NotificationDelivery.Status.PENDING,
+        )
+        _CHANNEL_HANDLERS[channel](notification=notification, delivery=delivery)
+
+    return notification
+
+
+def create_announcement(
+    *, school, title: str, body: str, audience: str, created_by: User,
+    channels: list[str] | None = None, request: HttpRequest | None = None,
+):
+    """Spec §22 'Announcements', role-aware fan-out. Creates the
+    Announcement record, then a Notification for every matching recipient
+    — matching the same per-recipient-row design as send_notification()
+    so each person's read state is independent."""
+    from django.utils import timezone
+
+    from .models import Announcement, Notification, School as SchoolModel
+
+    announcement = Announcement.objects.create(
+        school=school, title=title, body=body, audience=audience,
+        created_by=created_by, published_at=timezone.now(),
+    )
+
+    recipients = _resolve_announcement_audience(school=school, audience=audience)
+    for recipient in recipients:
+        send_notification(
+            recipient=recipient, notification_type=Notification.NotificationType.ANNOUNCEMENT,
+            title=title, body=body, channels=channels,
+            related_model="Announcement", related_object_id=announcement.pk, request=request,
+        )
+
+    log_audit(
+        actor=created_by, action=AuditLog.Action.CREATE, request=request,
+        target_model="Announcement", target_object_id=announcement.pk,
+        description=f"Published announcement '{title}' to {audience}",
+    )
+    return announcement
+
+
+def _resolve_announcement_audience(*, school, audience: str):
+    from .models import Announcement
+
+    role_map = {
+        Announcement.Audience.STUDENTS: [User.Role.STUDENT],
+        Announcement.Audience.PARENTS: [User.Role.PARENT],
+        Announcement.Audience.TEACHERS: [User.Role.TEACHER, User.Role.CLASS_TEACHER],
+        Announcement.Audience.STAFF: [
+            User.Role.STAFF_ADMIN, User.Role.ACADEMIC_ADMIN, User.Role.FINANCE_ADMIN,
+            User.Role.TEACHER, User.Role.EXAM_OFFICER, User.Role.CLASS_TEACHER,
+            User.Role.DEPARTMENT_HEAD, User.Role.ACCOUNTANT, User.Role.LIBRARIAN,
+        ],
+    }
+    if audience == Announcement.Audience.ALL:
+        return User.objects.filter(is_active=True).filter(_in_school_q(school))
+    roles = role_map.get(audience, [])
+    return User.objects.filter(is_active=True, role__in=roles).filter(_in_school_q(school))
+
+
+def _in_school_q(school):
+    """Users don't have a direct `school` FK (only Student/Staff/Guardian
+    do); this maps a User back to their school through whichever profile
+    they have, or matches everyone if the school can't be determined
+    (e.g. a bare superuser account with no Student/Staff profile)."""
+    from django.db.models import Q
+
+    return (
+        Q(student_profile__school=school)
+        | Q(staff_profile__school=school)
+        | Q(guardian_profile__school=school)
+        | Q(is_superuser=True)
+    )
+
+
+def mark_notification_read(*, notification) -> None:
+    from django.utils import timezone
+
+    if not notification.is_read:
+        notification.is_read = True
+        notification.read_at = timezone.now()
+        notification.save(update_fields=["is_read", "read_at"])
+
+
+# --- Role-aware convenience wrappers matching spec §22's exact examples ---
+
+def notify_result_published(*, student: Student, subject_name: str, request: HttpRequest | None = None):
+    """Spec §22 example: Student — "Your Mathematics results have been published." """
+    return send_notification(
+        recipient=student.user,
+        notification_type="RESULT_PUBLISHED",
+        title="Results Published",
+        body=f"Your {subject_name} results have been published.",
+        channels=["EMAIL"], request=request,
+    )
+
+
+def notify_report_available(*, guardian, student: Student, term, request: HttpRequest | None = None):
+    """Spec §22 example: Parent — "Your child's Term 2 report is available."
+    No-ops if the guardian has no linked portal account yet (Guardian.user
+    is optional — see Phase 3) since there's no User to notify."""
+    if guardian.user_id is None:
+        return None
+    return send_notification(
+        recipient=guardian.user,
+        notification_type="REPORT_AVAILABLE",
+        title="Report Available",
+        body=f"Your child's {term} report is available.",
+        channels=["EMAIL"], request=request,
+    )
+
+
+def notify_payment_received(
+    *, recipient: User, amount: Decimal, invoice_number: str, request: HttpRequest | None = None,
+):
+    """Spec §22 example: Finance — "Payment received." """
+    return send_notification(
+        recipient=recipient,
+        notification_type="PAYMENT_RECEIVED",
+        title="Payment Received",
+        body=f"Payment of {amount} received for invoice {invoice_number}.",
+        channels=["EMAIL"], request=request,
+    )
+
+
+def notify_assignment_deadline_approaching(
+    *, teacher_user: User, assignment_title: str, due_date, request: HttpRequest | None = None,
+):
+    """Spec §22 example: Teacher — "Assignment deadline approaching." """
+    return send_notification(
+        recipient=teacher_user,
+        notification_type="ASSIGNMENT_DEADLINE",
+        title="Assignment Deadline Approaching",
+        body=f"'{assignment_title}' is due on {due_date}.",
+        channels=["EMAIL"], request=request,
+    )
