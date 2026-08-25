@@ -30,4 +30,37 @@ urlpatterns = [
         "transcripts/verify/<uuid:verification_code>/",
         views.TranscriptVerifyView.as_view(), name="transcript_verify",
     ),
+    path("student/", views.StudentDashboardView.as_view(), name="student_dashboard"),
+    path("student/academic/", views.StudentAcademicView.as_view(), name="student_academic"),
+    path("student/lms/", views.StudentLMSView.as_view(), name="student_lms"),
+    path(
+        "student/lms/assignments/<int:assignment_id>/submit/",
+        views.StudentSubmitAssignmentView.as_view(), name="student_submit_assignment",
+    ),
+    path("student/finance/", views.StudentFinanceView.as_view(), name="student_finance"),
+    path(
+        "student/communication/", views.StudentCommunicationView.as_view(),
+        name="student_communication",
+    ),
+    path(
+        "student/notifications/<int:notification_id>/read/",
+        views.StudentMarkNotificationReadView.as_view(), name="student_mark_notification_read",
+    ),
+    path("parent/", views.ParentDashboardView.as_view(), name="parent_dashboard"),
+    path(
+        "parent/children/<int:student_id>/academic/",
+        views.ParentChildAcademicView.as_view(), name="parent_child_academic",
+    ),
+    path(
+        "parent/children/<int:student_id>/finance/",
+        views.ParentChildFinanceView.as_view(), name="parent_child_finance",
+    ),
+    path(
+        "parent/communication/", views.ParentCommunicationView.as_view(),
+        name="parent_communication",
+    ),
+    path(
+        "parent/notifications/<int:notification_id>/read/",
+        views.ParentMarkNotificationReadView.as_view(), name="parent_mark_notification_read",
+    ),
 ]
