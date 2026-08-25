@@ -90,8 +90,10 @@ def get_dashboard_url_for_role(user: User) -> str:
 
     mapping = {
         User.Role.SUPER_ADMIN: "dashboard:super_admin",
+        User.Role.STUDENT: "dashboard:student_dashboard",
+        User.Role.PARENT: "dashboard:parent_dashboard",
         # Other roles route here as their dashboards are built
-        # (Staff Admin -> Phase 6, Academic Admin -> Phase 7, etc.)
+        # (Staff Admin, Academic Admin, Teacher, Parent, Finance, etc.)
     }
     url_name = mapping.get(user.role, "dashboard:coming_soon")
     return reverse(url_name)
@@ -1016,7 +1018,7 @@ def generate_invoice_for_student(
     invoice = Invoice.objects.create(
         student=student, school=student.school, academic_year=academic_year,
         term=term, fee_structure=fee_structure, total_amount=Decimal("0"),
-        issue_date=timezone.now().date(), due_date=due_date, created_by=issued_by,
+        issue_date=timezone.localtime(timezone.now()).date(), due_date=due_date, created_by=issued_by,
     )
 
     total = Decimal("0")
@@ -1281,7 +1283,7 @@ def compute_student_account_summary(*, student: Student) -> dict[str, Any]:
         invoice__student=student, status=Payment.Status.COMPLETED
     ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
 
-    today = timezone.now().date()
+    today = timezone.localtime(timezone.now()).date()
     arrears = invoices.filter(
         due_date__lt=today
     ).exclude(status=Invoice.Status.PAID).aggregate(
@@ -1336,7 +1338,7 @@ def borrow_book(
                 f"{settings_row.max_books_per_student} borrowed books."
             )
 
-    today = timezone.now().date()
+    today = timezone.localtime(timezone.now()).date()
     borrowing = Borrowing.objects.create(
         book_copy=book_copy, student=student, staff=staff, issued_by=issued_by,
         borrowed_date=today,
@@ -1367,7 +1369,7 @@ def return_book(
     if borrowing.status != Borrowing.Status.BORROWED:
         raise ValueError(f"This borrowing is already {borrowing.status}, cannot return it.")
 
-    today = timezone.now().date()
+    today = timezone.localtime(timezone.now()).date()
     borrower_school = borrowing.student.school if borrowing.student else borrowing.staff.school
     settings_row, _ = LibrarySettings.objects.get_or_create(school=borrower_school)
 
@@ -1790,3 +1792,22 @@ def notify_assignment_deadline_approaching(
         body=f"'{assignment_title}' is due on {due_date}.",
         channels=["EMAIL"], request=request,
     )
+
+
+# =============================================================================
+# Phase 17 — Parent/Guardian Portal (spec §18)
+# =============================================================================
+
+def get_children_for_guardian(*, guardian_user: User):
+    """Spec §18 'Parent -> Child 1/2/3' -- a parent can have multiple
+    children, modeled via the existing StudentGuardian through-table
+    (Phase 3), not a new relation. Returns every Student linked to this
+    guardian's portal account, ordered for a stable dashboard listing."""
+    from .models import Guardian, Student
+
+    guardian = Guardian.objects.filter(user=guardian_user).first()
+    if guardian is None:
+        return Student.objects.none()
+    return Student.objects.filter(
+        studentguardian__guardian=guardian
+    ).distinct().order_by("admission_number")
