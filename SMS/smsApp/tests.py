@@ -1719,11 +1719,19 @@ class LibraryTests(TestCase):
         self.assertEqual(self.copy1.status, BookCopy.Status.AVAILABLE)
 
     def test_late_return_computes_fine(self):
+        from django.utils import timezone
+
         borrowing = borrow_book(
             book_copy=self.copy1, student=self.student, issued_by=self.librarian,
         )
-        # Force the due date into the past to simulate lateness.
-        borrowing.due_date = datetime.date.today() - datetime.timedelta(days=3)
+        # Force the due date into the past to simulate lateness. Uses the
+        # same timezone.localtime(timezone.now()).date() the service uses
+        # (not datetime.date.today()) — regression guard for a real bug
+        # where timezone.now().date() returned the UTC calendar date
+        # instead of the school's configured local date, silently causing
+        # an off-by-one-day fine during Nairobi's 00:00-03:00 local window.
+        today = timezone.localtime(timezone.now()).date()
+        borrowing.due_date = today - datetime.timedelta(days=3)
         borrowing.save(update_fields=["due_date"])
 
         return_book(borrowing=borrowing, returned_to=self.librarian)
@@ -2103,3 +2111,403 @@ class CommunicationTests(TestCase):
                 NotificationDelivery.objects.create(
                     notification=notification, channel=NotificationDelivery.Channel.IN_APP,
                 )
+
+
+class StudentDashboardTests(TestCase):
+    """Phase 16: read-only self-service views, ownership enforcement, and
+    the one legitimate write action (assignment submission)."""
+
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(school=self.school, code="MATH", name="Mathematics")
+        self.class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+            is_current=True,
+        )
+
+        self.student_user = User.objects.create_user(
+            username="dashstudent", password="pass12345", role=User.Role.STUDENT,
+        )
+        self.student = Student.objects.create(
+            user=self.student_user, school=self.school, admission_number="ADM990",
+            admission_date=datetime.date(2026, 1, 10), current_class=self.class_group,
+        )
+        Enrollment.objects.create(
+            student=self.student, class_subject=self.class_subject,
+            academic_year=self.academic_year,
+        )
+
+        # A second, unrelated student — used for ownership-boundary tests.
+        self.other_student_user = User.objects.create_user(
+            username="dashstudent2", password="pass12345", role=User.Role.STUDENT,
+        )
+        self.other_student = Student.objects.create(
+            user=self.other_student_user, school=self.school, admission_number="ADM991",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+
+        self.client.login(username="dashstudent", password="pass12345")
+
+    def test_overview_page_loads(self):
+        response = self.client.get(reverse("dashboard:student_dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.student.admission_number)
+
+    def test_academic_page_shows_enrolled_subject(self):
+        response = self.client.get(reverse("dashboard:student_academic"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Mathematics")
+
+    def test_lms_page_loads(self):
+        response = self.client.get(reverse("dashboard:student_lms"))
+        self.assertEqual(response.status_code, 200)
+
+    def test_finance_page_shows_only_own_invoices(self):
+        fee_category = FeeCategory.objects.create(school=self.school, name="Tuition", code="TUI")
+        structure = FeeStructure.objects.create(
+            school=self.school, academic_year=self.academic_year, term=self.term, name="Term 1"
+        )
+        FeeStructureItem.objects.create(structure=structure, category=fee_category, amount=Decimal("1000"))
+        finance_admin = User.objects.create_user(
+            username="dashfinance", password="pass12345", role=User.Role.FINANCE_ADMIN
+        )
+        my_invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=structure, academic_year=self.academic_year,
+            term=self.term, issued_by=finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        other_invoice = generate_invoice_for_student(
+            student=self.other_student, fee_structure=structure, academic_year=self.academic_year,
+            term=self.term, issued_by=finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        response = self.client.get(reverse("dashboard:student_finance"))
+        self.assertContains(response, my_invoice.invoice_number)
+        self.assertNotContains(response, other_invoice.invoice_number)
+
+    def test_communication_page_loads(self):
+        response = self.client.get(reverse("dashboard:student_communication"))
+        self.assertEqual(response.status_code, 200)
+
+    def test_student_can_submit_assignment_via_dashboard(self):
+        assignment = Assignment.objects.create(
+            class_subject=self.class_subject, term=self.term, title="Essay",
+            deadline=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+        )
+        response = self.client.post(
+            reverse("dashboard:student_submit_assignment", args=[assignment.pk]),
+            {"submitted_text": "My essay text"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(
+            AssignmentSubmission.objects.filter(assignment=assignment, student=self.student).exists()
+        )
+
+    def test_student_cannot_view_another_students_report_card(self):
+        template = ReportTemplate.objects.create(
+            school=self.school, name="Standard", is_default=True
+        )
+        other_card = ReportCard.objects.create(
+            student=self.other_student, term=self.term, template=template,
+        )
+        response = self.client.get(
+            reverse("dashboard:report_card_html", args=[other_card.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_student_can_view_own_report_card(self):
+        template = ReportTemplate.objects.create(
+            school=self.school, name="Standard", is_default=True
+        )
+        own_card = ReportCard.objects.create(
+            student=self.student, term=self.term, template=template,
+        )
+        response = self.client.get(
+            reverse("dashboard:report_card_html", args=[own_card.pk])
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_student_cannot_download_another_students_transcript(self):
+        response = self.client.get(
+            reverse("dashboard:transcript_download", args=[self.other_student.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_student_can_mark_own_notification_read(self):
+        notification = send_notification(
+            recipient=self.student_user, notification_type="OTHER", title="T", body="M",
+        )
+        response = self.client.post(
+            reverse("dashboard:student_mark_notification_read", args=[notification.pk])
+        )
+        self.assertEqual(response.status_code, 302)
+        notification.refresh_from_db()
+        self.assertTrue(notification.is_read)
+
+    def test_student_cannot_mark_another_students_notification_read(self):
+        other_notification = send_notification(
+            recipient=self.other_student_user, notification_type="OTHER", title="T", body="M",
+        )
+        response = self.client.post(
+            reverse("dashboard:student_mark_notification_read", args=[other_notification.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+        other_notification.refresh_from_db()
+        self.assertFalse(other_notification.is_read)
+
+    def test_non_student_role_cannot_access_student_dashboard(self):
+        self.client.logout()
+        teacher_user = User.objects.create_user(
+            username="dashteacher", password="pass12345", role=User.Role.TEACHER
+        )
+        self.client.login(username="dashteacher", password="pass12345")
+        response = self.client.get(reverse("dashboard:student_dashboard"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_dashboard_router_sends_student_to_student_dashboard(self):
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertRedirects(response, reverse("dashboard:student_dashboard"))
+
+
+class ParentDashboardTests(TestCase):
+    """Phase 17: multi-child aggregation, and ownership enforcement per
+    child — a parent must never be able to view a child not linked to
+    their own Guardian record, even by guessing a URL."""
+
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(school=self.school, code="MATH", name="Mathematics")
+        self.class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+            is_current=True,
+        )
+
+        self.parent_user = User.objects.create_user(
+            username="dashparent", password="pass12345", role=User.Role.PARENT,
+        )
+        self.guardian = Guardian.objects.create(
+            user=self.parent_user, school=self.school, first_name="Jane", last_name="Doe",
+            relationship="Mother", phone_number="+254700000000",
+        )
+
+        # Two children linked to this parent (spec §18 "Parent -> Child 1/2").
+        self.child1_user = User.objects.create_user(
+            username="parentchild1", password="pass12345", role=User.Role.STUDENT,
+        )
+        self.child1 = Student.objects.create(
+            user=self.child1_user, school=self.school, admission_number="ADM801",
+            admission_date=datetime.date(2026, 1, 10), current_class=self.class_group,
+        )
+        StudentGuardian.objects.create(student=self.child1, guardian=self.guardian)
+
+        self.child2_user = User.objects.create_user(
+            username="parentchild2", password="pass12345", role=User.Role.STUDENT,
+        )
+        self.child2 = Student.objects.create(
+            user=self.child2_user, school=self.school, admission_number="ADM802",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        StudentGuardian.objects.create(student=self.child2, guardian=self.guardian)
+
+        Enrollment.objects.create(
+            student=self.child1, class_subject=self.class_subject,
+            academic_year=self.academic_year,
+        )
+
+        # An unrelated student, NOT linked to this parent.
+        unrelated_user = User.objects.create_user(
+            username="unrelatedchild", password="pass12345", role=User.Role.STUDENT,
+        )
+        self.unrelated_student = Student.objects.create(
+            user=unrelated_user, school=self.school, admission_number="ADM803",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+
+        self.client.login(username="dashparent", password="pass12345")
+
+    def test_overview_shows_both_linked_children(self):
+        response = self.client.get(reverse("dashboard:parent_dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.child1.admission_number)
+        self.assertContains(response, self.child2.admission_number)
+
+    def test_overview_does_not_show_unrelated_student(self):
+        response = self.client.get(reverse("dashboard:parent_dashboard"))
+        self.assertNotContains(response, self.unrelated_student.admission_number)
+
+    def test_can_view_own_child_academic_page(self):
+        response = self.client.get(
+            reverse("dashboard:parent_child_academic", args=[self.child1.pk])
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Mathematics")
+
+    def test_cannot_view_unrelated_student_academic_page(self):
+        response = self.client.get(
+            reverse("dashboard:parent_child_academic", args=[self.unrelated_student.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_can_view_own_child_finance_page_scoped_to_that_child(self):
+        fee_category = FeeCategory.objects.create(school=self.school, name="Tuition", code="TUI")
+        structure = FeeStructure.objects.create(
+            school=self.school, academic_year=self.academic_year, term=self.term, name="Term 1"
+        )
+        FeeStructureItem.objects.create(structure=structure, category=fee_category, amount=Decimal("1000"))
+        finance_admin = User.objects.create_user(
+            username="parentfinanceadmin", password="pass12345", role=User.Role.FINANCE_ADMIN
+        )
+        child1_invoice = generate_invoice_for_student(
+            student=self.child1, fee_structure=structure, academic_year=self.academic_year,
+            term=self.term, issued_by=finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        child2_invoice = generate_invoice_for_student(
+            student=self.child2, fee_structure=structure, academic_year=self.academic_year,
+            term=self.term, issued_by=finance_admin, due_date=datetime.date(2026, 2, 1),
+        )
+        response = self.client.get(
+            reverse("dashboard:parent_child_finance", args=[self.child1.pk])
+        )
+        self.assertContains(response, child1_invoice.invoice_number)
+        # Even though child2 IS a linked child, the invoice on child1's
+        # page must only show child1's invoices, not a sibling's.
+        self.assertNotContains(response, child2_invoice.invoice_number)
+
+    def test_cannot_view_unrelated_student_finance_page(self):
+        response = self.client.get(
+            reverse("dashboard:parent_child_finance", args=[self.unrelated_student.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_can_view_own_child_report_card(self):
+        template = ReportTemplate.objects.create(
+            school=self.school, name="Standard", is_default=True
+        )
+        report_card = ReportCard.objects.create(
+            student=self.child1, term=self.term, template=template,
+        )
+        response = self.client.get(
+            reverse("dashboard:report_card_html", args=[report_card.pk])
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_cannot_view_unrelated_student_report_card(self):
+        template = ReportTemplate.objects.create(
+            school=self.school, name="Standard", is_default=True
+        )
+        other_card = ReportCard.objects.create(
+            student=self.unrelated_student, term=self.term, template=template,
+        )
+        response = self.client.get(
+            reverse("dashboard:report_card_html", args=[other_card.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_can_download_own_child_report_card_pdf(self):
+        """Regression test: ReportCardPDFView's allowed_roles previously
+        omitted PARENT entirely (despite the docstring claiming parity
+        with ReportCardHTMLView), so a parent hit 403 before the
+        ownership check ever ran. This must return 200, not 403/404."""
+        template = ReportTemplate.objects.create(
+            school=self.school, name="Standard", is_default=True
+        )
+        report_card = ReportCard.objects.create(
+            student=self.child1, term=self.term, template=template,
+        )
+        response = self.client.get(
+            reverse("dashboard:report_card_pdf", args=[report_card.pk])
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+
+    def test_cannot_download_unrelated_student_report_card_pdf(self):
+        template = ReportTemplate.objects.create(
+            school=self.school, name="Standard", is_default=True
+        )
+        other_card = ReportCard.objects.create(
+            student=self.unrelated_student, term=self.term, template=template,
+        )
+        response = self.client.get(
+            reverse("dashboard:report_card_pdf", args=[other_card.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_communication_page_loads_and_shows_notifications(self):
+        send_notification(
+            recipient=self.parent_user, notification_type="REPORT_AVAILABLE",
+            title="Report Available", body="Your child's Term 2 report is available.",
+        )
+        response = self.client.get(reverse("dashboard:parent_communication"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Report Available")
+
+    def test_parent_can_mark_own_notification_read(self):
+        notification = send_notification(
+            recipient=self.parent_user, notification_type="OTHER", title="T", body="M",
+        )
+        response = self.client.post(
+            reverse("dashboard:parent_mark_notification_read", args=[notification.pk])
+        )
+        self.assertEqual(response.status_code, 302)
+        notification.refresh_from_db()
+        self.assertTrue(notification.is_read)
+
+    def test_parent_cannot_mark_unrelated_notification_read(self):
+        other_parent = User.objects.create_user(
+            username="otherparent", password="pass12345", role=User.Role.PARENT,
+        )
+        other_notification = send_notification(
+            recipient=other_parent, notification_type="OTHER", title="T", body="M",
+        )
+        response = self.client.post(
+            reverse("dashboard:parent_mark_notification_read", args=[other_notification.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+        other_notification.refresh_from_db()
+        self.assertFalse(other_notification.is_read)
+
+    def test_non_parent_role_cannot_access_parent_dashboard(self):
+        self.client.logout()
+        self.client.login(username="parentchild1", password="pass12345")
+        response = self.client.get(reverse("dashboard:parent_dashboard"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_dashboard_router_sends_parent_to_parent_dashboard(self):
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertRedirects(response, reverse("dashboard:parent_dashboard"))
+
+    def test_guardian_with_no_linked_children_sees_empty_dashboard(self):
+        lonely_parent = User.objects.create_user(
+            username="lonelyparent", password="pass12345", role=User.Role.PARENT,
+        )
+        Guardian.objects.create(
+            user=lonely_parent, school=self.school, first_name="Solo", last_name="Parent",
+            relationship="Father", phone_number="+254700000001",
+        )
+        self.client.logout()
+        self.client.login(username="lonelyparent", password="pass12345")
+        response = self.client.get(reverse("dashboard:parent_dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context["child_rows"]), 0)
