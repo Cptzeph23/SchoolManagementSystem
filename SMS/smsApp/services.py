@@ -92,8 +92,12 @@ def get_dashboard_url_for_role(user: User) -> str:
         User.Role.SUPER_ADMIN: "dashboard:super_admin",
         User.Role.STUDENT: "dashboard:student_dashboard",
         User.Role.PARENT: "dashboard:parent_dashboard",
+        User.Role.TEACHER: "dashboard:teacher_dashboard",
+        User.Role.CLASS_TEACHER: "dashboard:teacher_dashboard",
+        User.Role.FINANCE_ADMIN: "dashboard:finance_dashboard",
+        User.Role.ACCOUNTANT: "dashboard:finance_dashboard",
         # Other roles route here as their dashboards are built
-        # (Staff Admin, Academic Admin, Teacher, Parent, Finance, etc.)
+        # (Staff Admin, Academic Admin, etc.)
     }
     url_name = mapping.get(user.role, "dashboard:coming_soon")
     return reverse(url_name)
@@ -1811,3 +1815,135 @@ def get_children_for_guardian(*, guardian_user: User):
     return Student.objects.filter(
         studentguardian__guardian=guardian
     ).distinct().order_by("admission_number")
+
+
+# =============================================================================
+# Phase 18 — Teacher Dashboard (spec §9)
+# =============================================================================
+
+def mark_attendance(
+    *,
+    class_subject,
+    term,
+    date,
+    taken_by,
+    records: dict[int, dict],
+    request: HttpRequest | None = None,
+):
+    """Spec §9/§11: a teacher's INITIAL attendance submission for one
+    class+subject+date — distinct from correct_attendance_record()
+    (Phase 6), which is Academic Admin's after-the-fact correction path.
+
+    `records` maps student_id -> {"status": ..., "notes": ...}. Blocks
+    re-marking a session Academic Admin has already locked (spec §11
+    'Academic Admin can... correct attendance with appropriate
+    permissions' implies the teacher's window to freely re-submit ends
+    once that review has happened)."""
+    from .models import AttendanceRecord, AttendanceSession
+
+    session, created = AttendanceSession.objects.get_or_create(
+        class_subject=class_subject, date=date,
+        defaults={"term": term, "taken_by": taken_by},
+    )
+    if session.is_locked:
+        raise ValueError(
+            "This attendance session has been locked by Academic Admin; "
+            "use the correction workflow instead of re-marking it."
+        )
+    if not created:
+        session.taken_by = taken_by
+        session.save(update_fields=["taken_by"])
+
+    for student_id, payload in records.items():
+        AttendanceRecord.objects.update_or_create(
+            session=session, student_id=student_id,
+            defaults={
+                "status": payload["status"],
+                "notes": payload.get("notes", ""),
+                "recorded_by": taken_by.user,
+            },
+        )
+
+    log_audit(
+        actor=taken_by.user, action=AuditLog.Action.CREATE if created else AuditLog.Action.UPDATE,
+        request=request, target_model="AttendanceSession", target_object_id=session.pk,
+        description=f"Marked attendance for {class_subject} on {date}",
+    )
+    return session
+
+
+def record_assessment_marks(
+    *,
+    assessment: "Assessment",
+    teacher,
+    marks: dict[int, Decimal],
+    request: HttpRequest | None = None,
+):
+    """Spec §9 'Enter marks'. Only allowed while the assessment is still
+    in a teacher-editable stage (DRAFT or REJECTED) — once submitted, the
+    result-processing workflow (Phase 8) owns further changes, and once
+    published, AssessmentMark.save() itself refuses direct edits (spec
+    §14, enforced at the model layer since Phase 8)."""
+    from .models import Assessment as AssessmentModel, AssessmentMark
+
+    editable_statuses = {
+        AssessmentModel.WorkflowStatus.DRAFT, AssessmentModel.WorkflowStatus.REJECTED,
+    }
+    if assessment.workflow_status not in editable_statuses:
+        raise ValueError(
+            f"Marks cannot be entered while this assessment is "
+            f"'{assessment.workflow_status}'."
+        )
+
+    updated = []
+    for student_id, mark_value in marks.items():
+        if mark_value > assessment.component.max_marks:
+            raise ValueError(
+                f"Mark {mark_value} exceeds this component's max_marks "
+                f"({assessment.component.max_marks})."
+            )
+        record, _ = AssessmentMark.objects.update_or_create(
+            assessment=assessment, student_id=student_id,
+            defaults={"marks_obtained": mark_value, "recorded_by": teacher.user},
+        )
+        updated.append(record)
+
+    log_audit(
+        actor=teacher.user, action=AuditLog.Action.UPDATE, request=request,
+        target_model="Assessment", target_object_id=assessment.pk,
+        description=f"Entered/updated {len(updated)} mark(s) for {assessment}",
+    )
+    return updated
+
+
+# =============================================================================
+# Phase 19 — Finance Admin Dashboard (spec §19, §23)
+# =============================================================================
+
+def compute_school_financial_summary(*, school) -> dict[str, Any]:
+    """School-wide equivalent of compute_student_account_summary() — same
+    data-minimization rule applies (financial totals only, no academic
+    joins). Used by the Finance Admin overview page."""
+    from django.utils import timezone
+
+    from .models import Invoice, Payment
+
+    invoices = Invoice.objects.filter(school=school).exclude(status=Invoice.Status.CANCELLED)
+    total_billed = invoices.aggregate(total=_sum("total_amount"))["total"] or Decimal("0")
+
+    total_collected = Payment.objects.filter(
+        invoice__school=school, status=Payment.Status.COMPLETED
+    ).aggregate(total=_sum("amount"))["total"] or Decimal("0")
+
+    today = timezone.localtime(timezone.now()).date()
+    overdue_invoices = invoices.filter(due_date__lt=today).exclude(status=Invoice.Status.PAID)
+    arrears = overdue_invoices.aggregate(total=_sum("total_amount"))["total"] or Decimal("0")
+
+    return {
+        "total_billed": total_billed,
+        "total_collected": total_collected,
+        "outstanding_balance": total_billed - total_collected,
+        "arrears": arrears,
+        "overdue_invoice_count": overdue_invoices.count(),
+        "unpaid_invoice_count": invoices.filter(status=Invoice.Status.UNPAID).count(),
+    }
