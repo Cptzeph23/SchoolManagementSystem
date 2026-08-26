@@ -1,4 +1,7 @@
 # Absolute path: SMS/smsApp/views.py
+import datetime
+from decimal import Decimal
+
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView as DjangoLoginView
 from django.http import Http404, HttpResponse, HttpResponseForbidden
@@ -10,40 +13,59 @@ from django.views.generic import RedirectView, TemplateView
 from .models import (
     AcademicYear,
     Announcement,
+    Assessment,
+    AssessmentMark,
     Assignment,
     AssignmentSubmission,
+    AttendanceRecord,
+    AttendanceSession,
     Class,
     ClassSubject,
     CourseMaterial,
     Discussion,
+    Enrollment,
+    FeeConcession,
+    FeeStructure,
     Guardian,
     Invoice,
     Notification,
     Payment,
     Quiz,
     QuizAttempt,
+    Refund,
     ReportCard,
     ReportTemplate,
     Staff,
     Student,
+    Subject,
+    TeachingAssignment,
     Term,
+    TimetableSlot,
     Transcript,
     User,
 )
 from .permissions import RoleRequiredMixin
 from .services import (
+    apply_financial_adjustment,
+    compute_school_financial_summary,
     compute_student_account_summary,
     compute_weighted_average,
+    decide_refund,
     generate_batch_reports,
+    generate_invoice_for_student,
     generate_report_pdf,
     generate_transcript,
     get_children_for_guardian,
     get_dashboard_url_for_role,
     get_grade_for_mark,
+    mark_attendance,
     mark_notification_read,
+    record_assessment_marks,
     record_login,
+    record_payment,
     render_report_html,
     submit_assignment,
+    transition_assessment_workflow,
     verify_transcript,
 )
 
@@ -270,6 +292,12 @@ class TranscriptVerifyView(View):
 
 class StudentRequiredMixin(RoleRequiredMixin):
     allowed_roles = [User.Role.STUDENT]
+    active_nav = None  # set per-view; drives sidebar active-link highlighting
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["active"] = self.active_nav
+        return context
 
     def get_student(self, request) -> Student:
         return get_object_or_404(Student, user=request.user)
@@ -286,6 +314,7 @@ class StudentDashboardView(StudentRequiredMixin, TemplateView):
     detail pages below."""
 
     template_name = "dashboard/student/overview.html"
+    active_nav = "overview"
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -341,6 +370,7 @@ class StudentAcademicView(StudentRequiredMixin, TemplateView):
     re-rendering their content inline."""
 
     template_name = "dashboard/student/academic.html"
+    active_nav = "academic"
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -381,6 +411,7 @@ class StudentLMSView(StudentRequiredMixin, TemplateView):
     submission history, feedback."""
 
     template_name = "dashboard/student/lms.html"
+    active_nav = "lms"
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -461,6 +492,7 @@ class StudentFinanceView(StudentRequiredMixin, TemplateView):
     staff' is a different boundary from 'a student sees their own bill'."""
 
     template_name = "dashboard/student/finance.html"
+    active_nav = "finance"
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -489,6 +521,7 @@ class StudentCommunicationView(StudentRequiredMixin, TemplateView):
     model is a reasonable follow-up phase."""
 
     template_name = "dashboard/student/communication.html"
+    active_nav = "communication"
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -540,6 +573,12 @@ class StudentMarkNotificationReadView(StudentRequiredMixin, View):
 
 class ParentRequiredMixin(RoleRequiredMixin):
     allowed_roles = [User.Role.PARENT]
+    active_nav = None  # set per-view; drives sidebar active-link highlighting
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["active"] = self.active_nav
+        return context
 
     def get_children(self, request):
         return get_children_for_guardian(guardian_user=request.user)
@@ -557,6 +596,7 @@ class ParentDashboardView(ParentRequiredMixin, TemplateView):
     into that child's detail pages."""
 
     template_name = "dashboard/parent/overview.html"
+    active_nav = "overview"
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -686,6 +726,7 @@ class ParentCommunicationView(ParentRequiredMixin, TemplateView):
     children."""
 
     template_name = "dashboard/parent/communication.html"
+    active_nav = "communication"
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -722,3 +763,669 @@ class ParentMarkNotificationReadView(ParentRequiredMixin, View):
         )
         mark_notification_read(notification=notification)
         return redirect("dashboard:parent_communication")
+
+
+# =============================================================================
+# Phase 18 — Teacher Dashboard (spec §9)
+#
+# Ownership boundary: every class/subject/assessment-scoped action checks
+# TeachingAssignment.objects.filter(teacher=staff, class_subject=...,
+# is_active=True) before allowing access — a teacher must never be able to
+# manage a class or grade an assessment they aren't actually assigned to,
+# even by guessing a URL. Spec §9 "Teachers must not be able to approve
+# their own final results" is enforced by transition_assessment_workflow()
+# itself (Phase 8), reused here rather than re-implemented.
+# =============================================================================
+
+class TeacherRequiredMixin(RoleRequiredMixin):
+    allowed_roles = [User.Role.TEACHER, User.Role.CLASS_TEACHER]
+    active_nav = None  # set per-view; drives sidebar active-link highlighting
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["active"] = self.active_nav
+        return context
+
+    def get_staff(self, request) -> Staff:
+        return get_object_or_404(Staff, user=request.user)
+
+    def get_my_class_subjects(self, staff):
+        return ClassSubject.objects.filter(
+            teaching_assignments__teacher=staff, teaching_assignments__is_active=True,
+        ).distinct().select_related("subject", "class_group")
+
+    def get_owned_class_subject_or_404(self, staff, class_subject_id):
+        return get_object_or_404(self.get_my_class_subjects(staff), pk=class_subject_id)
+
+
+class TeacherDashboardView(TeacherRequiredMixin, TemplateView):
+    """Overview landing page — spec §9's category list condensed into
+    stat cards linking to the detail pages below."""
+
+    template_name = "dashboard/teacher/overview.html"
+    active_nav = "overview"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+        class_subjects = self.get_my_class_subjects(staff)
+
+        pending_grading = AssignmentSubmission.objects.filter(
+            assignment__class_subject__in=class_subjects,
+            status=AssignmentSubmission.Status.SUBMITTED,
+        ).count()
+
+        from django.utils import timezone
+
+        from .models import TimetableSlot as TimetableSlotModel
+
+        # Bug fix: this widget is meant to be "what am I teaching today"
+        # (the full week is already available via TeacherTimetableView),
+        # but was previously missing a day_of_week filter entirely and
+        # silently showed the teacher's whole week here instead.
+        weekday_map = {
+            0: TimetableSlotModel.DayOfWeek.MONDAY, 1: TimetableSlotModel.DayOfWeek.TUESDAY,
+            2: TimetableSlotModel.DayOfWeek.WEDNESDAY, 3: TimetableSlotModel.DayOfWeek.THURSDAY,
+            4: TimetableSlotModel.DayOfWeek.FRIDAY, 5: TimetableSlotModel.DayOfWeek.SATURDAY,
+        }
+        today_code = weekday_map.get(timezone.localtime(timezone.now()).weekday())
+        today_slots = TimetableSlot.objects.filter(
+            teacher=staff, day_of_week=today_code
+        ).select_related("period", "class_group", "room").order_by("period__order") if today_code else TimetableSlot.objects.none()
+
+        unread_notifications = Notification.objects.filter(
+            recipient=self.request.user, is_read=False
+        ).count()
+
+        context.update({
+            "staff": staff,
+            "class_subject_count": class_subjects.count(),
+            "pending_grading": pending_grading,
+            "today_slots": today_slots,
+            "unread_notifications": unread_notifications,
+        })
+        return context
+
+
+class TeacherClassesView(TeacherRequiredMixin, TemplateView):
+    """Spec §9 'My classes', 'My subjects', 'My students'."""
+
+    template_name = "dashboard/teacher/classes.html"
+    active_nav = "classes"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+        class_subjects = self.get_my_class_subjects(staff)
+
+        rows = []
+        for cs in class_subjects:
+            student_count = Enrollment.objects.filter(class_subject=cs).count()
+            rows.append({"class_subject": cs, "student_count": student_count})
+
+        context.update({"staff": staff, "rows": rows})
+        return context
+
+
+class TeacherClassRosterView(TeacherRequiredMixin, TemplateView):
+    """Spec §9 'My students' — the enrolled roster for one owned class+subject."""
+
+    template_name = "dashboard/teacher/roster.html"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+        class_subject = self.get_owned_class_subject_or_404(staff, kwargs["class_subject_id"])
+
+        students = Student.objects.filter(
+            enrollments__class_subject=class_subject
+        ).distinct().order_by("admission_number")
+
+        context.update({"class_subject": class_subject, "students": students})
+        return context
+
+
+class TeacherTimetableView(TeacherRequiredMixin, TemplateView):
+    """Spec §9 'My timetable'."""
+
+    template_name = "dashboard/teacher/timetable.html"
+    active_nav = "timetable"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+        slots = TimetableSlot.objects.filter(teacher=staff).select_related(
+            "period", "class_group", "room", "teaching_assignment__class_subject__subject"
+        ).order_by("day_of_week", "period__order")
+        context.update({"staff": staff, "slots": slots})
+        return context
+
+
+class TeacherAttendanceView(TeacherRequiredMixin, TemplateView):
+    """Spec §9/§11 'Record attendance' — the teacher's initial marking
+    view for one owned class+subject on a given date (defaults today)."""
+
+    template_name = "dashboard/teacher/attendance.html"
+
+    def get_context_data(self, **kwargs):
+        from django.utils import timezone
+
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+        class_subject = self.get_owned_class_subject_or_404(staff, kwargs["class_subject_id"])
+        date_str = self.request.GET.get("date")
+        target_date = (
+            datetime.date.fromisoformat(date_str) if date_str
+            else timezone.localtime(timezone.now()).date()
+        )
+
+        students = Student.objects.filter(
+            enrollments__class_subject=class_subject
+        ).distinct().order_by("admission_number")
+
+        existing = {}
+        session = AttendanceSession.objects.filter(
+            class_subject=class_subject, date=target_date
+        ).first()
+        if session:
+            existing = {r.student_id: r for r in session.records.all()}
+
+        student_rows = [
+            {"student": s, "record": existing.get(s.pk)} for s in students
+        ]
+
+        context.update({
+            "class_subject": class_subject, "students": students,
+            "target_date": target_date, "existing": existing,
+            "student_rows": student_rows,
+            "session_locked": session.is_locked if session else False,
+            "status_choices": AttendanceRecord.Status.choices,
+        })
+        return context
+
+    def post(self, request, class_subject_id):
+        staff = self.get_staff(request)
+        class_subject = self.get_owned_class_subject_or_404(staff, class_subject_id)
+        target_date = datetime.date.fromisoformat(request.POST.get("date"))
+
+        term = TeachingAssignment.objects.filter(
+            teacher=staff, class_subject=class_subject, is_active=True
+        ).select_related("term").first()
+        term = term.term if term else None
+
+        records = {}
+        for student in Student.objects.filter(enrollments__class_subject=class_subject).distinct():
+            status = request.POST.get(f"status_{student.pk}")
+            if status:
+                records[student.pk] = {
+                    "status": status, "notes": request.POST.get(f"notes_{student.pk}", ""),
+                }
+
+        try:
+            mark_attendance(
+                class_subject=class_subject, term=term, date=target_date,
+                taken_by=staff, records=records, request=request,
+            )
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+
+        return redirect(
+            f"{reverse('dashboard:teacher_attendance', args=[class_subject.pk])}?date={target_date}"
+        )
+
+
+class TeacherAssignmentsView(TeacherRequiredMixin, TemplateView):
+    """Spec §9 'Assignments' — list across all owned classes, plus the
+    create form ('Create assignment', 'Set instructions', 'Set deadline',
+    'Define marks', 'Define submission format')."""
+
+    template_name = "dashboard/teacher/assignments.html"
+    active_nav = "assignments"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+        class_subjects = self.get_my_class_subjects(staff)
+        assignments = Assignment.objects.filter(
+            class_subject__in=class_subjects
+        ).select_related("class_subject__subject").order_by("-deadline")
+
+        context.update({
+            "class_subjects": class_subjects, "assignments": assignments,
+            "submission_formats": Assignment.SubmissionFormat.choices,
+        })
+        return context
+
+    def post(self, request):
+        staff = self.get_staff(request)
+        class_subject = self.get_owned_class_subject_or_404(
+            staff, request.POST.get("class_subject_id")
+        )
+        term_id = TeachingAssignment.objects.filter(
+            teacher=staff, class_subject=class_subject, is_active=True
+        ).values_list("term_id", flat=True).first()
+
+        Assignment.objects.create(
+            class_subject=class_subject, term_id=term_id,
+            title=request.POST.get("title", ""),
+            instructions=request.POST.get("instructions", ""),
+            deadline=request.POST.get("deadline"),
+            max_marks=request.POST.get("max_marks") or Decimal("100"),
+            submission_format=request.POST.get("submission_format", Assignment.SubmissionFormat.FILE_UPLOAD),
+            allow_resubmission=bool(request.POST.get("allow_resubmission")),
+            created_by=staff,
+        )
+        return redirect("dashboard:teacher_assignments")
+
+
+class TeacherAssignmentSubmissionsView(TeacherRequiredMixin, View):
+    """Spec §9 'Mark assignments', 'Provide feedback' — reuses
+    services.grade_assignment_submission() (Phase 11), already tested."""
+
+    template_name = "dashboard/teacher/submissions.html"
+
+    def _get_owned_assignment(self, request, assignment_id):
+        staff = self.get_staff(request)
+        return get_object_or_404(
+            Assignment, pk=assignment_id, class_subject__in=self.get_my_class_subjects(staff)
+        )
+
+    def get(self, request, assignment_id):
+        assignment = self._get_owned_assignment(request, assignment_id)
+        submissions = assignment.submissions.select_related("student").order_by("-submitted_at")
+        return render(request, self.template_name, {
+            "assignment": assignment, "submissions": submissions,
+        })
+
+    def post(self, request, assignment_id):
+        from .services import grade_assignment_submission
+
+        assignment = self._get_owned_assignment(request, assignment_id)
+        staff = self.get_staff(request)
+        submission = get_object_or_404(
+            assignment.submissions, pk=request.POST.get("submission_id")
+        )
+        try:
+            grade_assignment_submission(
+                submission=submission,
+                marks_obtained=Decimal(request.POST.get("marks_obtained")),
+                feedback=request.POST.get("feedback", ""),
+                graded_by=staff, request=request,
+            )
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:teacher_assignment_submissions", assignment_id=assignment.pk)
+
+
+class TeacherMaterialsView(TeacherRequiredMixin, TemplateView):
+    """Spec §9/§10 'Upload learning materials', 'Upload PDFs', 'Upload videos'."""
+
+    template_name = "dashboard/teacher/materials.html"
+    active_nav = "materials"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+        class_subjects = self.get_my_class_subjects(staff)
+        materials = CourseMaterial.objects.filter(
+            class_subject__in=class_subjects
+        ).select_related("class_subject__subject").order_by("-created_at")
+
+        context.update({
+            "class_subjects": class_subjects, "materials": materials,
+            "material_types": CourseMaterial.MaterialType.choices,
+        })
+        return context
+
+    def post(self, request):
+        staff = self.get_staff(request)
+        class_subject = self.get_owned_class_subject_or_404(
+            staff, request.POST.get("class_subject_id")
+        )
+        term_id = TeachingAssignment.objects.filter(
+            teacher=staff, class_subject=class_subject, is_active=True
+        ).values_list("term_id", flat=True).first()
+
+        CourseMaterial.objects.create(
+            class_subject=class_subject, term_id=term_id,
+            material_type=request.POST.get("material_type"),
+            title=request.POST.get("title", ""),
+            description=request.POST.get("description", ""),
+            file=request.FILES.get("file"),
+            external_url=request.POST.get("external_url", ""),
+            text_content=request.POST.get("text_content", ""),
+            uploaded_by=staff,
+        )
+        return redirect("dashboard:teacher_materials")
+
+
+class TeacherAnnouncementsView(TeacherRequiredMixin, TemplateView):
+    """Spec §9 'Publish course announcements' — this is Discussion
+    (course-scoped, Phase 11), distinct from the school-wide Announcement
+    model (Phase 15). See Phase 11's design note on that split."""
+
+    template_name = "dashboard/teacher/announcements.html"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+        class_subject = self.get_owned_class_subject_or_404(staff, kwargs["class_subject_id"])
+        discussions = Discussion.objects.filter(
+            class_subject=class_subject
+        ).order_by("-is_pinned", "-created_at")
+
+        context.update({"class_subject": class_subject, "discussions": discussions})
+        return context
+
+    def post(self, request, class_subject_id):
+        staff = self.get_staff(request)
+        class_subject = self.get_owned_class_subject_or_404(staff, class_subject_id)
+        term_id = TeachingAssignment.objects.filter(
+            teacher=staff, class_subject=class_subject, is_active=True
+        ).values_list("term_id", flat=True).first()
+
+        Discussion.objects.create(
+            class_subject=class_subject, term_id=term_id,
+            thread_type=Discussion.ThreadType.ANNOUNCEMENT,
+            title=request.POST.get("title", ""), body=request.POST.get("body", ""),
+            created_by=request.user,
+        )
+        return redirect("dashboard:teacher_announcements", class_subject_id=class_subject.pk)
+
+
+class TeacherAssessmentsView(TeacherRequiredMixin, TemplateView):
+    """Spec §9/§12 'Create assessments', 'Create exams'. Creates an
+    Assessment against an AssessmentComponent that Academic Admin has
+    already configured (Phase 7) — teachers don't define weighting
+    schemes, only schedule instances of them."""
+
+    template_name = "dashboard/teacher/assessments.html"
+    active_nav = "assessments"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+        class_subjects = self.get_my_class_subjects(staff)
+        assessments = Assessment.objects.filter(
+            class_subject__in=class_subjects
+        ).select_related("class_subject__subject", "component").order_by("-created_at")
+
+        context.update({"class_subjects": class_subjects, "assessments": assessments})
+        return context
+
+
+class TeacherMarksEntryView(TeacherRequiredMixin, TemplateView):
+    """Spec §9 'Enter marks'. Reuses services.record_assessment_marks()
+    (this phase) for the write, and services.transition_assessment_workflow()
+    (Phase 8) for the 'submit for review' action — which itself enforces
+    'teachers cannot approve their own results' if this same teacher later
+    tries to also approve it."""
+
+    template_name = "dashboard/teacher/marks_entry.html"
+
+    def _get_owned_assessment(self, request, assessment_id):
+        staff = self.get_staff(request)
+        return get_object_or_404(
+            Assessment, pk=assessment_id, class_subject__in=self.get_my_class_subjects(staff)
+        )
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        assessment = self._get_owned_assessment(self.request, kwargs["assessment_id"])
+        students = Student.objects.filter(
+            enrollments__class_subject=assessment.class_subject
+        ).distinct().order_by("admission_number")
+        existing_marks = {
+            m.student_id: m for m in AssessmentMark.objects.filter(assessment=assessment)
+        }
+        student_rows = [
+            {"student": s, "mark": existing_marks.get(s.pk)} for s in students
+        ]
+        context.update({
+            "assessment": assessment, "students": students, "existing_marks": existing_marks,
+            "student_rows": student_rows,
+        })
+        return context
+
+    def post(self, request, assessment_id):
+        assessment = self._get_owned_assessment(request, assessment_id)
+        staff = self.get_staff(request)
+
+        if request.POST.get("action") == "submit_for_review":
+            try:
+                transition_assessment_workflow(
+                    assessment=assessment, to_status=Assessment.WorkflowStatus.SUBMITTED,
+                    actor=request.user, request=request,
+                )
+            except ValueError as exc:
+                return HttpResponseForbidden(str(exc))
+            return redirect("dashboard:teacher_assessments")
+
+        marks = {}
+        for student in Student.objects.filter(enrollments__class_subject=assessment.class_subject).distinct():
+            raw = request.POST.get(f"mark_{student.pk}")
+            if raw not in (None, ""):
+                marks[student.pk] = Decimal(raw)
+
+        try:
+            record_assessment_marks(
+                assessment=assessment, teacher=staff, marks=marks, request=request,
+            )
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+
+        return redirect("dashboard:teacher_marks_entry", assessment_id=assessment.pk)
+
+
+class TeacherCommunicationView(TeacherRequiredMixin, TemplateView):
+    """Spec §9 'Announcements', 'Notifications' — the teacher's own inbox
+    (school-wide/staff-audience Announcements + personal Notifications),
+    distinct from course-level announcements they publish themselves
+    (TeacherAnnouncementsView, above)."""
+
+    template_name = "dashboard/teacher/communication.html"
+    active_nav = "communication"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff(self.request)
+
+        announcements = Announcement.objects.filter(
+            school=staff.school, is_published=True,
+        ).filter(_teacher_audience_q()).order_by("-created_at")[:20]
+
+        notifications = Notification.objects.filter(
+            recipient=self.request.user
+        ).order_by("-created_at")[:50]
+
+        context.update({"announcements": announcements, "notifications": notifications})
+        return context
+
+
+def _teacher_audience_q():
+    from django.db.models import Q
+    return (
+        Q(audience=Announcement.Audience.ALL)
+        | Q(audience=Announcement.Audience.TEACHERS)
+        | Q(audience=Announcement.Audience.STAFF)
+    )
+
+
+class TeacherMarkNotificationReadView(TeacherRequiredMixin, View):
+    def post(self, request, notification_id):
+        notification = get_object_or_404(
+            Notification, pk=notification_id, recipient=request.user
+        )
+        mark_notification_read(notification=notification)
+        return redirect("dashboard:teacher_communication")
+
+
+# =============================================================================
+# Phase 19 — Finance Admin Dashboard (spec §19, §23)
+#
+# Spec §23 'Financial and Academic Separation': Finance Admin gets fees,
+# payments, invoices, financial reporting — never grades, assessments, or
+# attendance. Every queryset here is scoped to Invoice/Payment/Refund and
+# minimal student identity (name, admission number); nothing joins into
+# AssessmentMark, SubjectResult, or AttendanceRecord.
+# =============================================================================
+
+class FinanceRequiredMixin(RoleRequiredMixin):
+    allowed_roles = [User.Role.FINANCE_ADMIN, User.Role.ACCOUNTANT]
+    active_nav = None
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["active"] = self.active_nav
+        return context
+
+    def get_school(self, request):
+        # Finance Admin/Accountant accounts aren't tied to a Student/Staff/
+        # Guardian profile the way other roles are (Phase 1's User model
+        # has no direct `school` FK) — for a single-school deployment this
+        # resolves to the one School row; multi-school support would add
+        # a FinanceAdmin-school assignment model as a follow-up.
+        from .models import School
+        return School.objects.first()
+
+
+class FinanceAdminDashboardView(FinanceRequiredMixin, TemplateView):
+    """Overview — spec §19 stat cards: total billed/collected/outstanding,
+    arrears, overdue invoices, recent payments. No academic data anywhere
+    on this page."""
+
+    template_name = "dashboard/finance/overview.html"
+    active_nav = "overview"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        summary = compute_school_financial_summary(school=school) if school else {}
+
+        recent_payments = Payment.objects.filter(
+            invoice__school=school
+        ).select_related("invoice__student").order_by("-payment_date")[:10] if school else []
+
+        pending_refunds = Refund.objects.filter(
+            payment__invoice__school=school, status=Refund.Status.REQUESTED
+        ).count() if school else 0
+
+        context.update({
+            "school": school, "summary": summary,
+            "recent_payments": recent_payments, "pending_refunds": pending_refunds,
+        })
+        return context
+
+
+class FinanceAdminInvoicesView(FinanceRequiredMixin, TemplateView):
+    """Spec §19 'Invoices'. List + generate-invoice action, reusing
+    services.generate_invoice_for_student() (Phase 12, already tested)."""
+
+    template_name = "dashboard/finance/invoices.html"
+    active_nav = "invoices"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        status_filter = self.request.GET.get("status", "")
+
+        invoices = Invoice.objects.filter(school=school).select_related(
+            "student__user", "academic_year", "term"
+        ).order_by("-issue_date") if school else Invoice.objects.none()
+        if status_filter:
+            invoices = invoices.filter(status=status_filter)
+
+        context.update({
+            "school": school, "invoices": invoices,
+            "status_choices": Invoice.Status.choices, "status_filter": status_filter,
+            "fee_structures": FeeStructure.objects.filter(school=school, is_active=True) if school else [],
+            "students": Student.objects.filter(school=school, is_active=True).select_related("user") if school else [],
+        })
+        return context
+
+    def post(self, request):
+        school = self.get_school(request)
+        student = get_object_or_404(Student, pk=request.POST.get("student_id"), school=school)
+        fee_structure = get_object_or_404(
+            FeeStructure, pk=request.POST.get("fee_structure_id"), school=school
+        )
+        try:
+            generate_invoice_for_student(
+                student=student, fee_structure=fee_structure,
+                academic_year=fee_structure.academic_year, term=fee_structure.term,
+                issued_by=request.user, due_date=request.POST.get("due_date"),
+                request=request,
+            )
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:finance_invoices")
+
+
+class FinanceAdminInvoiceDetailView(FinanceRequiredMixin, View):
+    """Spec §19 'Payments', 'Partial payments', 'Balances'. View one
+    invoice + record a payment against it, reusing
+    services.record_payment() (Phase 12, already tested)."""
+
+    template_name = "dashboard/finance/invoice_detail.html"
+    active_nav = "invoices"
+
+    def get(self, request, invoice_id):
+        school = self.get_school(request)
+        invoice = get_object_or_404(
+            Invoice.objects.select_related("student__user"), pk=invoice_id, school=school
+        )
+        return render(request, self.template_name, {
+            "invoice": invoice, "active": self.active_nav,
+            "payment_methods": Payment.Method.choices,
+        })
+
+    def post(self, request, invoice_id):
+        school = self.get_school(request)
+        invoice = get_object_or_404(Invoice, pk=invoice_id, school=school)
+        try:
+            record_payment(
+                invoice=invoice, amount=Decimal(request.POST.get("amount")),
+                payment_method=request.POST.get("payment_method"),
+                payment_date=request.POST.get("payment_date"),
+                received_by=request.user, payer_name=request.POST.get("payer_name", ""),
+                gateway_reference=request.POST.get("gateway_reference", ""),
+                request=request,
+            )
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:finance_invoice_detail", invoice_id=invoice.pk)
+
+
+class FinanceAdminRefundsView(FinanceRequiredMixin, TemplateView):
+    """Spec §19 'Refunds'. Approval queue, reusing
+    services.decide_refund() (Phase 12, already tested — including the
+    'cannot decide the same refund twice' guard)."""
+
+    template_name = "dashboard/finance/refunds.html"
+    active_nav = "refunds"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        refunds = Refund.objects.filter(
+            payment__invoice__school=school
+        ).select_related("payment__invoice__student__user").order_by("-requested_at") if school else []
+        context.update({"school": school, "refunds": refunds})
+        return context
+
+    def post(self, request):
+        school = self.get_school(request)
+        refund = get_object_or_404(
+            Refund, pk=request.POST.get("refund_id"), payment__invoice__school=school
+        )
+        approve = request.POST.get("action") == "approve"
+        try:
+            decide_refund(
+                refund=refund, approve=approve, decided_by=request.user,
+                refund_method=request.POST.get("refund_method", ""),
+                reference_number=request.POST.get("reference_number", ""),
+                request=request,
+            )
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:finance_refunds")
