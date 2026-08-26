@@ -63,4 +63,45 @@ urlpatterns = [
         "parent/notifications/<int:notification_id>/read/",
         views.ParentMarkNotificationReadView.as_view(), name="parent_mark_notification_read",
     ),
+    path("teacher/", views.TeacherDashboardView.as_view(), name="teacher_dashboard"),
+    path("teacher/classes/", views.TeacherClassesView.as_view(), name="teacher_classes"),
+    path(
+        "teacher/classes/<int:class_subject_id>/roster/",
+        views.TeacherClassRosterView.as_view(), name="teacher_class_roster",
+    ),
+    path("teacher/timetable/", views.TeacherTimetableView.as_view(), name="teacher_timetable"),
+    path(
+        "teacher/classes/<int:class_subject_id>/attendance/",
+        views.TeacherAttendanceView.as_view(), name="teacher_attendance",
+    ),
+    path("teacher/assignments/", views.TeacherAssignmentsView.as_view(), name="teacher_assignments"),
+    path(
+        "teacher/assignments/<int:assignment_id>/submissions/",
+        views.TeacherAssignmentSubmissionsView.as_view(), name="teacher_assignment_submissions",
+    ),
+    path("teacher/materials/", views.TeacherMaterialsView.as_view(), name="teacher_materials"),
+    path(
+        "teacher/classes/<int:class_subject_id>/announcements/",
+        views.TeacherAnnouncementsView.as_view(), name="teacher_announcements",
+    ),
+    path("teacher/assessments/", views.TeacherAssessmentsView.as_view(), name="teacher_assessments"),
+    path(
+        "teacher/assessments/<int:assessment_id>/marks/",
+        views.TeacherMarksEntryView.as_view(), name="teacher_marks_entry",
+    ),
+    path(
+        "teacher/communication/", views.TeacherCommunicationView.as_view(),
+        name="teacher_communication",
+    ),
+    path(
+        "teacher/notifications/<int:notification_id>/read/",
+        views.TeacherMarkNotificationReadView.as_view(), name="teacher_mark_notification_read",
+    ),
+    path("finance/", views.FinanceAdminDashboardView.as_view(), name="finance_dashboard"),
+    path("finance/invoices/", views.FinanceAdminInvoicesView.as_view(), name="finance_invoices"),
+    path(
+        "finance/invoices/<int:invoice_id>/",
+        views.FinanceAdminInvoiceDetailView.as_view(), name="finance_invoice_detail",
+    ),
+    path("finance/refunds/", views.FinanceAdminRefundsView.as_view(), name="finance_refunds"),
 ]
