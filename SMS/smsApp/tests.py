@@ -26,6 +26,7 @@ from .models import (
     Borrowing,
     Class,
     ClassSubject,
+    CourseMaterial,
     Discussion,
     DiscussionReply,
     Enrollment,
@@ -310,7 +311,14 @@ class AuthAndDashboardTests(TestCase):
         self.assertRedirects(response, reverse("dashboard:super_admin"))
 
     def test_non_super_admin_router_redirects_to_coming_soon(self):
-        self.client.login(username="teach1", password="pass12345")
+        # Teacher (Phase 18) and Finance Admin/Accountant (Phase 19) now
+        # have real dashboards — use a role that genuinely has no
+        # dashboard built yet (Staff Admin, deferred) to test the
+        # fallback path.
+        staff_admin = User.objects.create_user(
+            username="staffadmin1", password="pass12345", role=User.Role.STAFF_ADMIN
+        )
+        self.client.login(username="staffadmin1", password="pass12345")
         response = self.client.get(reverse("dashboard:home"))
         self.assertRedirects(response, reverse("dashboard:coming_soon"))
 
@@ -2511,3 +2519,472 @@ class ParentDashboardTests(TestCase):
         response = self.client.get(reverse("dashboard:parent_dashboard"))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.context["child_rows"]), 0)
+
+
+class TeacherDashboardTests(TestCase):
+    """Phase 18: ownership enforcement per class/subject (a teacher must
+    never manage a class they aren't assigned to), the write actions
+    (attendance, marks, grading, materials, announcements), and that
+    'teachers cannot approve their own results' still holds when reached
+    through the dashboard."""
+
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(school=self.school, code="MATH", name="Mathematics")
+        self.class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+            is_current=True,
+        )
+
+        self.teacher_user = User.objects.create_user(
+            username="dashteacher1", password="pass12345", role=User.Role.TEACHER
+        )
+        self.teacher = Staff.objects.create(
+            user=self.teacher_user, school=self.school, staff_id="STF980",
+            job_title="Maths Teacher", date_hired=datetime.date(2024, 1, 1),
+        )
+        self.teaching_assignment = TeachingAssignment.objects.create(
+            class_subject=self.class_subject, teacher=self.teacher, term=self.term
+        )
+
+        # A second class/subject this teacher is NOT assigned to.
+        subject2 = Subject.objects.create(school=self.school, code="ENG", name="English")
+        self.other_class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=subject2
+        )
+
+        student_user = User.objects.create_user(
+            username="dashteachstudent", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM910",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        Enrollment.objects.create(
+            student=self.student, class_subject=self.class_subject,
+            academic_year=self.academic_year,
+        )
+
+        self.client.login(username="dashteacher1", password="pass12345")
+
+    def test_overview_page_loads(self):
+        response = self.client.get(reverse("dashboard:teacher_dashboard"))
+        self.assertEqual(response.status_code, 200)
+
+    def test_overview_today_slots_only_shows_todays_day(self):
+        """Regression test: today_slots previously had no day_of_week
+        filter at all and silently showed the teacher's entire week."""
+        from django.utils import timezone
+
+        room = Room.objects.create(school=self.school, name="Room 1")
+        period = Period.objects.create(
+            school=self.school, name="Period 1",
+            start_time=datetime.time(8, 0), end_time=datetime.time(8, 40), order=1,
+        )
+        today_code = {
+            0: "MON", 1: "TUE", 2: "WED", 3: "THU", 4: "FRI", 5: "SAT",
+        }.get(timezone.localtime(timezone.now()).weekday())
+        if today_code is None:
+            self.skipTest("Test only meaningful Mon-Sat")
+
+        today_slot = TimetableSlot.objects.create(
+            teaching_assignment=self.teaching_assignment, day_of_week=today_code,
+            period=period, room=room,
+        )
+        other_days = [d for d in ["MON", "TUE", "WED", "THU", "FRI", "SAT"] if d != today_code]
+        period2 = Period.objects.create(
+            school=self.school, name="Period 2",
+            start_time=datetime.time(8, 40), end_time=datetime.time(9, 20), order=2,
+        )
+        # Need a second teaching assignment/class_subject pairing to avoid
+        # the class-double-booking constraint on the same class_group.
+        other_ta = TeachingAssignment.objects.create(
+            class_subject=self.other_class_subject, teacher=self.teacher, term=self.term
+        )
+        not_today_slot = TimetableSlot.objects.create(
+            teaching_assignment=other_ta, day_of_week=other_days[0], period=period2,
+        )
+        response = self.client.get(reverse("dashboard:teacher_dashboard"))
+        today_slots = list(response.context["today_slots"])
+        self.assertIn(today_slot, today_slots)
+        self.assertNotIn(not_today_slot, today_slots)
+
+    def test_classes_page_shows_owned_class_subject(self):
+        response = self.client.get(reverse("dashboard:teacher_classes"))
+        self.assertContains(response, "Mathematics")
+
+    def test_roster_shows_enrolled_student(self):
+        response = self.client.get(
+            reverse("dashboard:teacher_class_roster", args=[self.class_subject.pk])
+        )
+        self.assertContains(response, self.student.admission_number)
+
+    def test_cannot_access_roster_for_unassigned_class_subject(self):
+        response = self.client.get(
+            reverse("dashboard:teacher_class_roster", args=[self.other_class_subject.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_mark_attendance_via_dashboard(self):
+        target_date = datetime.date(2026, 2, 2)
+        response = self.client.post(
+            reverse("dashboard:teacher_attendance", args=[self.class_subject.pk]),
+            {
+                "date": target_date.isoformat(),
+                f"status_{self.student.pk}": "PRESENT",
+                f"notes_{self.student.pk}": "",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(
+            AttendanceRecord.objects.filter(
+                student=self.student, status="PRESENT", session__date=target_date,
+            ).exists()
+        )
+
+    def test_attendance_form_prefills_existing_status(self):
+        """Regression test: the attendance template previously had a
+        broken dict-lookup ({% if existing|dictsort:"" %}) that never
+        pre-selected a student's previously recorded status, risking a
+        teacher accidentally overwriting correct records with blanks on
+        resubmission."""
+        session = AttendanceSession.objects.create(
+            class_subject=self.class_subject, term=self.term, date=datetime.date(2026, 2, 3),
+        )
+        AttendanceRecord.objects.create(
+            session=session, student=self.student, status="ABSENT", notes="Sick",
+        )
+        response = self.client.get(
+            f"{reverse('dashboard:teacher_attendance', args=[self.class_subject.pk])}"
+            f"?date=2026-02-03"
+        )
+        row = next(
+            r for r in response.context["student_rows"] if r["student"].pk == self.student.pk
+        )
+        self.assertEqual(row["record"].status, "ABSENT")
+        self.assertContains(response, 'value="ABSENT" selected')
+
+    def test_cannot_mark_attendance_for_unassigned_class(self):
+        response = self.client.post(
+            reverse("dashboard:teacher_attendance", args=[self.other_class_subject.pk]),
+            {"date": "2026-02-02"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_create_assignment_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:teacher_assignments"),
+            {
+                "class_subject_id": self.class_subject.pk, "title": "Essay 1",
+                "deadline": "2026-03-01T23:59", "max_marks": "100",
+                "submission_format": Assignment.SubmissionFormat.TEXT_ENTRY,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Assignment.objects.filter(title="Essay 1").exists())
+
+    def test_cannot_create_assignment_for_unassigned_class(self):
+        response = self.client.post(
+            reverse("dashboard:teacher_assignments"),
+            {
+                "class_subject_id": self.other_class_subject.pk, "title": "Essay 2",
+                "deadline": "2026-03-01T23:59",
+            },
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_grade_submission_via_dashboard(self):
+        assignment = Assignment.objects.create(
+            class_subject=self.class_subject, term=self.term, title="Essay",
+            deadline=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+        )
+        submission = submit_assignment(
+            assignment=assignment, student=self.student, submitted_text="My essay",
+        )
+        response = self.client.post(
+            reverse("dashboard:teacher_assignment_submissions", args=[assignment.pk]),
+            {"submission_id": submission.pk, "marks_obtained": "85", "feedback": "Great work"},
+        )
+        self.assertEqual(response.status_code, 302)
+        submission.refresh_from_db()
+        self.assertEqual(submission.marks_obtained, Decimal("85"))
+
+    def test_cannot_grade_submission_for_unassigned_class_assignment(self):
+        other_assignment = Assignment.objects.create(
+            class_subject=self.other_class_subject, term=self.term, title="Other Essay",
+            deadline=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+        )
+        response = self.client.get(
+            reverse("dashboard:teacher_assignment_submissions", args=[other_assignment.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_upload_material_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:teacher_materials"),
+            {
+                "class_subject_id": self.class_subject.pk,
+                "material_type": CourseMaterial.MaterialType.TEXT_LESSON,
+                "title": "Intro to Algebra", "text_content": "x + 1 = 2",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(CourseMaterial.objects.filter(title="Intro to Algebra").exists())
+
+    def test_post_course_announcement_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:teacher_announcements", args=[self.class_subject.pk]),
+            {"title": "Test postponed", "body": "Moved to next week."},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(
+            Discussion.objects.filter(
+                class_subject=self.class_subject, thread_type=Discussion.ThreadType.ANNOUNCEMENT,
+                title="Test postponed",
+            ).exists()
+        )
+
+    def test_enter_marks_via_dashboard(self):
+        structure = AssessmentStructure.objects.create(
+            school=self.school, term=self.term, name="Standard"
+        )
+        atype = AssessmentType.objects.create(school=self.school, name="CAT", code="CAT1")
+        component = AssessmentComponent.objects.create(
+            structure=structure, assessment_type=atype,
+            weight_percentage=Decimal("100"), max_marks=Decimal("100"),
+        )
+        assessment = Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=component,
+            title="CAT 1",
+        )
+        response = self.client.post(
+            reverse("dashboard:teacher_marks_entry", args=[assessment.pk]),
+            {f"mark_{self.student.pk}": "78"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(
+            AssessmentMark.objects.filter(
+                assessment=assessment, student=self.student, marks_obtained=Decimal("78"),
+            ).exists()
+        )
+
+    def test_teacher_cannot_approve_own_submitted_assessment_via_dashboard(self):
+        """Spec §9: 'Teachers must not be able to approve their own final
+        results.' Enforced by transition_assessment_workflow() (Phase 8);
+        this confirms it still holds when reached through the dashboard
+        submit-for-review action followed by an approval attempt by the
+        same user."""
+        structure = AssessmentStructure.objects.create(
+            school=self.school, term=self.term, name="Standard"
+        )
+        atype = AssessmentType.objects.create(school=self.school, name="Final", code="FINAL")
+        component = AssessmentComponent.objects.create(
+            structure=structure, assessment_type=atype,
+            weight_percentage=Decimal("100"), max_marks=Decimal("100"),
+        )
+        assessment = Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=component,
+            title="Final Exam",
+        )
+        self.client.post(
+            reverse("dashboard:teacher_marks_entry", args=[assessment.pk]),
+            {"action": "submit_for_review"},
+        )
+        assessment.refresh_from_db()
+        self.assertEqual(assessment.workflow_status, Assessment.WorkflowStatus.SUBMITTED)
+
+        reviewer = User.objects.create_user(
+            username="reviewer1", password="pass12345", role=User.Role.CLASS_TEACHER
+        )
+        transition_assessment_workflow(
+            assessment=assessment, to_status=Assessment.WorkflowStatus.REVIEWED,
+            actor=reviewer,
+        )
+        verifier = User.objects.create_user(
+            username="verifier1", password="pass12345", role=User.Role.ACADEMIC_ADMIN
+        )
+        transition_assessment_workflow(
+            assessment=assessment, to_status=Assessment.WorkflowStatus.VERIFIED,
+            actor=verifier,
+        )
+
+        with self.assertRaises(PermissionError):
+            transition_assessment_workflow(
+                assessment=assessment, to_status=Assessment.WorkflowStatus.APPROVED,
+                actor=self.teacher_user,
+            )
+
+    def test_non_teacher_role_cannot_access_teacher_dashboard(self):
+        self.client.logout()
+        parent_user = User.objects.create_user(
+            username="notateacher", password="pass12345", role=User.Role.PARENT
+        )
+        self.client.login(username="notateacher", password="pass12345")
+        response = self.client.get(reverse("dashboard:teacher_dashboard"))
+        self.assertEqual(response.status_code, 403)
+
+
+class FinanceAdminDashboardTests(TestCase):
+    """Phase 19: Finance Admin dashboard reuses Phase 12's already-tested
+    generate_invoice_for_student()/record_payment()/decide_refund() —
+    these tests focus on the dashboard wiring (routes, ownership scoping,
+    role gating) and spec §23's academic/financial separation (no page
+    here should reference AssessmentMark/grades)."""
+
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+        )
+        self.tuition = FeeCategory.objects.create(
+            school=self.school, name="Tuition", code="TUITION"
+        )
+        self.structure = FeeStructure.objects.create(
+            school=self.school, academic_year=self.academic_year, term=self.term,
+            name="Term 1 Fees",
+        )
+        FeeStructureItem.objects.create(
+            structure=self.structure, category=self.tuition, amount=Decimal("50000")
+        )
+        student_user = User.objects.create_user(
+            username="financedashstudent", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM990",
+            admission_date=datetime.date(2026, 1, 10),
+        )
+        self.finance_user = User.objects.create_user(
+            username="financedashadmin", password="pass12345", role=User.Role.FINANCE_ADMIN
+        )
+        self.client.login(username="financedashadmin", password="pass12345")
+
+    def test_overview_page_loads_with_zero_state(self):
+        response = self.client.get(reverse("dashboard:finance_dashboard"))
+        self.assertEqual(response.status_code, 200)
+
+    def test_dashboard_router_sends_finance_admin_to_finance_dashboard(self):
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertRedirects(response, reverse("dashboard:finance_dashboard"))
+
+    def test_accountant_role_also_routes_to_finance_dashboard(self):
+        self.client.logout()
+        accountant = User.objects.create_user(
+            username="dashaccountant", password="pass12345", role=User.Role.ACCOUNTANT
+        )
+        self.client.login(username="dashaccountant", password="pass12345")
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertRedirects(response, reverse("dashboard:finance_dashboard"))
+
+    def test_non_finance_role_cannot_access_finance_dashboard(self):
+        self.client.logout()
+        teacher = User.objects.create_user(
+            username="notafinanceperson", password="pass12345", role=User.Role.TEACHER
+        )
+        self.client.login(username="notafinanceperson", password="pass12345")
+        response = self.client.get(reverse("dashboard:finance_dashboard"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_generate_invoice_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:finance_invoices"),
+            {
+                "student_id": self.student.pk, "fee_structure_id": self.structure.pk,
+                "due_date": "2026-02-01",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Invoice.objects.filter(student=self.student).exists())
+        invoice = Invoice.objects.get(student=self.student)
+        self.assertEqual(invoice.total_amount, Decimal("50000"))
+
+    def test_invoices_list_page_never_renders_grade_data(self):
+        """Spec §23: Finance Admin gets fees/payments/invoices only —
+        confirms the invoices page response contains no reference to
+        grades/marks/assessments in its rendered output."""
+        response = self.client.get(reverse("dashboard:finance_invoices"))
+        content = response.content.decode()
+        for forbidden_term in ["AssessmentMark", "grade_point", "weighted_total"]:
+            self.assertNotIn(forbidden_term, content)
+
+    def test_record_payment_via_dashboard(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_user, due_date=datetime.date(2026, 2, 1),
+        )
+        response = self.client.post(
+            reverse("dashboard:finance_invoice_detail", args=[invoice.pk]),
+            {
+                "amount": "20000", "payment_method": Payment.Method.CASH,
+                "payment_date": "2026-01-15T10:00",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, Invoice.Status.PARTIALLY_PAID)
+
+    def test_overpayment_via_dashboard_is_rejected_not_500(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_user, due_date=datetime.date(2026, 2, 1),
+        )
+        response = self.client.post(
+            reverse("dashboard:finance_invoice_detail", args=[invoice.pk]),
+            {
+                "amount": "999999", "payment_method": Payment.Method.CASH,
+                "payment_date": "2026-01-15T10:00",
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_approve_refund_via_dashboard(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_user, due_date=datetime.date(2026, 2, 1),
+        )
+        payment = record_payment(
+            invoice=invoice, amount=Decimal("50000"), payment_method=Payment.Method.CASH,
+            payment_date=datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc),
+            received_by=self.finance_user,
+        )
+        refund = Refund.objects.create(
+            payment=payment, amount=Decimal("5000"), reason="Overcharge",
+            requested_by=self.finance_user,
+        )
+        response = self.client.post(
+            reverse("dashboard:finance_refunds"),
+            {"refund_id": refund.pk, "action": "approve"},
+        )
+        self.assertEqual(response.status_code, 302)
+        refund.refresh_from_db()
+        self.assertEqual(refund.status, Refund.Status.COMPLETED)
+
+    def test_invoice_detail_shows_correct_student_only(self):
+        invoice = generate_invoice_for_student(
+            student=self.student, fee_structure=self.structure,
+            academic_year=self.academic_year, term=self.term,
+            issued_by=self.finance_user, due_date=datetime.date(2026, 2, 1),
+        )
+        response = self.client.get(
+            reverse("dashboard:finance_invoice_detail", args=[invoice.pk])
+        )
+        self.assertContains(response, self.student.admission_number)
