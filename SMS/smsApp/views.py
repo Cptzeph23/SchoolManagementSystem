@@ -22,12 +22,14 @@ from .models import (
     Class,
     ClassSubject,
     CourseMaterial,
+    Department,
     Discussion,
     Enrollment,
     FeeConcession,
     FeeStructure,
     Guardian,
     Invoice,
+    LeaveRequest,
     Notification,
     Payment,
     Quiz,
@@ -36,6 +38,8 @@ from .models import (
     ReportCard,
     ReportTemplate,
     Staff,
+    StaffAttendanceRecord,
+    StaffQualification,
     Student,
     Subject,
     TeachingAssignment,
@@ -48,8 +52,11 @@ from .permissions import RoleRequiredMixin
 from .services import (
     apply_financial_adjustment,
     compute_school_financial_summary,
+    compute_staff_workload,
     compute_student_account_summary,
     compute_weighted_average,
+    deactivate_staff,
+    decide_leave_request,
     decide_refund,
     generate_batch_reports,
     generate_invoice_for_student,
@@ -60,11 +67,14 @@ from .services import (
     get_grade_for_mark,
     mark_attendance,
     mark_notification_read,
+    reactivate_staff,
     record_assessment_marks,
     record_login,
     record_payment,
+    record_staff_attendance,
     render_report_html,
     submit_assignment,
+    submit_leave_request,
     transition_assessment_workflow,
     verify_transcript,
 )
@@ -1429,3 +1439,289 @@ class FinanceAdminRefundsView(FinanceRequiredMixin, TemplateView):
         except ValueError as exc:
             return HttpResponseForbidden(str(exc))
         return redirect("dashboard:finance_refunds")
+
+
+# =============================================================================
+# Phase 20 — Staff Admin Dashboard (spec §6)
+#
+# 'Restrict sensitive HR information to authorized users' — this entire
+# section is gated to STAFF_ADMIN (and Super Admin via RoleRequiredMixin's
+# is_superuser override). No other role's dashboard reads Staff HR fields
+# beyond public-facing display name.
+# =============================================================================
+
+class StaffAdminRequiredMixin(RoleRequiredMixin):
+    allowed_roles = [User.Role.STAFF_ADMIN]
+    active_nav = None
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["active"] = self.active_nav
+        return context
+
+    def get_school(self, request):
+        from .models import School
+        return School.objects.first()
+
+
+class StaffAdminDashboardView(StaffAdminRequiredMixin, TemplateView):
+    """Overview — staff counts by employment status, pending leave
+    requests, today's attendance summary."""
+
+    template_name = "dashboard/staff_admin/overview.html"
+    active_nav = "overview"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        staff_qs = Staff.objects.filter(school=school) if school else Staff.objects.none()
+
+        context.update({
+            "school": school,
+            "total_staff": staff_qs.filter(is_active=True).count(),
+            "on_leave_count": staff_qs.filter(
+                employment_status=Staff.EmploymentStatus.ON_LEAVE
+            ).count(),
+            "pending_leave_requests": LeaveRequest.objects.filter(
+                staff__school=school, status=LeaveRequest.Status.PENDING
+            ).count() if school else 0,
+            "departments": Department.objects.filter(school=school, is_active=True) if school else [],
+        })
+        return context
+
+
+class StaffAdminStaffListView(StaffAdminRequiredMixin, TemplateView):
+    """Spec §6 'Staff profiles', 'Departments', 'Job titles', 'Employment
+    status'. List + search; create-staff action is deliberately NOT a
+    quick inline form here — creating a Staff record requires first
+    creating its linked User (username/password/role), which is a
+    distinct enough operation to warrant its own confirmation step rather
+    than a silent side-effect of this list page. See StaffAdminStaffCreateView."""
+
+    template_name = "dashboard/staff_admin/staff_list.html"
+    active_nav = "staff"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        staff_qs = Staff.objects.filter(school=school).select_related(
+            "user", "department"
+        ).order_by("-created_at") if school else Staff.objects.none()
+
+        search = self.request.GET.get("q", "").strip()
+        if search:
+            from django.db.models import Q
+            staff_qs = staff_qs.filter(
+                Q(staff_id__icontains=search) | Q(user__first_name__icontains=search)
+                | Q(user__last_name__icontains=search)
+            )
+
+        context.update({
+            "school": school, "staff_list": staff_qs, "search": search,
+            "departments": Department.objects.filter(school=school, is_active=True) if school else [],
+        })
+        return context
+
+
+class StaffAdminStaffCreateView(StaffAdminRequiredMixin, View):
+    """Spec §6 'Create staff'. Creates the User (login) and Staff
+    (HR profile) together — a Staff record cannot exist without a User,
+    per the OneToOneField in Phase 3's model."""
+
+    def post(self, request):
+        from django.utils.crypto import get_random_string
+
+        school = self.get_school(request)
+        username = request.POST.get("username", "").strip()
+        if not username:
+            return HttpResponseForbidden("Username is required.")
+
+        new_user = User.objects.create_user(
+            username=username, password=request.POST.get("password") or get_random_string(16),
+            first_name=request.POST.get("first_name", ""),
+            last_name=request.POST.get("last_name", ""),
+            email=request.POST.get("email", ""),
+            role=request.POST.get("role", User.Role.TEACHER),
+        )
+        Staff.objects.create(
+            user=new_user, school=school, staff_id=request.POST.get("staff_id", ""),
+            department_id=request.POST.get("department_id") or None,
+            job_title=request.POST.get("job_title", ""),
+            date_hired=request.POST.get("date_hired") or datetime.date.today(),
+        )
+        return redirect("dashboard:staff_admin_staff_list")
+
+
+class StaffAdminStaffDetailView(StaffAdminRequiredMixin, View):
+    """Spec §6 'Edit staff', 'Deactivate staff', 'Qualifications',
+    'Certifications', 'Emergency contacts'."""
+
+    template_name = "dashboard/staff_admin/staff_detail.html"
+    active_nav = "staff"
+
+    def get(self, request, staff_id):
+        school = self.get_school(request)
+        staff = get_object_or_404(Staff, pk=staff_id, school=school)
+        return render(request, self.template_name, {
+            "staff": staff, "active": self.active_nav,
+            "qualifications": staff.qualifications.all(),
+            "employment_statuses": Staff.EmploymentStatus.choices,
+        })
+
+    def post(self, request, staff_id):
+        school = self.get_school(request)
+        staff = get_object_or_404(Staff, pk=staff_id, school=school)
+        action = request.POST.get("action")
+
+        if action == "deactivate":
+            deactivate_staff(
+                staff=staff, deactivated_by=request.user,
+                reason=request.POST.get("reason", ""), request=request,
+            )
+        elif action == "reactivate":
+            reactivate_staff(staff=staff, reactivated_by=request.user, request=request)
+        else:
+            # Edit profile fields.
+            staff.job_title = request.POST.get("job_title", staff.job_title)
+            staff.emergency_contact_name = request.POST.get(
+                "emergency_contact_name", staff.emergency_contact_name
+            )
+            staff.emergency_contact_phone = request.POST.get(
+                "emergency_contact_phone", staff.emergency_contact_phone
+            )
+            staff.save()
+        return redirect("dashboard:staff_admin_staff_detail", staff_id=staff.pk)
+
+
+class StaffAdminAttendanceView(StaffAdminRequiredMixin, TemplateView):
+    """Spec §6 'Staff attendance' — mark attendance for all staff on a
+    given date."""
+
+    template_name = "dashboard/staff_admin/attendance.html"
+    active_nav = "attendance"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        target_date = self.request.GET.get("date") or datetime.date.today().isoformat()
+
+        staff_qs = Staff.objects.filter(school=school, is_active=True).select_related("user") if school else Staff.objects.none()
+        existing = {
+            r.staff_id: r for r in StaffAttendanceRecord.objects.filter(
+                staff__school=school, date=target_date
+            )
+        } if school else {}
+        staff_rows = [{"staff": s, "record": existing.get(s.pk)} for s in staff_qs]
+
+        context.update({
+            "school": school, "staff_rows": staff_rows, "target_date": target_date,
+            "status_choices": StaffAttendanceRecord.Status.choices,
+        })
+        return context
+
+    def post(self, request):
+        school = self.get_school(request)
+        target_date = request.POST.get("date")
+        for staff in Staff.objects.filter(school=school, is_active=True):
+            status = request.POST.get(f"status_{staff.pk}")
+            if not status:
+                continue
+            record_staff_attendance(
+                staff=staff, date=target_date, status=status, recorded_by=request.user,
+                notes=request.POST.get(f"notes_{staff.pk}", ""), request=request,
+            )
+        return redirect(f"{reverse('dashboard:staff_admin_attendance')}?date={target_date}")
+
+
+class StaffAdminLeaveRequestsView(StaffAdminRequiredMixin, TemplateView):
+    """Spec §6 leave workflow — the Staff Admin review/approve/reject
+    step. Approval/rejection reuses services.decide_leave_request(),
+    which sends the required notification (Phase 15)."""
+
+    template_name = "dashboard/staff_admin/leave_requests.html"
+    active_nav = "leave"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        requests_qs = LeaveRequest.objects.filter(
+            staff__school=school
+        ).select_related("staff__user").order_by("-requested_at") if school else []
+        context.update({"school": school, "leave_requests": requests_qs})
+        return context
+
+    def post(self, request):
+        school = self.get_school(request)
+        leave_request = get_object_or_404(
+            LeaveRequest, pk=request.POST.get("leave_request_id"), staff__school=school
+        )
+        approve = request.POST.get("action") == "approve"
+        try:
+            decide_leave_request(
+                leave_request=leave_request, approve=approve, decided_by=request.user,
+                decision_notes=request.POST.get("decision_notes", ""), request=request,
+            )
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:staff_admin_leave_requests")
+
+
+class StaffAdminWorkloadView(StaffAdminRequiredMixin, TemplateView):
+    """Spec §6 'Staff workload': assigned classes, subjects, teaching
+    hours, timetable. Read-only — reuses Phase 5/14 data via
+    compute_staff_workload(), no new write path."""
+
+    template_name = "dashboard/staff_admin/workload.html"
+    active_nav = "workload"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        term = Term.objects.filter(academic_year__school=school, is_current=True).first() if school else None
+
+        rows = []
+        if term:
+            for staff in Staff.objects.filter(school=school, is_active=True).select_related("user"):
+                workload = compute_staff_workload(staff=staff, term=term)
+                rows.append({"staff": staff, "workload": workload})
+
+        context.update({"school": school, "term": term, "workload_rows": rows})
+        return context
+
+
+class MyLeaveRequestsView(LoginRequiredMixin, TemplateView):
+    """Spec §6 leave workflow, step one: 'Staff submits leave request.'
+    Generic self-service view for any staff member (Teacher, Librarian,
+    Accountant, etc.) — not gated to a specific staff role, only to
+    having a linked Staff profile at all, since every staff type can
+    take leave. This is the missing entry point the workflow needs:
+    without it, LeaveRequest rows could only ever be created via Django
+    admin, never by the staff member themselves."""
+
+    template_name = "dashboard/staff_self_service/my_leave_requests.html"
+
+    def get_staff_or_404(self, request):
+        return get_object_or_404(Staff, user=request.user)
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        staff = self.get_staff_or_404(self.request)
+        context.update({
+            "staff": staff,
+            "leave_requests": staff.leave_requests.order_by("-requested_at"),
+            "leave_types": LeaveRequest.LeaveType.choices,
+        })
+        return context
+
+    def post(self, request):
+        staff = self.get_staff_or_404(request)
+        try:
+            submit_leave_request(
+                staff=staff, leave_type=request.POST.get("leave_type"),
+                start_date=request.POST.get("start_date"),
+                end_date=request.POST.get("end_date"),
+                reason=request.POST.get("reason", ""), request=request,
+            )
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:my_leave_requests")
