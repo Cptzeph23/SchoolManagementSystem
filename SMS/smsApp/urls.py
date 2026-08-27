@@ -115,4 +115,18 @@ urlpatterns = [
     path("staff-admin/leave/", views.StaffAdminLeaveRequestsView.as_view(), name="staff_admin_leave_requests"),
     path("staff-admin/workload/", views.StaffAdminWorkloadView.as_view(), name="staff_admin_workload"),
     path("my-leave-requests/", views.MyLeaveRequestsView.as_view(), name="my_leave_requests"),
+    path("academic-admin/", views.AcademicAdminDashboardView.as_view(), name="academic_admin_dashboard"),
+    path("academic-admin/students/", views.AcademicAdminStudentsView.as_view(), name="academic_admin_students"),
+    path(
+        "academic-admin/students/<int:student_id>/",
+        views.AcademicAdminStudentDetailView.as_view(), name="academic_admin_student_detail",
+    ),
+    path(
+        "academic-admin/results/", views.AcademicAdminResultsApprovalView.as_view(),
+        name="academic_admin_results_approval",
+    ),
+    path(
+        "academic-admin/attendance/", views.AcademicAdminAttendanceCorrectionView.as_view(),
+        name="academic_admin_attendance_correction",
+    ),
 ]
