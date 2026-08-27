@@ -74,6 +74,8 @@ from .models import (
 from .services import (
     apply_financial_adjustment,
     borrow_book,
+    change_student_status,
+    compute_school_academic_summary,
     correct_attendance_record,
     create_announcement,
     create_timetable_slot,
@@ -99,6 +101,7 @@ from .services import (
     notify_report_available,
     notify_result_published,
     reactivate_staff,
+    register_student,
     record_staff_attendance,
     pay_library_fine,
     record_payment,
@@ -321,14 +324,14 @@ class AuthAndDashboardTests(TestCase):
         self.assertRedirects(response, reverse("dashboard:super_admin"))
 
     def test_non_super_admin_router_redirects_to_coming_soon(self):
-        # Teacher (Phase 18), Finance Admin/Accountant (Phase 19), and
-        # Staff Admin (Phase 20) now have real dashboards — use a role
-        # that genuinely has no dashboard built yet (Academic Admin,
-        # deferred) to test the fallback path.
-        academic_admin = User.objects.create_user(
-            username="academicadmin1", password="pass12345", role=User.Role.ACADEMIC_ADMIN
+        # Teacher (Phase 18), Finance Admin/Accountant (Phase 19), Staff
+        # Admin (Phase 20), and Academic Admin (Phase 21) now all have
+        # real dashboards — use a role that genuinely has no dashboard
+        # built yet (Department Head) to test the fallback path.
+        department_head = User.objects.create_user(
+            username="depthead1", password="pass12345", role=User.Role.DEPARTMENT_HEAD
         )
-        self.client.login(username="academicadmin1", password="pass12345")
+        self.client.login(username="depthead1", password="pass12345")
         response = self.client.get(reverse("dashboard:home"))
         self.assertRedirects(response, reverse("dashboard:coming_soon"))
 
@@ -3210,3 +3213,183 @@ class StaffAdminDashboardTests(TestCase):
         self.client.login(username="dashparentnotstaff", password="pass12345")
         response = self.client.get(reverse("dashboard:my_leave_requests"))
         self.assertEqual(response.status_code, 404)
+
+
+class AcademicAdminDashboardTests(TestCase):
+    """Phase 21: Academic Admin dashboard. Every view reuses already-
+    tested service functions from Phases 6/7/8 (correct_attendance_record,
+    transition_assessment_workflow) rather than reimplementing logic —
+    tests focus on the dashboard wiring, ownership scoping, role gating,
+    and spec §7's 'without accessing confidential financial information'
+    constraint."""
+
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        self.class_group = Class.objects.create(
+            school=self.school, program=self.program, name="Grade 10"
+        )
+        self.subject = Subject.objects.create(school=self.school, code="MATH", name="Mathematics")
+        self.class_subject = ClassSubject.objects.create(
+            class_group=self.class_group, subject=self.subject
+        )
+        self.academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+            is_current=True,
+        )
+        self.term = Term.objects.create(
+            academic_year=self.academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+            is_current=True,
+        )
+        self.academic_admin_user = User.objects.create_user(
+            username="dashacademicadmin", password="pass12345", role=User.Role.ACADEMIC_ADMIN
+        )
+        student_user = User.objects.create_user(
+            username="dashacademicstudent", password="pass12345", role=User.Role.STUDENT
+        )
+        self.student = Student.objects.create(
+            user=student_user, school=self.school, admission_number="ADM950",
+            admission_date=datetime.date(2026, 1, 10), current_class=self.class_group,
+        )
+        self.client.login(username="dashacademicadmin", password="pass12345")
+
+    def test_overview_page_loads(self):
+        response = self.client.get(reverse("dashboard:academic_admin_dashboard"))
+        self.assertEqual(response.status_code, 200)
+
+    def test_dashboard_router_sends_academic_admin_to_academic_admin_dashboard(self):
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertRedirects(response, reverse("dashboard:academic_admin_dashboard"))
+
+    def test_non_academic_admin_cannot_access_dashboard(self):
+        self.client.logout()
+        teacher = User.objects.create_user(
+            username="notaacademicadmin", password="pass12345", role=User.Role.TEACHER
+        )
+        self.client.login(username="notaacademicadmin", password="pass12345")
+        response = self.client.get(reverse("dashboard:academic_admin_dashboard"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_overview_never_renders_financial_data(self):
+        """Spec §7: 'Academic Admin must manage academic operations
+        without accessing confidential financial information.'"""
+        response = self.client.get(reverse("dashboard:academic_admin_dashboard"))
+        content = response.content.decode()
+        for forbidden_term in ["Invoice", "invoice_number", "total_billed", "outstanding_balance"]:
+            self.assertNotIn(forbidden_term, content)
+
+    def test_students_list_shows_registered_student(self):
+        response = self.client.get(reverse("dashboard:academic_admin_students"))
+        self.assertContains(response, "ADM950")
+
+    def test_register_student_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:academic_admin_students"),
+            {
+                "username": "newstudent1", "first_name": "Amy", "last_name": "Kim",
+                "admission_number": "ADM951", "admission_date": "2026-01-10",
+                "current_class_id": self.class_group.pk,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Student.objects.filter(admission_number="ADM951").exists())
+
+    def test_student_detail_shows_correct_student(self):
+        response = self.client.get(
+            reverse("dashboard:academic_admin_student_detail", args=[self.student.pk])
+        )
+        self.assertContains(response, "ADM950")
+
+    def test_change_student_status_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:academic_admin_student_detail", args=[self.student.pk]),
+            {"status": Student.Status.SUSPENDED, "reason": "Disciplinary review"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.status, Student.Status.SUSPENDED)
+
+    def test_student_detail_shows_guardian_and_enrollment_history(self):
+        guardian = Guardian.objects.create(
+            school=self.school, first_name="Jane", last_name="Doe",
+            relationship="Mother", phone_number="+254700000000",
+        )
+        StudentGuardian.objects.create(
+            student=self.student, guardian=guardian, is_primary_contact=True,
+        )
+        Enrollment.objects.create(
+            student=self.student, class_subject=self.class_subject,
+            academic_year=self.academic_year,
+        )
+        response = self.client.get(
+            reverse("dashboard:academic_admin_student_detail", args=[self.student.pk])
+        )
+        self.assertContains(response, "Jane")
+        self.assertContains(response, "Mathematics")
+
+    def test_result_approval_queue_shows_submitted_assessment(self):
+        structure = AssessmentStructure.objects.create(
+            school=self.school, term=self.term, name="Standard"
+        )
+        atype = AssessmentType.objects.create(school=self.school, name="Final", code="FINAL")
+        component = AssessmentComponent.objects.create(
+            structure=structure, assessment_type=atype,
+            weight_percentage=Decimal("100"), max_marks=Decimal("100"),
+        )
+        assessment = Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=component,
+            title="Final Exam", workflow_status=Assessment.WorkflowStatus.SUBMITTED,
+        )
+        response = self.client.get(reverse("dashboard:academic_admin_results_approval"))
+        self.assertContains(response, "Final Exam")
+        self.assertEqual(list(response.context["assessments"]), [assessment])
+
+    def test_advance_assessment_through_workflow_via_dashboard(self):
+        structure = AssessmentStructure.objects.create(
+            school=self.school, term=self.term, name="Standard"
+        )
+        atype = AssessmentType.objects.create(school=self.school, name="Final", code="FINAL2")
+        component = AssessmentComponent.objects.create(
+            structure=structure, assessment_type=atype,
+            weight_percentage=Decimal("100"), max_marks=Decimal("100"),
+        )
+        assessment = Assessment.objects.create(
+            class_subject=self.class_subject, term=self.term, component=component,
+            title="CAT 1", workflow_status=Assessment.WorkflowStatus.SUBMITTED,
+        )
+        response = self.client.post(
+            reverse("dashboard:academic_admin_results_approval"),
+            {"assessment_id": assessment.pk, "action": "review"},
+        )
+        self.assertEqual(response.status_code, 302)
+        assessment.refresh_from_db()
+        self.assertEqual(assessment.workflow_status, Assessment.WorkflowStatus.REVIEWED)
+
+    def test_correct_attendance_via_dashboard(self):
+        session = AttendanceSession.objects.create(
+            class_subject=self.class_subject, term=self.term, date=datetime.date(2026, 2, 3),
+        )
+        record = AttendanceRecord.objects.create(
+            session=session, student=self.student, status="ABSENT",
+        )
+        response = self.client.post(
+            reverse("dashboard:academic_admin_attendance_correction"),
+            {"record_id": record.pk, "status": "PRESENT", "notes": "Was marked absent by mistake"},
+        )
+        self.assertEqual(response.status_code, 302)
+        record.refresh_from_db()
+        self.assertEqual(record.status, "PRESENT")
+
+        audit_entry = AuditLog.objects.filter(
+            target_model="AttendanceRecord", target_object_id=str(record.pk)
+        ).first()
+        self.assertIsNotNone(audit_entry)
+
+    def test_invalid_student_status_rejected(self):
+        response = self.client.post(
+            reverse("dashboard:academic_admin_student_detail", args=[self.student.pk]),
+            {"status": "NOT_A_REAL_STATUS"},
+        )
+        self.assertEqual(response.status_code, 403)
