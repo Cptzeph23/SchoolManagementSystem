@@ -40,6 +40,7 @@ from .models import (
     Invoice,
     InvoiceLineItem,
     LibrarySettings,
+    LeaveRequest,
     LoginHistory,
     Notification,
     NotificationDelivery,
@@ -61,6 +62,7 @@ from .models import (
     Period,
     School,
     Staff,
+    StaffAttendanceRecord,
     StaffQualification,
     Stream,
     Student,
@@ -724,3 +726,23 @@ class NotificationAdmin(admin.ModelAdmin):
 class NotificationPreferenceAdmin(admin.ModelAdmin):
     list_display = ("user", "in_app_enabled", "email_enabled", "sms_enabled", "push_enabled")
     search_fields = ("user__username",)
+
+
+@admin.register(StaffAttendanceRecord)
+class StaffAttendanceRecordAdmin(admin.ModelAdmin):
+    list_display = ("staff", "date", "status", "check_in_time", "check_out_time")
+    list_filter = ("status", "date")
+    search_fields = ("staff__staff_id",)
+
+
+@admin.register(LeaveRequest)
+class LeaveRequestAdmin(admin.ModelAdmin):
+    """Approve/reject via smsApp.services.decide_leave_request() so the
+    required notification (spec §6) actually gets sent — editing status
+    directly here skips that."""
+
+    list_display = (
+        "staff", "leave_type", "start_date", "end_date", "status", "requested_at",
+    )
+    list_filter = ("leave_type", "status")
+    search_fields = ("staff__staff_id",)
