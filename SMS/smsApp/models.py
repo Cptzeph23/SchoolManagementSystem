@@ -2707,3 +2707,109 @@ class NotificationDelivery(models.Model):
 
     def __str__(self) -> str:
         return f"{self.notification} via {self.channel} ({self.status})"
+
+
+# =============================================================================
+# Phase 20 — Staff Admin Dashboard (spec §6)
+#
+# Scope note: 'Staff management' (create/edit/deactivate, profiles, IDs,
+# departments, job titles, employment status, qualifications, documents,
+# emergency contacts) reuses Staff/StaffQualification/Department entirely
+# from Phase 3 — no new models needed there. 'Workload' reuses
+# TeachingAssignment/TimetableSlot from Phase 5/14. Only 'Staff attendance'
+# and 'Leave management' need new models, below. 'Staff performance'
+# (appraisals, training records) is explicitly deferred — a distinct HR
+# feature area, not required for the rest of this phase to function.
+# =============================================================================
+
+class StaffAttendanceRecord(models.Model):
+    """Spec §6 'Staff attendance': attendance/absence/late arrival/early
+    departure. One row per staff member per day (unlike student
+    attendance's per-class-period Session+Record split from Phase 6 —
+    staff attendance is a single daily check-in/out, not per-lesson)."""
+
+    class Status(models.TextChoices):
+        PRESENT = "PRESENT", "Present"
+        ABSENT = "ABSENT", "Absent"
+        LATE = "LATE", "Late Arrival"
+        EARLY_DEPARTURE = "EARLY_DEPARTURE", "Early Departure"
+        ON_LEAVE = "ON_LEAVE", "On Leave"
+
+    staff = models.ForeignKey(
+        Staff, on_delete=models.CASCADE, related_name="attendance_records"
+    )
+    date = models.DateField()
+    status = models.CharField(max_length=20, choices=Status.choices, db_index=True)
+    check_in_time = models.TimeField(blank=True, null=True)
+    check_out_time = models.TimeField(blank=True, null=True)
+    notes = models.CharField(max_length=255, blank=True)
+    recorded_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="staff_attendance_recorded",
+        blank=True, null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "staff_attendance_records"
+        ordering = ["-date"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["staff", "date"], name="uniq_staff_attendance_per_day"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.staff} - {self.date} - {self.status}"
+
+
+class LeaveRequest(models.Model):
+    """Spec §6 'Leave management' workflow: staff submits -> Staff Admin
+    reviews -> approves/rejects -> system records decision -> user
+    receives notification (wired via services.decide_leave_request()
+    calling smsApp.services.send_notification() from Phase 15)."""
+
+    class LeaveType(models.TextChoices):
+        ANNUAL = "ANNUAL", "Annual Leave"
+        SICK = "SICK", "Sick Leave"
+        MATERNITY = "MATERNITY", "Maternity Leave"
+        PATERNITY = "PATERNITY", "Paternity Leave"
+        COMPASSIONATE = "COMPASSIONATE", "Compassionate Leave"
+        UNPAID = "UNPAID", "Unpaid Leave"
+        OTHER = "OTHER", "Other"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+
+    staff = models.ForeignKey(
+        Staff, on_delete=models.CASCADE, related_name="leave_requests"
+    )
+    leave_type = models.CharField(max_length=15, choices=LeaveType.choices)
+    start_date = models.DateField()
+    end_date = models.DateField()
+    reason = models.TextField(blank=True)
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True
+    )
+    reviewed_by = models.ForeignKey(
+        "smsApp.User", on_delete=models.SET_NULL, related_name="leave_requests_reviewed",
+        blank=True, null=True,
+    )
+    reviewed_at = models.DateTimeField(blank=True, null=True)
+    decision_notes = models.CharField(max_length=255, blank=True)
+    requested_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "leave_requests"
+        ordering = ["-requested_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(end_date__gte=models.F("start_date")),
+                name="leave_end_date_after_start",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.staff} - {self.get_leave_type_display()} ({self.status})"
