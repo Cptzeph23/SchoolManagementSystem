@@ -104,4 +104,15 @@ urlpatterns = [
         views.FinanceAdminInvoiceDetailView.as_view(), name="finance_invoice_detail",
     ),
     path("finance/refunds/", views.FinanceAdminRefundsView.as_view(), name="finance_refunds"),
+    path("staff-admin/", views.StaffAdminDashboardView.as_view(), name="staff_admin_dashboard"),
+    path("staff-admin/staff/", views.StaffAdminStaffListView.as_view(), name="staff_admin_staff_list"),
+    path("staff-admin/staff/create/", views.StaffAdminStaffCreateView.as_view(), name="staff_admin_staff_create"),
+    path(
+        "staff-admin/staff/<int:staff_id>/",
+        views.StaffAdminStaffDetailView.as_view(), name="staff_admin_staff_detail",
+    ),
+    path("staff-admin/attendance/", views.StaffAdminAttendanceView.as_view(), name="staff_admin_attendance"),
+    path("staff-admin/leave/", views.StaffAdminLeaveRequestsView.as_view(), name="staff_admin_leave_requests"),
+    path("staff-admin/workload/", views.StaffAdminWorkloadView.as_view(), name="staff_admin_workload"),
+    path("my-leave-requests/", views.MyLeaveRequestsView.as_view(), name="my_leave_requests"),
 ]
