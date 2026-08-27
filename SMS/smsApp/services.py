@@ -14,7 +14,7 @@ from typing import Any
 
 from django.http import HttpRequest
 
-from .models import Assessment, AuditLog, ClassSubject, LoginHistory, Student, Term, User
+from .models import Assessment, AuditLog, ClassSubject, LoginHistory, Staff, Student, Term, User
 
 
 def _client_ip(request: HttpRequest | None) -> str | None:
@@ -96,8 +96,9 @@ def get_dashboard_url_for_role(user: User) -> str:
         User.Role.CLASS_TEACHER: "dashboard:teacher_dashboard",
         User.Role.FINANCE_ADMIN: "dashboard:finance_dashboard",
         User.Role.ACCOUNTANT: "dashboard:finance_dashboard",
+        User.Role.STAFF_ADMIN: "dashboard:staff_admin_dashboard",
         # Other roles route here as their dashboards are built
-        # (Staff Admin, Academic Admin, etc.)
+        # (Academic Admin, etc.)
     }
     url_name = mapping.get(user.role, "dashboard:coming_soon")
     return reverse(url_name)
@@ -1946,4 +1947,194 @@ def compute_school_financial_summary(*, school) -> dict[str, Any]:
         "arrears": arrears,
         "overdue_invoice_count": overdue_invoices.count(),
         "unpaid_invoice_count": invoices.filter(status=Invoice.Status.UNPAID).count(),
+    }
+
+
+# =============================================================================
+# Phase 20 — Staff Admin Dashboard (spec §6)
+# =============================================================================
+
+def record_staff_attendance(
+    *,
+    staff: Staff,
+    date,
+    status: str,
+    recorded_by: User,
+    check_in_time=None,
+    check_out_time=None,
+    notes: str = "",
+    request: HttpRequest | None = None,
+):
+    """Spec §6 'Staff attendance'. update_or_create so re-marking the same
+    staff/date corrects the existing row rather than erroring — mirrors
+    the Student attendance pattern (Phase 6) but one row per day, not per
+    class period."""
+    from .models import StaffAttendanceRecord
+
+    record, created = StaffAttendanceRecord.objects.update_or_create(
+        staff=staff, date=date,
+        defaults={
+            "status": status, "check_in_time": check_in_time,
+            "check_out_time": check_out_time, "notes": notes, "recorded_by": recorded_by,
+        },
+    )
+    log_audit(
+        actor=recorded_by, action=AuditLog.Action.CREATE if created else AuditLog.Action.UPDATE,
+        request=request, target_model="StaffAttendanceRecord", target_object_id=record.pk,
+        description=f"{'Recorded' if created else 'Updated'} attendance for {staff} on {date}: {status}",
+    )
+    return record
+
+
+def submit_leave_request(
+    *,
+    staff: Staff,
+    leave_type: str,
+    start_date,
+    end_date,
+    reason: str = "",
+    request: HttpRequest | None = None,
+):
+    """Spec §6 'Staff submits leave request.' First step of the workflow."""
+    from .models import LeaveRequest
+
+    if end_date < start_date:
+        raise ValueError("Leave end date cannot be before the start date.")
+
+    leave_request = LeaveRequest.objects.create(
+        staff=staff, leave_type=leave_type, start_date=start_date,
+        end_date=end_date, reason=reason,
+    )
+    log_audit(
+        actor=staff.user, action=AuditLog.Action.CREATE, request=request,
+        target_model="LeaveRequest", target_object_id=leave_request.pk,
+        description=f"{staff} requested {leave_type} leave ({start_date} to {end_date})",
+    )
+    return leave_request
+
+
+def decide_leave_request(
+    *,
+    leave_request,
+    approve: bool,
+    decided_by: User,
+    decision_notes: str = "",
+    request: HttpRequest | None = None,
+):
+    """Spec §6 'Staff Admin reviews. Staff Admin approves/rejects. System
+    records decision. User receives notification.' The notification step
+    is not optional in the spec — wired here via send_notification()
+    (Phase 15) rather than left as a TODO."""
+    from django.utils import timezone
+
+    from .models import LeaveRequest
+
+    if leave_request.status != LeaveRequest.Status.PENDING:
+        raise ValueError(f"This leave request is already {leave_request.status}.")
+
+    leave_request.status = (
+        LeaveRequest.Status.APPROVED if approve else LeaveRequest.Status.REJECTED
+    )
+    leave_request.reviewed_by = decided_by
+    leave_request.reviewed_at = timezone.now()
+    leave_request.decision_notes = decision_notes
+    leave_request.save()
+
+    send_notification(
+        recipient=leave_request.staff.user,
+        notification_type="OTHER",
+        title=f"Leave Request {leave_request.get_status_display()}",
+        body=(
+            f"Your {leave_request.get_leave_type_display()} request "
+            f"({leave_request.start_date} to {leave_request.end_date}) "
+            f"was {leave_request.get_status_display().lower()}."
+            + (f" Note: {decision_notes}" if decision_notes else "")
+        ),
+        channels=["EMAIL"], request=request,
+    )
+
+    log_audit(
+        actor=decided_by, action=AuditLog.Action.APPROVE if approve else AuditLog.Action.OTHER,
+        request=request, target_model="LeaveRequest", target_object_id=leave_request.pk,
+        description=f"{'Approved' if approve else 'Rejected'} leave request for {leave_request.staff}",
+    )
+    return leave_request
+
+
+def deactivate_staff(
+    *, staff: Staff, deactivated_by: User, reason: str = "", request: HttpRequest | None = None,
+):
+    """Spec §6 'Deactivate staff'. Deactivates both the Staff profile and
+    the linked login (User.is_active) — a deactivated staff member
+    shouldn't still be able to log in. Never deletes the row (spec
+    §37/§38 'prefer correction over destructive deletion')."""
+    previous_value = {"is_active": staff.is_active, "employment_status": staff.employment_status}
+
+    staff.is_active = False
+    staff.employment_status = staff.EmploymentStatus.TERMINATED
+    staff.save(update_fields=["is_active", "employment_status"])
+    staff.user.is_active = False
+    staff.user.save(update_fields=["is_active"])
+
+    log_audit(
+        actor=deactivated_by, action=AuditLog.Action.UPDATE, request=request,
+        target_model="Staff", target_object_id=staff.pk,
+        description=f"Deactivated {staff}" + (f": {reason}" if reason else ""),
+        previous_value=previous_value,
+        new_value={"is_active": False, "employment_status": staff.employment_status},
+    )
+    return staff
+
+
+def reactivate_staff(*, staff: Staff, reactivated_by: User, request: HttpRequest | None = None):
+    """Reverses deactivate_staff() — a correction, not a new capability,
+    consistent with spec §37/§38's 'never silently destroy, always
+    provide correction paths' principle."""
+    staff.is_active = True
+    staff.employment_status = staff.EmploymentStatus.ACTIVE
+    staff.save(update_fields=["is_active", "employment_status"])
+    staff.user.is_active = True
+    staff.user.save(update_fields=["is_active"])
+
+    log_audit(
+        actor=reactivated_by, action=AuditLog.Action.UPDATE, request=request,
+        target_model="Staff", target_object_id=staff.pk,
+        description=f"Reactivated {staff}",
+    )
+    return staff
+
+
+def compute_staff_workload(*, staff: Staff, term) -> dict[str, Any]:
+    """Spec §6 'Staff workload': assigned classes, assigned subjects,
+    teaching hours, timetable. Teaching hours are derived from actual
+    scheduled TimetableSlots (Phase 14), not just counted
+    TeachingAssignments, so a subject taught 5x/week correctly counts
+    more than one taught once."""
+    from .models import TeachingAssignment, TimetableSlot
+
+    assignments = TeachingAssignment.objects.filter(
+        teacher=staff, term=term, is_active=True
+    ).select_related("class_subject__class_group", "class_subject__subject")
+
+    slots = TimetableSlot.objects.filter(
+        teacher=staff, term=term
+    ).select_related("period")
+
+    total_minutes = 0
+    for slot in slots:
+        start = slot.period.start_time
+        end = slot.period.end_time
+        total_minutes += (end.hour * 60 + end.minute) - (start.hour * 60 + start.minute)
+
+    return {
+        "assigned_classes": assignments.values_list(
+            "class_subject__class_group__name", flat=True
+        ).distinct().count(),
+        "assigned_subjects": assignments.values_list(
+            "class_subject__subject__name", flat=True
+        ).distinct().count(),
+        "weekly_periods": slots.count(),
+        "weekly_teaching_hours": round(total_minutes / 60, 1),
+        "assignments": assignments,
+        "slots": slots,
     }
