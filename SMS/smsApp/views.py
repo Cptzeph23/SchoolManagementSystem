@@ -32,6 +32,7 @@ from .models import (
     LeaveRequest,
     Notification,
     Payment,
+    Program,
     Quiz,
     QuizAttempt,
     Refund,
@@ -40,7 +41,9 @@ from .models import (
     Staff,
     StaffAttendanceRecord,
     StaffQualification,
+    Stream,
     Student,
+    StudentGuardian,
     Subject,
     TeachingAssignment,
     Term,
@@ -51,10 +54,13 @@ from .models import (
 from .permissions import RoleRequiredMixin
 from .services import (
     apply_financial_adjustment,
+    change_student_status,
+    compute_school_academic_summary,
     compute_school_financial_summary,
     compute_staff_workload,
     compute_student_account_summary,
     compute_weighted_average,
+    correct_attendance_record,
     deactivate_staff,
     decide_leave_request,
     decide_refund,
@@ -72,6 +78,7 @@ from .services import (
     record_login,
     record_payment,
     record_staff_attendance,
+    register_student,
     render_report_html,
     submit_assignment,
     submit_leave_request,
@@ -1725,3 +1732,223 @@ class MyLeaveRequestsView(LoginRequiredMixin, TemplateView):
         except ValueError as exc:
             return HttpResponseForbidden(str(exc))
         return redirect("dashboard:my_leave_requests")
+
+
+# =============================================================================
+# Phase 21 — Academic Admin Dashboard (spec §7)
+#
+# 'Academic Admin must manage academic operations without accessing
+# confidential financial information' — no view in this section imports
+# or queries Invoice/Payment/Refund/FeeStructure/FeeConcession.
+#
+# Two of these views close loops left open since earlier phases: result
+# approval (Phase 8's workflow was fully built/tested but had no
+# Academic Admin-facing view until now) and attendance correction
+# (Phase 6's correct_attendance_record() was built/tested but likewise
+# never had a UI entry point).
+# =============================================================================
+
+class AcademicAdminRequiredMixin(RoleRequiredMixin):
+    allowed_roles = [User.Role.ACADEMIC_ADMIN]
+    active_nav = None
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["active"] = self.active_nav
+        return context
+
+    def get_school(self, request):
+        from .models import School
+        return School.objects.first()
+
+
+class AcademicAdminDashboardView(AcademicAdminRequiredMixin, TemplateView):
+    template_name = "dashboard/academic_admin/overview.html"
+    active_nav = "overview"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        summary = compute_school_academic_summary(school=school) if school else {}
+        context.update({"school": school, "summary": summary})
+        return context
+
+
+class AcademicAdminStudentsView(AcademicAdminRequiredMixin, TemplateView):
+    """Spec §7 'Student profiles', 'Classes', 'Streams', 'Student
+    status'. List + search + register-student action."""
+
+    template_name = "dashboard/academic_admin/students.html"
+    active_nav = "students"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        students_qs = Student.objects.filter(school=school).select_related(
+            "user", "current_class", "current_stream"
+        ).order_by("-created_at") if school else Student.objects.none()
+
+        search = self.request.GET.get("q", "").strip()
+        if search:
+            from django.db.models import Q
+            students_qs = students_qs.filter(
+                Q(admission_number__icontains=search) | Q(user__first_name__icontains=search)
+                | Q(user__last_name__icontains=search)
+            )
+
+        context.update({
+            "school": school, "students": students_qs, "search": search,
+            "classes": Class.objects.filter(school=school, is_active=True) if school else [],
+        })
+        return context
+
+    def post(self, request):
+        school = self.get_school(request)
+        try:
+            register_student(
+                school=school, username=request.POST.get("username", "").strip(),
+                password=request.POST.get("password") or None,
+                first_name=request.POST.get("first_name", ""),
+                last_name=request.POST.get("last_name", ""),
+                email=request.POST.get("email", ""),
+                admission_number=request.POST.get("admission_number", ""),
+                admission_date=request.POST.get("admission_date"),
+                current_class=(
+                    Class.objects.filter(pk=request.POST.get("current_class_id")).first()
+                    if request.POST.get("current_class_id") else None
+                ),
+                registered_by=request.user, request=request,
+            )
+        except (ValueError, TypeError) as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:academic_admin_students")
+
+
+class AcademicAdminStudentDetailView(AcademicAdminRequiredMixin, View):
+    """Spec §7 'Student profiles', 'Guardian information', 'Academic
+    history', 'Student status', 'Student documents'."""
+
+    template_name = "dashboard/academic_admin/student_detail.html"
+    active_nav = "students"
+
+    def get(self, request, student_id):
+        school = self.get_school(request)
+        student = get_object_or_404(
+            Student.objects.select_related("user", "current_class", "current_stream"),
+            pk=student_id, school=school,
+        )
+        guardians = StudentGuardian.objects.filter(student=student).select_related("guardian")
+        enrollments = Enrollment.objects.filter(student=student).select_related(
+            "class_subject__subject", "academic_year"
+        )
+        return render(request, self.template_name, {
+            "student": student, "active": self.active_nav,
+            "guardians": guardians, "enrollments": enrollments,
+            "status_choices": Student.Status.choices,
+        })
+
+    def post(self, request, student_id):
+        school = self.get_school(request)
+        student = get_object_or_404(Student, pk=student_id, school=school)
+        try:
+            change_student_status(
+                student=student, new_status=request.POST.get("status"),
+                changed_by=request.user, reason=request.POST.get("reason", ""),
+                request=request,
+            )
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:academic_admin_student_detail", student_id=student.pk)
+
+
+class AcademicAdminResultsApprovalView(AcademicAdminRequiredMixin, TemplateView):
+    """Spec §7/§14: the Academic Admin review/verify/approve/publish
+    steps in the result-processing workflow. Reuses
+    services.transition_assessment_workflow() (Phase 8, already tested —
+    including the 'a teacher can't approve their own results' rule)."""
+
+    template_name = "dashboard/academic_admin/results_approval.html"
+    active_nav = "results"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        pending_statuses = [
+            Assessment.WorkflowStatus.SUBMITTED, Assessment.WorkflowStatus.REVIEWED,
+            Assessment.WorkflowStatus.VERIFIED,
+        ]
+        assessments = Assessment.objects.filter(
+            class_subject__class_group__school=school, workflow_status__in=pending_statuses
+        ).select_related(
+            "class_subject__class_group", "class_subject__subject", "term"
+        ).order_by("workflow_status") if school else []
+        context.update({"school": school, "assessments": assessments})
+        return context
+
+    def post(self, request):
+        school = self.get_school(request)
+        assessment = get_object_or_404(
+            Assessment, pk=request.POST.get("assessment_id"),
+            class_subject__class_group__school=school,
+        )
+        action = request.POST.get("action")
+        next_status_map = {
+            "review": Assessment.WorkflowStatus.REVIEWED,
+            "verify": Assessment.WorkflowStatus.VERIFIED,
+            "approve": Assessment.WorkflowStatus.APPROVED,
+            "publish": Assessment.WorkflowStatus.PUBLISHED,
+            "reject": Assessment.WorkflowStatus.DRAFT,
+        }
+        to_status = next_status_map.get(action)
+        if to_status is None:
+            return HttpResponseForbidden("Unknown action.")
+        try:
+            transition_assessment_workflow(
+                assessment=assessment, to_status=to_status, actor=request.user,
+                request=request,
+            )
+        except (ValueError, PermissionError) as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:academic_admin_results_approval")
+
+
+class AcademicAdminAttendanceCorrectionView(AcademicAdminRequiredMixin, TemplateView):
+    """Spec §7/§11: 'Academic Admin can... correct attendance with
+    appropriate permissions.' Reuses services.correct_attendance_record()
+    (Phase 6, already tested — including the full audit-log trail)."""
+
+    template_name = "dashboard/academic_admin/attendance_correction.html"
+    active_nav = "attendance"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        school = self.get_school(self.request)
+        target_date = self.request.GET.get("date") or datetime.date.today().isoformat()
+
+        records = AttendanceRecord.objects.filter(
+            session__class_subject__class_group__school=school, session__date=target_date,
+        ).select_related(
+            "student__user", "session__class_subject__subject", "session__class_subject__class_group",
+        ) if school else AttendanceRecord.objects.none()
+
+        context.update({
+            "school": school, "records": records, "target_date": target_date,
+            "status_choices": AttendanceRecord.Status.choices,
+        })
+        return context
+
+    def post(self, request):
+        school = self.get_school(request)
+        record = get_object_or_404(
+            AttendanceRecord, pk=request.POST.get("record_id"),
+            session__class_subject__class_group__school=school,
+        )
+        correct_attendance_record(
+            record=record, new_status=request.POST.get("status"),
+            corrected_by=request.user, request=request,
+            new_notes=request.POST.get("notes", ""),
+        )
+        return redirect(
+            f"{reverse('dashboard:academic_admin_attendance_correction')}"
+            f"?date={record.session.date.isoformat()}"
+        )
