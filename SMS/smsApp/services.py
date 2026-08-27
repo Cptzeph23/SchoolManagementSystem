@@ -97,8 +97,9 @@ def get_dashboard_url_for_role(user: User) -> str:
         User.Role.FINANCE_ADMIN: "dashboard:finance_dashboard",
         User.Role.ACCOUNTANT: "dashboard:finance_dashboard",
         User.Role.STAFF_ADMIN: "dashboard:staff_admin_dashboard",
+        User.Role.ACADEMIC_ADMIN: "dashboard:academic_admin_dashboard",
         # Other roles route here as their dashboards are built
-        # (Academic Admin, etc.)
+        # (Department Head, Exam Officer, Librarian, etc.)
     }
     url_name = mapping.get(user.role, "dashboard:coming_soon")
     return reverse(url_name)
@@ -2137,4 +2138,112 @@ def compute_staff_workload(*, staff: Staff, term) -> dict[str, Any]:
         "weekly_teaching_hours": round(total_minutes / 60, 1),
         "assignments": assignments,
         "slots": slots,
+    }
+
+
+# =============================================================================
+# Phase 21 — Academic Admin Dashboard (spec §7).
+# 'Academic Admin must manage academic operations without accessing
+# confidential financial information' — every function here works with
+# Student/Enrollment/Assessment/AttendanceRecord only; nothing in this
+# section imports or queries Invoice/Payment/Refund/FeeStructure.
+# =============================================================================
+
+def register_student(
+    *,
+    school,
+    username: str,
+    password: str | None,
+    first_name: str,
+    last_name: str,
+    email: str,
+    admission_number: str,
+    admission_date,
+    current_class=None,
+    current_stream=None,
+    program=None,
+    registered_by: User,
+    request: HttpRequest | None = None,
+):
+    """Spec §7 'Student registration', 'Admission numbers'. Creates the
+    login (User) and academic profile (Student) together — a Student
+    cannot exist without a User, per the OneToOneField in Phase 3."""
+    from django.utils.crypto import get_random_string
+
+    from .models import Student
+
+    new_user = User.objects.create_user(
+        username=username, password=password or get_random_string(16),
+        first_name=first_name, last_name=last_name, email=email,
+        role=User.Role.STUDENT,
+    )
+    student = Student.objects.create(
+        user=new_user, school=school, admission_number=admission_number,
+        admission_date=admission_date, current_class=current_class,
+        current_stream=current_stream, program=program,
+    )
+    log_audit(
+        actor=registered_by, action=AuditLog.Action.CREATE, request=request,
+        target_model="Student", target_object_id=student.pk,
+        description=f"Registered student {student} ({admission_number})",
+    )
+    return student
+
+
+def change_student_status(
+    *, student: Student, new_status: str, changed_by: User,
+    reason: str = "", request: HttpRequest | None = None,
+):
+    """Spec §7 'Student status': Active, Graduated, Suspended,
+    Transferred, Deferred, Withdrawn, Expelled, Alumni. A status change
+    is a correction event, not a silent field edit — always audit-logged
+    with the before/after value (spec §37/§38)."""
+    from .models import Student
+
+    if new_status not in Student.Status.values:
+        raise ValueError(f"'{new_status}' is not a valid student status.")
+
+    previous_status = student.status
+    student.status = new_status
+    student.save(update_fields=["status"])
+
+    log_audit(
+        actor=changed_by, action=AuditLog.Action.UPDATE, request=request,
+        target_model="Student", target_object_id=student.pk,
+        description=f"Changed status of {student} from {previous_status} to {new_status}"
+        + (f": {reason}" if reason else ""),
+        previous_value={"status": previous_status}, new_value={"status": new_status},
+    )
+    return student
+
+
+def compute_school_academic_summary(*, school) -> dict[str, Any]:
+    """Overview page aggregate — student counts by status, pending
+    assessment-approval queue depth, current academic year/term. No
+    financial data anywhere in this function, per spec §7's constraint."""
+    from .models import AcademicYear, Assessment, Student, Term
+
+    students = Student.objects.filter(school=school)
+    current_year = AcademicYear.objects.filter(school=school, is_current=True).first()
+    current_term = Term.objects.filter(
+        academic_year__school=school, is_current=True
+    ).first()
+
+    pending_statuses = [
+        Assessment.WorkflowStatus.SUBMITTED, Assessment.WorkflowStatus.REVIEWED,
+        Assessment.WorkflowStatus.VERIFIED,
+    ]
+    pending_approvals = Assessment.objects.filter(
+        class_subject__class_group__school=school, workflow_status__in=pending_statuses
+    ).count()
+
+    return {
+        "total_students": students.filter(is_active=True).count(),
+        "status_breakdown": {
+            status: students.filter(status=status).count()
+            for status, _ in Student.Status.choices
+        },
+        "current_academic_year": current_year,
+        "current_term": current_term,
+        "pending_result_approvals": pending_approvals,
     }
