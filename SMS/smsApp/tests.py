@@ -27,6 +27,7 @@ from .models import (
     Class,
     ClassSubject,
     CourseMaterial,
+    Department,
     Discussion,
     DiscussionReply,
     Enrollment,
@@ -40,6 +41,7 @@ from .models import (
     Guardian,
     Invoice,
     InvoiceLineItem,
+    LeaveRequest,
     LibrarySettings,
     LoginHistory,
     Notification,
@@ -60,6 +62,7 @@ from .models import (
     Period,
     School,
     Staff,
+    StaffAttendanceRecord,
     Student,
     StudentGuardian,
     Subject,
@@ -76,6 +79,10 @@ from .services import (
     create_timetable_slot,
     compute_weighted_average,
     compute_student_account_summary,
+    compute_school_financial_summary,
+    compute_staff_workload,
+    deactivate_staff,
+    decide_leave_request,
     decide_refund,
     decide_result_amendment,
     generate_batch_reports,
@@ -91,6 +98,8 @@ from .services import (
     notify_payment_received,
     notify_report_available,
     notify_result_published,
+    reactivate_staff,
+    record_staff_attendance,
     pay_library_fine,
     record_payment,
     reject_assessment,
@@ -102,6 +111,7 @@ from .services import (
     send_notification,
     submit_assignment,
     submit_quiz_attempt,
+    submit_leave_request,
     transition_assessment_workflow,
     validate_grade_bands_no_overlap,
     verify_transcript,
@@ -311,14 +321,14 @@ class AuthAndDashboardTests(TestCase):
         self.assertRedirects(response, reverse("dashboard:super_admin"))
 
     def test_non_super_admin_router_redirects_to_coming_soon(self):
-        # Teacher (Phase 18) and Finance Admin/Accountant (Phase 19) now
-        # have real dashboards — use a role that genuinely has no
-        # dashboard built yet (Staff Admin, deferred) to test the
-        # fallback path.
-        staff_admin = User.objects.create_user(
-            username="staffadmin1", password="pass12345", role=User.Role.STAFF_ADMIN
+        # Teacher (Phase 18), Finance Admin/Accountant (Phase 19), and
+        # Staff Admin (Phase 20) now have real dashboards — use a role
+        # that genuinely has no dashboard built yet (Academic Admin,
+        # deferred) to test the fallback path.
+        academic_admin = User.objects.create_user(
+            username="academicadmin1", password="pass12345", role=User.Role.ACADEMIC_ADMIN
         )
-        self.client.login(username="staffadmin1", password="pass12345")
+        self.client.login(username="academicadmin1", password="pass12345")
         response = self.client.get(reverse("dashboard:home"))
         self.assertRedirects(response, reverse("dashboard:coming_soon"))
 
@@ -2988,3 +2998,215 @@ class FinanceAdminDashboardTests(TestCase):
             reverse("dashboard:finance_invoice_detail", args=[invoice.pk])
         )
         self.assertContains(response, self.student.admission_number)
+
+
+class StaffAdminDashboardTests(TestCase):
+    """Phase 20: Staff Admin dashboard. Covers the two real bugs found
+    during review — missing `reactivate_staff` import (would 500 on any
+    real reactivate action) and the missing self-service leave-submission
+    entry point (spec's workflow literally starts with 'Staff submits
+    leave request', which had no way to happen before this phase)."""
+
+    def setUp(self):
+        self.school = School.objects.create(name="Riverside High", code="RVH")
+        self.department = Department.objects.create(
+            school=self.school, name="Mathematics Dept", code="MATHDEPT"
+        )
+        self.staff_admin_user = User.objects.create_user(
+            username="dashstaffadmin", password="pass12345", role=User.Role.STAFF_ADMIN
+        )
+        teacher_user = User.objects.create_user(
+            username="dashstaffmember", password="pass12345", role=User.Role.TEACHER,
+            first_name="Sam", last_name="Otieno",
+        )
+        self.staff = Staff.objects.create(
+            user=teacher_user, school=self.school, staff_id="STF700",
+            department=self.department, job_title="Maths Teacher",
+            date_hired=datetime.date(2024, 1, 1),
+        )
+        self.client.login(username="dashstaffadmin", password="pass12345")
+
+    def test_overview_page_loads(self):
+        response = self.client.get(reverse("dashboard:staff_admin_dashboard"))
+        self.assertEqual(response.status_code, 200)
+
+    def test_dashboard_router_sends_staff_admin_to_staff_admin_dashboard(self):
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertRedirects(response, reverse("dashboard:staff_admin_dashboard"))
+
+    def test_non_staff_admin_cannot_access_staff_admin_dashboard(self):
+        self.client.logout()
+        teacher = User.objects.create_user(
+            username="notastaffadmin", password="pass12345", role=User.Role.TEACHER
+        )
+        self.client.login(username="notastaffadmin", password="pass12345")
+        response = self.client.get(reverse("dashboard:staff_admin_dashboard"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_staff_list_shows_created_staff(self):
+        response = self.client.get(reverse("dashboard:staff_admin_staff_list"))
+        self.assertContains(response, "STF700")
+
+    def test_create_staff_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:staff_admin_staff_create"),
+            {
+                "username": "newteacher1", "first_name": "Amy", "last_name": "Kim",
+                "staff_id": "STF701", "job_title": "English Teacher",
+                "department_id": self.department.pk,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Staff.objects.filter(staff_id="STF701").exists())
+        new_staff = Staff.objects.get(staff_id="STF701")
+        self.assertTrue(new_staff.user.is_active)
+
+    def test_deactivate_staff_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:staff_admin_staff_detail", args=[self.staff.pk]),
+            {"action": "deactivate", "reason": "Resigned"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.staff.refresh_from_db()
+        self.assertFalse(self.staff.is_active)
+        self.assertFalse(self.staff.user.is_active)
+        self.assertEqual(self.staff.employment_status, Staff.EmploymentStatus.TERMINATED)
+
+    def test_reactivate_staff_via_dashboard_does_not_500(self):
+        """Regression test: reactivate_staff was called in views.py but
+        never imported — this action would have raised NameError (500)
+        on every real request before the fix."""
+        deactivate_staff(staff=self.staff, deactivated_by=self.staff_admin_user)
+        response = self.client.post(
+            reverse("dashboard:staff_admin_staff_detail", args=[self.staff.pk]),
+            {"action": "reactivate"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.staff.refresh_from_db()
+        self.assertTrue(self.staff.is_active)
+        self.assertTrue(self.staff.user.is_active)
+
+    def test_edit_staff_profile_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:staff_admin_staff_detail", args=[self.staff.pk]),
+            {
+                "job_title": "Head of Mathematics",
+                "emergency_contact_name": "Jane Otieno",
+                "emergency_contact_phone": "+254700000099",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.staff.refresh_from_db()
+        self.assertEqual(self.staff.job_title, "Head of Mathematics")
+        self.assertEqual(self.staff.emergency_contact_name, "Jane Otieno")
+
+    def test_mark_staff_attendance_via_dashboard(self):
+        response = self.client.post(
+            reverse("dashboard:staff_admin_attendance"),
+            {"date": "2026-02-02", f"status_{self.staff.pk}": "PRESENT"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(
+            StaffAttendanceRecord.objects.filter(
+                staff=self.staff, date="2026-02-02", status="PRESENT",
+            ).exists()
+        )
+
+    def test_leave_request_full_workflow_via_dashboard(self):
+        """Spec §6: 'Staff submits leave request -> Staff Admin reviews
+        -> Staff Admin approves/rejects -> System records decision ->
+        User receives notification.' Exercised end-to-end through the
+        actual views, not just the service layer."""
+        self.client.logout()
+        self.client.login(username="dashstaffmember", password="pass12345")
+        response = self.client.post(
+            reverse("dashboard:my_leave_requests"),
+            {
+                "leave_type": LeaveRequest.LeaveType.ANNUAL,
+                "start_date": "2026-03-01", "end_date": "2026-03-05",
+                "reason": "Family trip",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        leave_request = LeaveRequest.objects.get(staff=self.staff)
+        self.assertEqual(leave_request.status, LeaveRequest.Status.PENDING)
+
+        self.client.logout()
+        self.client.login(username="dashstaffadmin", password="pass12345")
+        response = self.client.post(
+            reverse("dashboard:staff_admin_leave_requests"),
+            {"leave_request_id": leave_request.pk, "action": "approve"},
+        )
+        self.assertEqual(response.status_code, 302)
+        leave_request.refresh_from_db()
+        self.assertEqual(leave_request.status, LeaveRequest.Status.APPROVED)
+
+        from smsApp.models import Notification
+        self.assertTrue(
+            Notification.objects.filter(
+                recipient=self.staff.user, title__icontains="Leave Request",
+            ).exists()
+        )
+
+    def test_cannot_decide_same_leave_request_twice_via_dashboard(self):
+        leave_request = submit_leave_request(
+            staff=self.staff, leave_type=LeaveRequest.LeaveType.SICK,
+            start_date=datetime.date(2026, 3, 1), end_date=datetime.date(2026, 3, 2),
+        )
+        decide_leave_request(
+            leave_request=leave_request, approve=True, decided_by=self.staff_admin_user,
+        )
+        response = self.client.post(
+            reverse("dashboard:staff_admin_leave_requests"),
+            {"leave_request_id": leave_request.pk, "action": "approve"},
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_workload_page_reflects_teaching_assignment(self):
+        program = Program.objects.create(school=self.school, name="8-4-4", code="844")
+        class_group = Class.objects.create(school=self.school, program=program, name="Grade 10")
+        subject = Subject.objects.create(school=self.school, code="MATH", name="Mathematics")
+        class_subject = ClassSubject.objects.create(class_group=class_group, subject=subject)
+        academic_year = AcademicYear.objects.create(
+            school=self.school, name="2026/2027",
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 12, 31),
+        )
+        term = Term.objects.create(
+            academic_year=academic_year, name="Term 1", term_number=1,
+            start_date=datetime.date(2026, 1, 1), end_date=datetime.date(2026, 4, 1),
+            is_current=True,
+        )
+        TeachingAssignment.objects.create(
+            class_subject=class_subject, teacher=self.staff, term=term
+        )
+        response = self.client.get(reverse("dashboard:staff_admin_workload"))
+        self.assertEqual(response.status_code, 200)
+        row = next(
+            r for r in response.context["workload_rows"] if r["staff"].pk == self.staff.pk
+        )
+        self.assertEqual(row["workload"]["assigned_classes"], 1)
+
+    def test_my_leave_requests_page_accessible_to_any_staff_role(self):
+        """The self-service view isn't gated to a specific staff role —
+        confirms a Librarian (not Teacher/Staff Admin) can still submit
+        their own leave request."""
+        librarian_user = User.objects.create_user(
+            username="dashlibrarian", password="pass12345", role=User.Role.LIBRARIAN
+        )
+        Staff.objects.create(
+            user=librarian_user, school=self.school, staff_id="STF702",
+            job_title="Librarian", date_hired=datetime.date(2024, 1, 1),
+        )
+        self.client.logout()
+        self.client.login(username="dashlibrarian", password="pass12345")
+        response = self.client.get(reverse("dashboard:my_leave_requests"))
+        self.assertEqual(response.status_code, 200)
+
+    def test_non_staff_user_gets_404_on_my_leave_requests(self):
+        self.client.logout()
+        parent_user = User.objects.create_user(
+            username="dashparentnotstaff", password="pass12345", role=User.Role.PARENT
+        )
+        self.client.login(username="dashparentnotstaff", password="pass12345")
+        response = self.client.get(reverse("dashboard:my_leave_requests"))
+        self.assertEqual(response.status_code, 404)
