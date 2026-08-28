@@ -155,3 +155,52 @@ SPECTACULAR_SETTINGS = {
     "SERVE_INCLUDE_SCHEMA": False,
     "SCHEMA_PATH_PREFIX": r"/api/v1",
 }
+
+# =============================================================================
+# Phase 23 — Supabase Storage (spec §41 'Deployment', §42 'Environment
+# Configuration'). Read here; actually wired to django-storages'
+# S3Boto3Storage in dev.py/prod.py, not here, since dev and prod make
+# different decisions about whether to use it (see those files).
+#
+# IMPORTANT: these are dedicated S3-protocol access keys generated in
+# the Supabase dashboard under Storage -> S3 Connection — NOT the same
+# as SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY (those authenticate
+# against Supabase's REST/GraphQL API, not the S3-compatible Storage
+# API this settings block talks to).
+# =============================================================================
+
+SUPABASE_STORAGE_ENDPOINT_URL = env(
+    "SUPABASE_STORAGE_ENDPOINT_URL", default=""
+)  # e.g. https://<project-ref>.supabase.co/storage/v1/s3
+SUPABASE_STORAGE_ACCESS_KEY_ID = env("SUPABASE_STORAGE_ACCESS_KEY_ID", default="")
+SUPABASE_STORAGE_SECRET_ACCESS_KEY = env("SUPABASE_STORAGE_SECRET_ACCESS_KEY", default="")
+SUPABASE_STORAGE_BUCKET_NAME = env("SUPABASE_STORAGE_BUCKET_NAME", default="sms-media")
+SUPABASE_STORAGE_REGION = env("SUPABASE_STORAGE_REGION", default="us-east-1")
+# Private bucket + short-lived signed URLs is the safe default here: this
+# bucket holds student/staff photographs, report cards, transcripts, and
+# assignment submissions — none of that should ever be a permanently
+# public, guessable URL. AWS_QUERYSTRING_EXPIRE controls how long a
+# generated URL stays valid (seconds) before it must be re-signed.
+SUPABASE_STORAGE_URL_EXPIRE_SECONDS = env.int(
+    "SUPABASE_STORAGE_URL_EXPIRE_SECONDS", default=3600
+)
+
+
+def supabase_storage_options() -> dict:
+    """Shared S3Boto3Storage kwargs for both dev (opt-in) and prod
+    (required) use — kept in one place so the two settings files can't
+    drift apart on the security-relevant options (private ACL, signed
+    URLs, path-style addressing which Supabase's S3 gateway requires)."""
+    return {
+        "access_key": SUPABASE_STORAGE_ACCESS_KEY_ID,
+        "secret_key": SUPABASE_STORAGE_SECRET_ACCESS_KEY,
+        "bucket_name": SUPABASE_STORAGE_BUCKET_NAME,
+        "endpoint_url": SUPABASE_STORAGE_ENDPOINT_URL,
+        "region_name": SUPABASE_STORAGE_REGION,
+        "default_acl": None,  # Supabase's S3 gateway rejects ACL headers entirely
+        "querystring_auth": True,  # private bucket -> every .url is a signed URL
+        "querystring_expire": SUPABASE_STORAGE_URL_EXPIRE_SECONDS,
+        "addressing_style": "path",  # required by Supabase's S3-compatible endpoint
+        "signature_version": "s3v4",
+        "file_overwrite": False,  # never silently clobber a same-named upload
+    }
