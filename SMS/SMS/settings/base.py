@@ -2,7 +2,9 @@
 Base settings shared by all environments.
 Absolute path: SMS/SMS/settings/base.py
 """
+from datetime import timedelta
 from pathlib import Path
+
 import environ
 
 # ---------------------------------------------------------------------------
@@ -35,7 +37,10 @@ LOCAL_APPS = [
 ]
 
 THIRD_PARTY_APPS = [
-    # DRF added in Phase 16
+    "rest_framework",
+    "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
+    "drf_spectacular",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -107,3 +112,46 @@ MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# =============================================================================
+# Phase 22 — REST API (spec §25/§26). API-first: this exposes the same
+# service-layer functions the Django template views already call (Phases
+# 4-21), never duplicating business logic — see smsApp/api/views.py.
+# =============================================================================
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ),
+    "DEFAULT_PERMISSION_CLASSES": (
+        "rest_framework.permissions.IsAuthenticated",
+    ),
+    "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.URLPathVersioning",
+    "DEFAULT_VERSION": "v1",
+    "ALLOWED_VERSIONS": ["v1"],
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 25,
+}
+
+SIMPLE_JWT = {
+    # Short-lived access token + longer refresh token is the standard
+    # mobile-client pattern (spec §26 'Flutter readiness') — access
+    # tokens expiring quickly limits the blast radius of a leaked token
+    # on a phone, while the refresh token keeps the user logged in.
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "AUTH_HEADER_TYPES": ("Bearer",),
+}
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "School Management System API",
+    "DESCRIPTION": "REST API for the SMS platform — powers the Flutter "
+                    "mobile clients (spec §26) alongside the Django "
+                    "template dashboards.",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "SCHEMA_PATH_PREFIX": r"/api/v1",
+}
