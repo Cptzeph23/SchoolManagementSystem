@@ -1,0 +1,36 @@
+<!-- Absolute path: SMS/templates/dashboard/teacher/assessments.html -->
+{% extends "dashboard/teacher/_teacher_base.html" %}
+{% block title %}Assessments — SMS{% endblock %}
+
+{% block breadcrumbs %}
+    <li class="breadcrumb-item"><a href="{% url 'dashboard:home' %}">Dashboard</a></li>
+    <li class="breadcrumb-item active">Assessments</li>
+{% endblock %}
+
+{% block content %}
+<h3 class="mb-4">Assessments</h3>
+<p class="text-muted">Assessment instances are scheduled against weighting structures configured by Academic Admin.</p>
+
+<div class="card sms-stat-card p-3">
+    <table class="table table-hover align-middle mb-0">
+        <thead>
+            <tr><th>Title</th><th>Class / Subject</th><th>Component</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody>
+        {% for a in assessments %}
+            <tr>
+                <td>{{ a.title }}</td>
+                <td>{{ a.class_subject.class_group }} - {{ a.class_subject.subject.name }}</td>
+                <td>{{ a.component }}</td>
+                <td><span class="badge bg-secondary">{{ a.get_workflow_status_display }}</span></td>
+                <td class="text-end">
+                    <a class="btn btn-sm btn-outline-secondary" href="{% url 'dashboard:teacher_marks_entry' a.pk %}">Enter Marks</a>
+                </td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="5" class="text-muted">No assessments scheduled yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
