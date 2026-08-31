@@ -44,3 +44,4 @@ if env.bool("USE_SUPABASE_STORAGE_IN_DEV", default=False):
             "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
         },
     }
+
