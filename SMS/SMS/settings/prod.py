@@ -72,6 +72,9 @@ STORAGES = {
         "OPTIONS": supabase_storage_options(),
     },
     "staticfiles": {
-        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        # Whitenoise's compressed+hashed storage — enables long-lived
+        # browser caching (filename changes when content changes) plus
+        # gzip/brotli compression, without needing a separate CDN.
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     },
 }
