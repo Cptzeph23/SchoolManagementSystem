@@ -3,6 +3,7 @@ import datetime
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.urls import reverse
@@ -118,6 +119,12 @@ from .services import (
     transition_assessment_workflow,
     validate_grade_bands_no_overlap,
     verify_transcript,
+)
+from .validators import (
+    validate_document_content,
+    validate_file_size,
+    validate_image_content,
+    validate_pdf_content,
 )
 
 User = get_user_model()
@@ -2756,6 +2763,93 @@ class TeacherDashboardTests(TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertTrue(CourseMaterial.objects.filter(title="Intro to Algebra").exists())
 
+    def test_upload_material_with_valid_pdf_is_validated_and_renamed(self):
+        """Regression test: file_validation.validate_upload() existed but
+        was never actually called from any view — every upload endpoint
+        accepted files with zero validation. Confirms a real PDF passes
+        and is renamed to a UUID (spec §29 'never trust filenames
+        supplied by users'), not stored under the user-supplied name."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        pdf_bytes = b"%PDF-1.4\n" + b"0" * 100
+        upload = SimpleUploadedFile(
+            "../../etc/passwd.pdf", pdf_bytes, content_type="application/pdf"
+        )
+        response = self.client.post(
+            reverse("dashboard:teacher_materials"),
+            {
+                "class_subject_id": self.class_subject.pk,
+                "material_type": CourseMaterial.MaterialType.PDF,
+                "title": "Syllabus", "file": upload,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        material = CourseMaterial.objects.get(title="Syllabus")
+        self.assertNotIn("passwd", material.file.name)
+        self.assertNotIn("..", material.file.name)
+        self.assertTrue(material.file.name.endswith(".pdf"))
+
+    def test_upload_material_rejects_disguised_executable(self):
+        """A file with a .pdf extension but non-PDF content (sniffed via
+        libmagic, not trusted from the extension or browser Content-Type)
+        must be rejected."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        fake_pdf = SimpleUploadedFile(
+            "malware.pdf", b"MZ\x90\x00" + b"\x00" * 100,  # PE/EXE header
+            content_type="application/pdf",
+        )
+        response = self.client.post(
+            reverse("dashboard:teacher_materials"),
+            {
+                "class_subject_id": self.class_subject.pk,
+                "material_type": CourseMaterial.MaterialType.PDF,
+                "title": "Malicious", "file": fake_pdf,
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(CourseMaterial.objects.filter(title="Malicious").exists())
+
+    def test_upload_material_rejects_oversized_file(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        oversized = SimpleUploadedFile(
+            "huge.jpg", b"\xff\xd8\xff" + b"0" * (6 * 1024 * 1024),  # 6MB, JPEG-ish header
+            content_type="image/jpeg",
+        )
+        response = self.client.post(
+            reverse("dashboard:teacher_materials"),
+            {
+                "class_subject_id": self.class_subject.pk,
+                "material_type": CourseMaterial.MaterialType.IMAGE,
+                "title": "Too Big", "file": oversized,
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(CourseMaterial.objects.filter(title="Too Big").exists())
+
+    def test_submit_assignment_with_file_is_validated(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        assignment = Assignment.objects.create(
+            class_subject=self.class_subject, term=self.term, title="Essay Upload",
+            deadline=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+        )
+        # setUp() logs in as the teacher; switch to the student for this
+        # student-facing submission action.
+        self.client.logout()
+        self.client.login(username=self.student.user.username, password="pass12345")
+        essay = SimpleUploadedFile(
+            "essay.pdf", b"%PDF-1.4\n" + b"0" * 100, content_type="application/pdf",
+        )
+        response = self.client.post(
+            reverse("dashboard:student_submit_assignment", args=[assignment.pk]),
+            {"submitted_file": essay},
+        )
+        self.assertEqual(response.status_code, 302)
+        submission = AssignmentSubmission.objects.get(assignment=assignment, student=self.student)
+        self.assertNotIn("essay", submission.submitted_file.name)
+
     def test_post_course_announcement_via_dashboard(self):
         response = self.client.post(
             reverse("dashboard:teacher_announcements", args=[self.class_subject.pk]),
@@ -3393,3 +3487,93 @@ class AcademicAdminDashboardTests(TestCase):
             {"status": "NOT_A_REAL_STATUS"},
         )
         self.assertEqual(response.status_code, 403)
+
+
+class UploadValidatorTests(TestCase):
+    """Phase 24: spec §27 'File validation', 'Upload size restrictions'.
+    Confirms validators sniff actual file content via libmagic rather
+    than trusting the filename/extension or a spoofed Content-Type."""
+
+    # A real, complete, minimal valid 1x1 PNG.
+    REAL_PNG_BYTES = bytes.fromhex(
+        "89504e470d0a1a0a0000000d494844520000000100000001080600000031e97a"
+        "c00000000a49444154789c6300010000050001a5a0f5980000000049454e44ae"
+        "426082"
+    )
+    # A real, minimal valid PDF.
+    REAL_PDF_BYTES = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+        b"2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF"
+    )
+
+    def test_real_image_passes_content_validation(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        f = SimpleUploadedFile("photo.png", self.REAL_PNG_BYTES, content_type="image/png")
+        validate_image_content(f)  # must not raise
+
+    def test_renamed_non_image_fails_content_validation_even_with_image_extension(self):
+        """The core spoofing scenario spec §27 is guarding against: a
+        file that is NOT actually an image, renamed to look like one."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        fake_image = SimpleUploadedFile(
+            "totally_a_photo.jpg", b"this is definitely not image data, just text",
+            content_type="image/jpeg",  # the spoofed header alone must not be trusted
+        )
+        with self.assertRaises(ValidationError):
+            validate_image_content(fake_image)
+
+    def test_real_pdf_passes_pdf_validation(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        f = SimpleUploadedFile("report.pdf", self.REAL_PDF_BYTES, content_type="application/pdf")
+        validate_pdf_content(f)  # must not raise
+
+    def test_image_rejected_by_pdf_only_validator(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        f = SimpleUploadedFile("photo.png", self.REAL_PNG_BYTES, content_type="image/png")
+        with self.assertRaises(ValidationError):
+            validate_pdf_content(f)
+
+    def test_document_validator_accepts_both_images_and_pdfs(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        image = SimpleUploadedFile("photo.png", self.REAL_PNG_BYTES, content_type="image/png")
+        pdf = SimpleUploadedFile("doc.pdf", self.REAL_PDF_BYTES, content_type="application/pdf")
+        validate_document_content(image)  # must not raise
+        validate_document_content(pdf)  # must not raise
+
+    def test_file_size_validator_rejects_oversized_file(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        oversized = SimpleUploadedFile("big.png", b"x" * (6 * 1024 * 1024))  # 6 MB
+        validator = validate_file_size(5)  # 5 MB limit
+        with self.assertRaises(ValidationError):
+            validator(oversized)
+
+    def test_file_size_validator_accepts_file_within_limit(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        small_file = SimpleUploadedFile("small.png", b"x" * 1024)  # 1 KB
+        validator = validate_file_size(5)
+        validator(small_file)  # must not raise
+
+    def test_school_logo_field_actually_enforces_validators_via_full_clean(self):
+        """End-to-end: confirms the validators are actually wired onto
+        the model field (not just defined and unused) by going through
+        Django's real validation path, full_clean(), the same path a
+        ModelForm-based upload view exercises."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        school = School(
+            name="Test School", code="VALTEST",
+            logo=SimpleUploadedFile(
+                "fake.png", b"not a real image", content_type="image/png"
+            ),
+        )
+        with self.assertRaises(ValidationError):
+            school.full_clean()
+
+    def test_school_logo_field_accepts_real_image_via_full_clean(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        school = School(
+            name="Test School 2", code="VALTEST2",
+            logo=SimpleUploadedFile(
+                "real.png", self.REAL_PNG_BYTES, content_type="image/png"
+            ),
+        )
+        school.full_clean()  # must not raise
