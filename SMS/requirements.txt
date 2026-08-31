@@ -1,8 +1,7 @@
-
 asgiref==3.12.1
 Django==6.1
 sqlparse==0.6.0
-django-environ==0.21.0
+django-environ==0.14.0
 psycopg[binary]==3.3.4
 Pillow==12.3.0
 weasyprint==69.0
@@ -14,3 +13,7 @@ requests==2.34.2
 python-magic==0.4.27
 django-storages==1.14.6
 boto3==1.43.82
+django-redis==7.0.0
+gunicorn==26.2.0
+whitenoise==6.12.0
+ 
