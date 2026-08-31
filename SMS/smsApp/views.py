@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView as DjangoLoginView
+from django.core.exceptions import ValidationError
 from django.http import Http404, HttpResponse, HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse, reverse_lazy
@@ -85,6 +86,7 @@ from .services import (
     transition_assessment_workflow,
     verify_transcript,
 )
+from .validators import validate_upload, validate_course_material_content, validate_document_content
 
 
 class LoginView(DjangoLoginView):
@@ -489,13 +491,18 @@ class StudentSubmitAssignmentView(StudentRequiredMixin, View):
         assignment = get_object_or_404(Assignment, pk=assignment_id, is_published=True)
 
         try:
+            submitted_file = validate_upload(
+                request.FILES.get("submitted_file"),
+                validate_document_content,
+                size_limit_mb=25,
+            )
             submit_assignment(
                 assignment=assignment, student=student,
-                submitted_file=request.FILES.get("submitted_file"),
+                submitted_file=submitted_file,
                 submitted_text=request.POST.get("submitted_text", ""),
                 request=request,
             )
-        except ValueError as exc:
+        except (ValueError, ValidationError) as exc:
             return HttpResponseForbidden(str(exc))
 
         return redirect("dashboard:student_lms")
@@ -1103,12 +1110,31 @@ class TeacherMaterialsView(TeacherRequiredMixin, TemplateView):
             teacher=staff, class_subject=class_subject, is_active=True
         ).values_list("term_id", flat=True).first()
 
+        # Size limit varies by material type: images are smaller, videos/presentations larger
+        material_type = request.POST.get("material_type")
+        size_limit_mb = {
+            CourseMaterial.MaterialType.IMAGE: 5,
+            CourseMaterial.MaterialType.PDF: 200,
+            CourseMaterial.MaterialType.DOCUMENT: 200,
+            CourseMaterial.MaterialType.VIDEO: 200,
+            CourseMaterial.MaterialType.PRESENTATION: 200,
+        }.get(material_type, 200)
+
+        try:
+            file_obj = validate_upload(
+                request.FILES.get("file"),
+                validate_course_material_content,
+                size_limit_mb=size_limit_mb,
+            )
+        except ValidationError as exc:
+            return HttpResponseForbidden(str(exc))
+
         CourseMaterial.objects.create(
             class_subject=class_subject, term_id=term_id,
-            material_type=request.POST.get("material_type"),
+            material_type=material_type,
             title=request.POST.get("title", ""),
             description=request.POST.get("description", ""),
-            file=request.FILES.get("file"),
+            file=file_obj,
             external_url=request.POST.get("external_url", ""),
             text_content=request.POST.get("text_content", ""),
             uploaded_by=staff,

@@ -19,8 +19,12 @@ category of requirement as WeasyPrint's Cairo/Pango dependency (Phase 9).
 """
 from __future__ import annotations
 
+import os
+import uuid
+
 import magic
 from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import UploadedFile
 from django.template.defaultfilters import filesizeformat
 from django.utils.deconstruct import deconstructible
 
@@ -112,3 +116,51 @@ def validate_course_material_content(file_obj):
         file_obj, COURSE_MATERIAL_MIME_TYPES,
         "PDFs, images, videos, presentations, or documents",
     )
+
+
+def validate_upload(
+    uploaded_file: UploadedFile | None,
+    content_validator,
+    size_limit_mb: int,
+) -> UploadedFile | None:
+    """Validate and rename an uploaded file.
+
+    Performs both size and content validation, then renames the file to
+    remove the original filename (security: prevents information leaks
+    and executable detection by name extension). Returns the file object
+    with a renamed name attribute.
+
+    Raises ValidationError if validation fails. Returns None if the input
+    file is None (supporting optional file uploads).
+
+    Args:
+        uploaded_file: The file from request.FILES, or None
+        content_validator: Function like validate_document_content that
+                          checks file content (magic bytes)
+        size_limit_mb: Max file size in MB (passed to MaxFileSizeValidator)
+
+    Returns:
+        The same UploadedFile object, with name attribute changed to
+        <uuid>.<extension> to strip the original filename.
+
+    Raises:
+        ValidationError: If file size or content validation fails.
+    """
+    if uploaded_file is None:
+        return None
+
+    # Validate file size
+    size_validator = MaxFileSizeValidator(size_limit_mb)
+    size_validator(uploaded_file)
+
+    # Validate file content
+    content_validator(uploaded_file)
+
+    # Rename: extract extension and generate a new name without the original filename
+    # This prevents info leaks and avoids relying on the filename for type detection
+    _, ext = os.path.splitext(uploaded_file.name)
+    # Generate a random component; Django's default upload_to will prepend the path
+    new_name = f"{uuid.uuid4().hex}{ext}"
+    uploaded_file.name = new_name
+
+    return uploaded_file
