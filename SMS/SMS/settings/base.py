@@ -47,6 +47,10 @@ INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    # WhiteNoise serves static files directly from the app process (no
+    # separate nginx/CDN needed to start on Render) — must sit
+    # immediately after SecurityMiddleware per whitenoise's own docs.
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -94,6 +98,32 @@ LOGIN_REDIRECT_URL = "dashboard:home"
 LOGOUT_REDIRECT_URL = "dashboard:login"
 
 # ---------------------------------------------------------------------------
+# Cache (Phase 24, spec §41 lists REDIS_URL as an expected env var). Used
+# for rate limiting (spec §27) — login lockout and DRF throttling both
+# need a cache shared across worker processes to actually be effective;
+# Django's default LocMemCache is per-process and would let an attacker
+# bypass a lockout just by hitting a different gunicorn worker.
+#
+# REDIS_URL unset -> LocMemCache, so a fresh clone still runs without
+# Redis installed (dev convenience, same principle as Phase 1's sqlite
+# fallback for DATABASE_URL). REDIS_URL set -> Redis, required in
+# practice for prod to have real cross-worker rate limiting.
+# ---------------------------------------------------------------------------
+REDIS_URL = env("REDIS_URL", default="")
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "LOCATION": REDIS_URL,
+            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+        }
+    }
+else:
+    CACHES = {
+        "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}
+    }
+
+# ---------------------------------------------------------------------------
 # Internationalization
 # ---------------------------------------------------------------------------
 LANGUAGE_CODE = "en-us"
@@ -132,6 +162,18 @@ REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 25,
+    # Spec §27 'Rate limiting where appropriate'. Anonymous throttling
+    # matters most on /api/v1/auth/token/ (credential-stuffing target);
+    # authenticated throttling is a general abuse backstop, generous
+    # enough that no legitimate dashboard/app usage should ever hit it.
+    "DEFAULT_THROTTLE_CLASSES": (
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ),
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "20/minute",
+        "user": "300/minute",
+    },
 }
 
 SIMPLE_JWT = {
