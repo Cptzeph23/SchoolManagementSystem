@@ -2239,11 +2239,41 @@ def compute_school_academic_summary(*, school) -> dict[str, Any]:
 
     return {
         "total_students": students.filter(is_active=True).count(),
-        "status_breakdown": {
-            status: students.filter(status=status).count()
-            for status, _ in Student.Status.choices
-        },
+        "status_breakdown": [
+            {"code": status, "label": label, "count": students.filter(status=status).count()}
+            for status, label in Student.Status.choices
+        ],
         "current_academic_year": current_year,
         "current_term": current_term,
         "pending_result_approvals": pending_approvals,
+    }
+
+
+def compute_school_attendance_summary(*, school, days: int = 30) -> dict[str, Any]:
+    """Spec §5 Super Admin overview 'Attendance Overview' card. A rolling
+    window (default 30 days), not all-time — an all-time percentage
+    across a school's whole history would be a nearly-meaningless number
+    that never moves; a recent window is what actually tells an admin
+    "is attendance currently healthy."""
+    from django.utils import timezone
+
+    from .models import AttendanceRecord
+
+    today = timezone.localtime(timezone.now()).date()
+    window_start = today - datetime.timedelta(days=days)
+
+    records = AttendanceRecord.objects.filter(
+        session__class_subject__class_group__school=school,
+        session__date__gte=window_start, session__date__lte=today,
+    )
+    total = records.count()
+    present = records.filter(status=AttendanceRecord.Status.PRESENT).count()
+
+    return {
+        "window_days": days,
+        "total_records": total,
+        "present_count": present,
+        "attendance_rate_percent": (
+            round((present / total) * 100, 1) if total > 0 else None
+        ),
     }
