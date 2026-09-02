@@ -4,13 +4,17 @@ from decimal import Decimal
 
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView as DjangoLoginView
-from django.core.exceptions import ValidationError
 from django.http import Http404, HttpResponse, HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse, reverse_lazy
 from django.views import View
 from django.views.generic import RedirectView, TemplateView
 
+from .file_validation import (
+    COURSE_MATERIAL_TYPE_TO_CATEGORY,
+    FileValidationError,
+    validate_upload,
+)
 from .models import (
     AcademicYear,
     Announcement,
@@ -19,6 +23,7 @@ from .models import (
     Assignment,
     AssignmentSubmission,
     AttendanceRecord,
+    AuditLog,
     AttendanceSession,
     Class,
     ClassSubject,
@@ -57,6 +62,7 @@ from .services import (
     apply_financial_adjustment,
     change_student_status,
     compute_school_academic_summary,
+    compute_school_attendance_summary,
     compute_school_financial_summary,
     compute_staff_workload,
     compute_student_account_summary,
@@ -86,22 +92,56 @@ from .services import (
     transition_assessment_workflow,
     verify_transcript,
 )
-from .validators import validate_upload, validate_course_material_content, validate_document_content
 
 
 class LoginView(DjangoLoginView):
     """Wraps Django's built-in LoginView to also write LoginHistory/AuditLog
-    entries (spec §5 'View login history', §27 audit logging)."""
+    entries (spec §5 'View login history', §27 audit logging) and enforce
+    a per-IP rate limit on failed attempts (spec §27 'Rate limiting where
+    appropriate') — the login form is the most direct brute-force/
+    credential-stuffing target in the whole application."""
 
     template_name = "registration/login.html"
     redirect_authenticated_user = True
 
+    MAX_FAILED_ATTEMPTS = 5
+    LOCKOUT_WINDOW_SECONDS = 300  # 5 minutes
+
+    def _client_ip(self) -> str:
+        forwarded = self.request.META.get("HTTP_X_FORWARDED_FOR")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return self.request.META.get("REMOTE_ADDR", "unknown")
+
+    def _lockout_cache_key(self) -> str:
+        return f"login_failed_attempts:{self._client_ip()}"
+
+    def dispatch(self, request, *args, **kwargs):
+        from django.core.cache import cache
+
+        attempts = cache.get(self._lockout_cache_key(), 0)
+        if attempts >= self.MAX_FAILED_ATTEMPTS:
+            return render(
+                request, "registration/login_locked.html",
+                {"retry_after_seconds": self.LOCKOUT_WINDOW_SECONDS}, status=429,
+            )
+        return super().dispatch(request, *args, **kwargs)
+
     def form_valid(self, form):
+        from django.core.cache import cache
+
+        cache.delete(self._lockout_cache_key())  # successful login clears the counter
         response = super().form_valid(form)
         record_login(user=form.get_user(), request=self.request, was_successful=True)
         return response
 
     def form_invalid(self, form):
+        from django.core.cache import cache
+
+        key = self._lockout_cache_key()
+        attempts = cache.get(key, 0) + 1
+        cache.set(key, attempts, timeout=self.LOCKOUT_WINDOW_SECONDS)
+
         # Only log a failed attempt if a real user was targeted, to avoid
         # creating noise/PII rows for arbitrary junk usernames.
         username = form.data.get("username")
@@ -140,7 +180,13 @@ class AccountLockedView(TemplateView):
 class SuperAdminDashboardView(RoleRequiredMixin, TemplateView):
     """Spec §5 Super Admin Dashboard — top-level stat cards. Detailed
     sub-pages (user management, school configuration, audit log browser)
-    are separate views added as those workflows are built out."""
+    are separate views added as those workflows are built out.
+
+    Finance and Attendance cards were placeholder text ("module pending")
+    left over from Phase 4, written before those modules existed
+    (Phase 6 attendance, Phase 12/19 finance). Fixed here to show real
+    aggregates via the same service functions the Finance/Academic Admin
+    dashboards already use — no new business logic, just wiring."""
 
     template_name = "dashboard/super_admin.html"
     allowed_roles = [User.Role.SUPER_ADMIN]
@@ -151,6 +197,15 @@ class SuperAdminDashboardView(RoleRequiredMixin, TemplateView):
         current_year = AcademicYear.objects.filter(is_current=True).first()
         current_term = Term.objects.filter(is_current=True).first()
 
+        # Same single-school resolution convention used by every other
+        # admin dashboard (Finance/Staff/Academic Admin) — see those
+        # views' get_school() docstrings for the multi-school caveat.
+        from .models import School
+        school = School.objects.first()
+
+        financial_summary = compute_school_financial_summary(school=school) if school else {}
+        attendance_summary = compute_school_attendance_summary(school=school) if school else {}
+
         context.update(
             {
                 "total_students": Student.objects.filter(is_active=True).count(),
@@ -158,8 +213,10 @@ class SuperAdminDashboardView(RoleRequiredMixin, TemplateView):
                 "active_classes": Class.objects.filter(is_active=True).count(),
                 "current_academic_year": current_year,
                 "current_term": current_term,
-                # Fees collected/outstanding populate once the Finance module
-                # (Phase 19) exists; shown as "—" in the template until then.
+                "financial_summary": financial_summary,
+                "attendance_summary": attendance_summary,
+                "recent_audit_logs": AuditLog.objects.select_related("actor")
+                .order_by("-created_at")[:10],
             }
         )
         return context
@@ -490,19 +547,26 @@ class StudentSubmitAssignmentView(StudentRequiredMixin, View):
         student = self.get_student(request)
         assignment = get_object_or_404(Assignment, pk=assignment_id, is_published=True)
 
+        submitted_file = request.FILES.get("submitted_file")
+        if submitted_file:
+            try:
+                result = validate_upload(
+                    file_obj=submitted_file, category="ASSIGNMENT_SUBMISSION",
+                )
+            except FileValidationError as exc:
+                return HttpResponseForbidden(str(exc))
+            # Spec §29 'never trust filenames supplied by users' — the file
+            # is renamed to a fresh UUID before it ever reaches storage.
+            submitted_file.name = result["safe_filename"]
+
         try:
-            submitted_file = validate_upload(
-                request.FILES.get("submitted_file"),
-                validate_document_content,
-                size_limit_mb=25,
-            )
             submit_assignment(
                 assignment=assignment, student=student,
                 submitted_file=submitted_file,
                 submitted_text=request.POST.get("submitted_text", ""),
                 request=request,
             )
-        except (ValueError, ValidationError) as exc:
+        except ValueError as exc:
             return HttpResponseForbidden(str(exc))
 
         return redirect("dashboard:student_lms")
@@ -1110,31 +1174,27 @@ class TeacherMaterialsView(TeacherRequiredMixin, TemplateView):
             teacher=staff, class_subject=class_subject, is_active=True
         ).values_list("term_id", flat=True).first()
 
-        # Size limit varies by material type: images are smaller, videos/presentations larger
         material_type = request.POST.get("material_type")
-        size_limit_mb = {
-            CourseMaterial.MaterialType.IMAGE: 5,
-            CourseMaterial.MaterialType.PDF: 200,
-            CourseMaterial.MaterialType.DOCUMENT: 200,
-            CourseMaterial.MaterialType.VIDEO: 200,
-            CourseMaterial.MaterialType.PRESENTATION: 200,
-        }.get(material_type, 200)
-
-        try:
-            file_obj = validate_upload(
-                request.FILES.get("file"),
-                validate_course_material_content,
-                size_limit_mb=size_limit_mb,
-            )
-        except ValidationError as exc:
-            return HttpResponseForbidden(str(exc))
+        uploaded_file = request.FILES.get("file")
+        if uploaded_file:
+            category = COURSE_MATERIAL_TYPE_TO_CATEGORY.get(material_type)
+            if category is None:
+                return HttpResponseForbidden(
+                    f"'{material_type}' does not accept a file upload; use "
+                    f"external_url or text_content instead."
+                )
+            try:
+                result = validate_upload(file_obj=uploaded_file, category=category)
+            except FileValidationError as exc:
+                return HttpResponseForbidden(str(exc))
+            uploaded_file.name = result["safe_filename"]
 
         CourseMaterial.objects.create(
             class_subject=class_subject, term_id=term_id,
             material_type=material_type,
             title=request.POST.get("title", ""),
             description=request.POST.get("description", ""),
-            file=file_obj,
+            file=uploaded_file,
             external_url=request.POST.get("external_url", ""),
             text_content=request.POST.get("text_content", ""),
             uploaded_by=staff,
