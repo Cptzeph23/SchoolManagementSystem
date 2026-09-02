@@ -10,7 +10,7 @@ from django.urls import reverse, reverse_lazy
 from django.views import View
 from django.views.generic import RedirectView, TemplateView
 
-from .file_validation import (
+from .validators import (
     COURSE_MATERIAL_TYPE_TO_CATEGORY,
     FileValidationError,
     validate_upload,

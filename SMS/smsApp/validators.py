@@ -27,7 +27,7 @@ from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import UploadedFile
 from django.template.defaultfilters import filesizeformat
 from django.utils.deconstruct import deconstructible
-
+from django.core.exceptions import ValidationError
 
 @deconstructible
 class MaxFileSizeValidator:
@@ -164,3 +164,16 @@ def validate_upload(
     uploaded_file.name = new_name
 
     return uploaded_file
+
+# Define the custom exception expected by views.py
+class FileValidationError(ValidationError):
+    """Exception raised when file validation fails."""
+    pass
+
+# Map MIME types / categories for LMS materials
+COURSE_MATERIAL_TYPE_TO_CATEGORY = {
+    "pdf": PDF_MIME_TYPES,
+    "image": IMAGE_MIME_TYPES,
+    "document": DOCUMENT_MIME_TYPES,
+    "material": COURSE_MATERIAL_MIME_TYPES,
+}
