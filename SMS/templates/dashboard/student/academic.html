@@ -32,6 +32,27 @@
 </div>
 
 <div class="card sms-stat-card p-3 mb-4">
+    <div class="text-muted small mb-2">Graded Quiz Results</div>
+    {% if quiz_rows %}
+    <table class="table table-sm">
+        <thead><tr><th>Subject</th><th>Quiz</th><th>Score</th><th>Grade</th></tr></thead>
+        <tbody>
+        {% for row in quiz_rows %}
+            <tr>
+                <td>{{ row.subject }}</td>
+                <td>{{ row.title }}</td>
+                <td>{{ row.score }} / {{ row.maximum }} ({{ row.percentage }}%)</td>
+                <td>{{ row.grade }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+        <p class="text-muted mb-0">No fully graded quizzes for the current term.</p>
+    {% endif %}
+</div>
+
+<div class="card sms-stat-card p-3 mb-4">
     <div class="text-muted small mb-2">Report Books</div>
     {% if report_cards %}
         <ul class="list-unstyled mb-0">

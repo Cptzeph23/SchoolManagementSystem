@@ -454,6 +454,7 @@ class StudentAcademicView(StudentRequiredMixin, TemplateView):
         term = self.get_current_term(student)
 
         subject_rows = []
+        quiz_rows = []
         if term is not None:
             class_subjects = ClassSubject.objects.filter(
                 enrollments__student=student, enrollments__academic_year=term.academic_year
@@ -471,12 +472,53 @@ class StudentAcademicView(StudentRequiredMixin, TemplateView):
                     "is_complete": summary["is_complete"],
                 })
 
+            # Quizzes are stored separately from official AssessmentMark rows.
+            # Keep them separate from Current Term Results because quizzes have
+            # no configured assessment-component weight, but expose their
+            # teacher-assigned grades from the Academic page as well.
+            quizzes = Quiz.objects.filter(
+                class_subject__in=class_subjects,
+                term=term,
+                is_published=True,
+            ).select_related("class_subject__subject")
+            latest_attempts = {
+                attempt.quiz_id: attempt
+                for attempt in QuizAttempt.objects.filter(
+                    student=student, quiz__in=quizzes
+                ).order_by("attempt_number")
+            }
+            for quiz in quizzes:
+                attempt = latest_attempts.get(quiz.pk)
+                if attempt is None or not attempt.is_fully_graded:
+                    continue
+                maximum = sum(
+                    (question.marks for question in quiz.questions.all()),
+                    Decimal("0"),
+                )
+                percentage = (
+                    (attempt.total_score / maximum * Decimal("100")).quantize(Decimal("0.01"))
+                    if maximum > 0 and attempt.total_score is not None else None
+                )
+                band = (
+                    get_grade_for_mark(grading_scheme, percentage)
+                    if grading_scheme and percentage is not None else None
+                )
+                quiz_rows.append({
+                    "subject": quiz.class_subject.subject.name,
+                    "title": quiz.title,
+                    "score": attempt.total_score,
+                    "maximum": maximum,
+                    "percentage": percentage,
+                    "grade": band.grade if band else "-",
+                })
+
         report_cards = ReportCard.objects.filter(student=student).select_related("term")
 
         context.update({
             "student": student,
             "current_term": term,
             "subject_rows": subject_rows,
+            "quiz_rows": quiz_rows,
             "report_cards": report_cards,
         })
         return context

@@ -21,6 +21,13 @@
                     <option value="{{ cs.pk }}">{{ cs.class_group }} - {{ cs.subject.name }}</option>
                 {% endfor %}
             </select>
+            {% if not class_subjects %}
+                <div class="form-text text-danger">
+                    No options are available. In Django admin, create a Class Subject
+                    for the class, then create an active Teaching Assignment linking it
+                    to this teacher and the current term.
+                </div>
+            {% endif %}
         </div>
         <div class="col-md-3">
             <input type="text" name="title" class="form-control" placeholder="Title" required>
