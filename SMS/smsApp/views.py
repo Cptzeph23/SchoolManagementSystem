@@ -2,6 +2,7 @@
 import datetime
 from decimal import Decimal
 
+from django.contrib.auth import logout as auth_logout
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView as DjangoLoginView
 from django.http import Http404, HttpResponse, HttpResponseForbidden
@@ -150,6 +151,25 @@ class LoginView(DjangoLoginView):
             if user:
                 record_login(user=user, request=self.request, was_successful=False)
         return super().form_invalid(form)
+
+
+class LogoutView(View):
+    """End the browser session and return the user to the login page.
+
+    The dashboard profile menu uses a normal link, so GET must be supported
+    for that click to work across every dashboard base template. POST is also
+    accepted for clients that choose the form-based logout pattern.
+    """
+
+    def _logout(self, request):
+        auth_logout(request)
+        return redirect("dashboard:login")
+
+    def get(self, request):
+        return self._logout(request)
+
+    def post(self, request):
+        return self._logout(request)
 
 
 class DashboardRouterView(LoginRequiredMixin, RedirectView):

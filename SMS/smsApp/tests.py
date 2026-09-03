@@ -380,6 +380,17 @@ class AuthAndDashboardTests(TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("dashboard:login"), response.url)
 
+    def test_logout_link_ends_session_and_redirects_to_login(self):
+        self.client.login(username="admin1", password="pass12345")
+        response = self.client.get(reverse("dashboard:logout"))
+
+        self.assertRedirects(response, reverse("dashboard:login"))
+        dashboard_response = self.client.get(reverse("dashboard:super_admin"))
+        self.assertRedirects(
+            dashboard_response,
+            f"{reverse('dashboard:login')}?next={reverse('dashboard:super_admin')}",
+        )
+
     def test_createsuperuser_account_gets_super_admin_role_and_dashboard(self):
         """Regression test: `createsuperuser` sets is_superuser=True but has
         no concept of our custom `role` field, so it would otherwise stay at
