@@ -79,6 +79,7 @@ from .services import (
     get_children_for_guardian,
     get_dashboard_url_for_role,
     get_grade_for_mark,
+    log_audit,
     mark_attendance,
     mark_notification_read,
     reactivate_staff,
@@ -456,6 +457,111 @@ class StudentDashboardView(StudentRequiredMixin, TemplateView):
             "account_summary": account_summary,
             "unread_notifications": unread_notifications,
         })
+        return context
+
+
+class SuperAdminRequiredMixin(RoleRequiredMixin):
+    allowed_roles = [User.Role.SUPER_ADMIN]
+    active_nav = None
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["active"] = self.active_nav
+        return context
+
+    def get_school(self):
+        from .models import School
+        return School.objects.first()
+
+
+class SuperAdminUsersView(SuperAdminRequiredMixin, TemplateView):
+    template_name = "dashboard/super_admin/users.html"
+    active_nav = "users"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        users = User.objects.all().order_by("-created_at")
+        search = self.request.GET.get("q", "").strip()
+        if search:
+            from django.db.models import Q
+            users = users.filter(Q(username__icontains=search) | Q(first_name__icontains=search) | Q(last_name__icontains=search) | Q(email__icontains=search))
+        context.update({"users": users, "search": search, "roles": User.Role.choices})
+        return context
+
+    def post(self, request):
+        user = get_object_or_404(User, pk=request.POST.get("user_id"))
+        action = request.POST.get("action")
+        if user.pk == request.user.pk and action in {"lock", "deactivate", "role"}:
+            return HttpResponseForbidden("You cannot disable or change your own super-admin account.")
+        previous = {"is_active": user.is_active, "is_locked": user.is_locked, "role": user.role}
+        if action == "lock":
+            user.is_locked = True
+            audit_action = AuditLog.Action.LOCK
+        elif action == "unlock":
+            user.is_locked = False
+            audit_action = AuditLog.Action.UNLOCK
+        elif action in {"activate", "deactivate"}:
+            user.is_active = action == "activate"
+            audit_action = AuditLog.Action.UPDATE
+        elif action == "role":
+            role = request.POST.get("role")
+            if role not in {value for value, _label in User.Role.choices}:
+                return HttpResponseForbidden("Invalid user role.")
+            user.role = role
+            audit_action = AuditLog.Action.ROLE_CHANGE
+        else:
+            return HttpResponseForbidden("Unsupported user action.")
+        user.save(update_fields=["is_active", "is_locked", "role", "updated_at"])
+        log_audit(actor=request.user, action=audit_action, request=request, target_model="User", target_object_id=user.pk, description=f"Updated account {user.username}.", previous_value=previous, new_value={"is_active": user.is_active, "is_locked": user.is_locked, "role": user.role})
+        return redirect("dashboard:super_admin_users")
+
+
+class SuperAdminSchoolConfigView(SuperAdminRequiredMixin, TemplateView):
+    template_name = "dashboard/super_admin/school_config.html"
+    active_nav = "school_config"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["school"] = self.get_school()
+        return context
+
+    def post(self, request):
+        school = self.get_school()
+        if school is None:
+            return HttpResponseForbidden("No school has been configured.")
+        previous = {"name": school.name, "code": school.code, "motto": school.motto, "address": school.address, "phone_number": school.phone_number, "email": school.email, "enable_position_ranking": school.enable_position_ranking}
+        school.name = request.POST.get("name", "").strip()
+        school.code = request.POST.get("code", "").strip()
+        school.motto = request.POST.get("motto", "").strip()
+        school.address = request.POST.get("address", "").strip()
+        school.phone_number = request.POST.get("phone_number", "").strip()
+        school.email = request.POST.get("email", "").strip()
+        school.enable_position_ranking = request.POST.get("enable_position_ranking") == "on"
+        if not school.name or not school.code:
+            return HttpResponseForbidden("School name and code are required.")
+        try:
+            school.save(update_fields=["name", "code", "motto", "address", "phone_number", "email", "enable_position_ranking", "updated_at"])
+        except Exception as exc:
+            return HttpResponseForbidden(str(exc))
+        log_audit(actor=request.user, action=AuditLog.Action.UPDATE, request=request, target_model="School", target_object_id=school.pk, description=f"Updated school configuration for {school.name}.", previous_value=previous, new_value={"name": school.name, "code": school.code, "motto": school.motto, "address": school.address, "phone_number": school.phone_number, "email": school.email, "enable_position_ranking": school.enable_position_ranking})
+        return redirect("dashboard:super_admin_school_config")
+
+
+class SuperAdminAuditLogsView(SuperAdminRequiredMixin, TemplateView):
+    template_name = "dashboard/super_admin/audit_logs.html"
+    active_nav = "audit_logs"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        logs = AuditLog.objects.select_related("actor").all()
+        search = self.request.GET.get("q", "").strip()
+        action = self.request.GET.get("action", "").strip()
+        if search:
+            from django.db.models import Q
+            logs = logs.filter(Q(description__icontains=search) | Q(target_model__icontains=search) | Q(target_object_id__icontains=search) | Q(actor__username__icontains=search))
+        if action:
+            logs = logs.filter(action=action)
+        context.update({"audit_logs": logs[:250], "actions": AuditLog.Action.choices, "search": search, "selected_action": action})
         return context
 
 

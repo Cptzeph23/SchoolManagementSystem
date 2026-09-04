@@ -12,6 +12,9 @@ urlpatterns = [
     path("", views.DashboardRouterView.as_view(), name="home"),
     path("coming-soon/", views.ComingSoonView.as_view(), name="coming_soon"),
     path("super-admin/", views.SuperAdminDashboardView.as_view(), name="super_admin"),
+    path("super-admin/users/", views.SuperAdminUsersView.as_view(), name="super_admin_users"),
+    path("super-admin/school-config/", views.SuperAdminSchoolConfigView.as_view(), name="super_admin_school_config"),
+    path("super-admin/audit-logs/", views.SuperAdminAuditLogsView.as_view(), name="super_admin_audit_logs"),
     path(
         "reports/<int:report_card_id>/html/",
         views.ReportCardHTMLView.as_view(), name="report_card_html",

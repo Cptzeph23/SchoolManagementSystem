@@ -3,10 +3,7 @@
 {% block title %}Super Admin Dashboard — SMS{% endblock %}
 
 {% block sidebar_items %}
-    <li class="nav-item"><a class="nav-link active" href="{% url 'dashboard:super_admin' %}"><i class="bi bi-grid-1x2 me-2"></i>Overview</a></li>
-    <li class="nav-item"><a class="nav-link disabled" href="#"><i class="bi bi-people me-2"></i>Users <span class="badge bg-secondary ms-1">soon</span></a></li>
-    <li class="nav-item"><a class="nav-link disabled" href="#"><i class="bi bi-building me-2"></i>School Config <span class="badge bg-secondary ms-1">soon</span></a></li>
-    <li class="nav-item"><a class="nav-link disabled" href="#"><i class="bi bi-journal-text me-2"></i>Audit Logs <span class="badge bg-secondary ms-1">soon</span></a></li>
+    {% include "dashboard/super_admin/_sidebar.html" %}
 {% endblock %}
 
 {% block breadcrumbs %}

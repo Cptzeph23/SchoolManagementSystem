@@ -360,6 +360,40 @@ class AuthAndDashboardTests(TestCase):
         response = self.client.get(reverse("dashboard:super_admin"))
         self.assertEqual(response.context["total_students"], 1)
 
+    def test_super_admin_sidebar_sections_are_available(self):
+        self.client.login(username="admin1", password="pass12345")
+        for name in ("super_admin_users", "super_admin_school_config", "super_admin_audit_logs"):
+            response = self.client.get(reverse(f"dashboard:{name}"))
+            self.assertEqual(response.status_code, 200)
+
+    def test_super_admin_can_update_user_role_and_audit_is_recorded(self):
+        self.client.login(username="admin1", password="pass12345")
+        response = self.client.post(
+            reverse("dashboard:super_admin_users"),
+            {"user_id": self.teacher.pk, "action": "role", "role": User.Role.CLASS_TEACHER},
+        )
+        self.assertRedirects(response, reverse("dashboard:super_admin_users"))
+        self.teacher.refresh_from_db()
+        self.assertEqual(self.teacher.role, User.Role.CLASS_TEACHER)
+        self.assertTrue(
+            AuditLog.objects.filter(
+                target_model="User", target_object_id=str(self.teacher.pk),
+                action=AuditLog.Action.ROLE_CHANGE,
+            ).exists()
+        )
+
+    def test_super_admin_can_update_school_configuration(self):
+        school = School.objects.create(name="Old School", code="OLD")
+        self.client.login(username="admin1", password="pass12345")
+        response = self.client.post(
+            reverse("dashboard:super_admin_school_config"),
+            {"name": "New School", "code": "NEW", "motto": "Learn", "enable_position_ranking": "on"},
+        )
+        self.assertRedirects(response, reverse("dashboard:super_admin_school_config"))
+        school.refresh_from_db()
+        self.assertEqual(school.name, "New School")
+        self.assertTrue(school.enable_position_ranking)
+
     def test_locked_account_cannot_reach_dashboard(self):
         self.super_admin.is_locked = True
         self.super_admin.save()
