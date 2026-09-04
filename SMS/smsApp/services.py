@@ -558,6 +558,7 @@ def render_report_html(*, report_card: "ReportCard") -> str:
     template_path = template_paths[report_card.template.template_key]
 
     context = assemble_report_data(student=report_card.student, term=report_card.term)
+    context["school_logo"] = _school_logo_data_uri(context["school"])
     context.update(
         {
             "template_config": report_card.template,
@@ -566,6 +567,29 @@ def render_report_html(*, report_card: "ReportCard") -> str:
         }
     )
     return render_to_string(template_path, context)
+
+
+def _school_logo_data_uri(school) -> str:
+    """Return the configured school logo as an embeddable image URI.
+
+    Report PDFs are rendered by WeasyPrint without a browser request context;
+    a private/relative storage URL can therefore become a broken image. The
+    logo is read through Django's configured storage and embedded directly so
+    both HTML previews and PDFs use the same reliable asset.
+    """
+    import base64
+    import mimetypes
+
+    if not school or not school.logo:
+        return ""
+    try:
+        school.logo.open("rb")
+        contents = school.logo.read()
+        school.logo.close()
+    except (OSError, ValueError):
+        return ""
+    content_type = mimetypes.guess_type(school.logo.name)[0] or "image/jpeg"
+    return f"data:{content_type};base64,{base64.b64encode(contents).decode('ascii')}"
 
 
 def generate_report_pdf(
@@ -757,6 +781,7 @@ def generate_transcript(
         "reports/transcript.html",
         {
             "school": school,
+            "school_logo": _school_logo_data_uri(school),
             "student": student,
             "transcript": transcript,
             "entries": transcript.entries.all(),
