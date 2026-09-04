@@ -2276,6 +2276,7 @@ class StudentDashboardTests(TestCase):
         assignment = Assignment.objects.create(
             class_subject=self.class_subject, term=self.term, title="Essay",
             deadline=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+            submission_format=Assignment.SubmissionFormat.TEXT_ENTRY,
         )
         response = self.client.post(
             reverse("dashboard:student_submit_assignment", args=[assignment.pk]),

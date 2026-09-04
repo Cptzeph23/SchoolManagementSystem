@@ -49,15 +49,15 @@
                             {% csrf_token %}
                             <textarea name="submitted_text" class="form-control form-control-sm mb-2" placeholder="Resubmission text (optional)"></textarea>
                             <input type="file" name="submitted_file" class="form-control form-control-sm mb-2">
-                            <button type="submit" class="btn btn-sm btn-outline-secondary">Resubmit</button>
+                            <button type="submit" class="btn btn-sm btn-outline-secondary" data-submission-format="{{ row.assignment.submission_format }}" disabled>Resubmit</button>
                         </form>
                     {% endif %}
                 {% else %}
                     <form method="post" action="{% url 'dashboard:student_submit_assignment' row.assignment.pk %}" enctype="multipart/form-data" class="mt-2">
                         {% csrf_token %}
-                        <textarea name="submitted_text" class="form-control form-control-sm mb-2" placeholder="Your answer (optional)"></textarea>
+                        <textarea name="submitted_text" class="form-control form-control-sm mb-2" placeholder="Your answer"></textarea>
                         <input type="file" name="submitted_file" class="form-control form-control-sm mb-2">
-                        <button type="submit" class="btn btn-sm btn-secondary">Submit</button>
+                        <button type="submit" class="btn btn-sm btn-secondary" data-submission-format="{{ row.assignment.submission_format }}" disabled>Submit</button>
                     </form>
                 {% endif %}
             </li>
@@ -67,6 +67,8 @@
         <p class="text-muted mb-0">No assignments yet.</p>
     {% endif %}
 </div>
+
+<div class="card sms-stat-card p-3 mb-4"><div class="text-muted small mb-2">CATs</div>{% if cat_rows %}<ul class="list-unstyled mb-0">{% for cat in cat_rows %}<li class="mb-2"><strong>{{ cat.class_subject.subject.name }}</strong> — {{ cat.title }} <span class="badge bg-secondary">{{ cat.get_workflow_status_display }}</span></li>{% endfor %}</ul>{% else %}<p class="text-muted mb-0">No CATs available.</p>{% endif %}</div>
 
 <div class="card sms-stat-card p-3">
     <div class="text-muted small mb-2">Quizzes</div>
@@ -81,6 +83,7 @@
                     </span>
                 {% else %}
                     <span class="badge bg-secondary">Not attempted</span>
+                    <a class="btn btn-sm btn-outline-primary ms-2" href="{% url 'dashboard:student_quiz_attempt' row.quiz.pk %}">Attempt</a>
                 {% endif %}
             </li>
         {% endfor %}
@@ -89,4 +92,21 @@
         <p class="text-muted mb-0">No quizzes yet.</p>
     {% endif %}
 </div>
+<script>
+document.querySelectorAll('form[action*="student_submit_assignment"]').forEach(function (form) {
+    const text = form.querySelector('textarea[name="submitted_text"]');
+    const file = form.querySelector('input[type="file"]');
+    const button = form.querySelector('button[type="submit"]');
+    if (!button) return;
+    function update() {
+        const format = button.dataset.submissionFormat;
+        const hasText = text && text.value.trim().length > 0;
+        const hasFile = file && file.files.length > 0;
+        button.disabled = format === 'FILE_UPLOAD' ? !hasFile : format === 'TEXT_ENTRY' ? !hasText : !(hasText || hasFile);
+    }
+    if (text) text.addEventListener('input', update);
+    if (file) file.addEventListener('change', update);
+    update();
+});
+</script>
 {% endblock %}

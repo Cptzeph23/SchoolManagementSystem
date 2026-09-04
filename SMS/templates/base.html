@@ -70,6 +70,10 @@
         /* --- Sidebar: deep jungle green, not charcoal-black --- */
         .sms-sidebar {
             min-height: 100vh;
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            overflow-y: auto;
             background-color: var(--sms-jungle-900);
             color: #cfe6db;
         }
@@ -95,6 +99,7 @@
             color: var(--sms-charcoal-700);
         }
         .sms-topnav .btn-light:hover { background-color: var(--sms-jungle-100); }
+        .d-flex > .flex-grow-1 { height: 100vh; overflow-y: auto; min-width: 0; }
 
         /* --- Stat cards: clean, elevated, jungle-green accent bar --- */
         .sms-stat-card {

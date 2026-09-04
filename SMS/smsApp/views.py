@@ -20,6 +20,7 @@ from .models import (
     AcademicYear,
     Announcement,
     Assessment,
+    AssessmentComponent,
     AssessmentMark,
     Assignment,
     AssignmentSubmission,
@@ -41,7 +42,10 @@ from .models import (
     Payment,
     Program,
     Quiz,
+    QuizAnswer,
     QuizAttempt,
+    QuizOption,
+    QuizQuestion,
     Refund,
     ReportCard,
     ReportTemplate,
@@ -79,6 +83,7 @@ from .services import (
     get_children_for_guardian,
     get_dashboard_url_for_role,
     get_grade_for_mark,
+    grade_quiz_short_answer,
     log_audit,
     mark_attendance,
     mark_notification_read,
@@ -694,6 +699,9 @@ class StudentLMSView(StudentRequiredMixin, TemplateView):
         quiz_rows = [
             {"quiz": q, "attempt": my_attempts.get(q.pk)} for q in quizzes
         ]
+        cats = Assessment.objects.filter(
+            class_subject__in=class_subjects, is_published=True
+        ).select_related("class_subject__subject", "component").order_by("-created_at") if term else Assessment.objects.none()
 
         context.update({
             "student": student,
@@ -701,6 +709,7 @@ class StudentLMSView(StudentRequiredMixin, TemplateView):
             "materials": materials,
             "assignment_rows": assignment_rows,
             "quiz_rows": quiz_rows,
+            "cat_rows": cats,
         })
         return context
 
@@ -716,6 +725,14 @@ class StudentSubmitAssignmentView(StudentRequiredMixin, View):
         assignment = get_object_or_404(Assignment, pk=assignment_id, is_published=True)
 
         submitted_file = request.FILES.get("submitted_file")
+        submitted_text = request.POST.get("submitted_text", "").strip()
+        required = assignment.submission_format
+        has_file = submitted_file is not None
+        has_text = bool(submitted_text)
+        if (required == Assignment.SubmissionFormat.FILE_UPLOAD and not has_file) or \
+                (required == Assignment.SubmissionFormat.TEXT_ENTRY and not has_text) or \
+                (required == Assignment.SubmissionFormat.BOTH and not (has_file or has_text)):
+            return HttpResponseForbidden("A submission file or answer is required for this assignment.")
         if submitted_file:
             try:
                 result = validate_upload(
@@ -731,12 +748,49 @@ class StudentSubmitAssignmentView(StudentRequiredMixin, View):
             submit_assignment(
                 assignment=assignment, student=student,
                 submitted_file=submitted_file,
-                submitted_text=request.POST.get("submitted_text", ""),
+                submitted_text=submitted_text,
                 request=request,
             )
         except ValueError as exc:
             return HttpResponseForbidden(str(exc))
 
+        return redirect("dashboard:student_lms")
+
+
+class StudentQuizAttemptView(StudentRequiredMixin, View):
+    template_name = "dashboard/student/quiz_attempt.html"
+
+    def get_quiz(self, request, quiz_id):
+        return get_object_or_404(
+            Quiz.objects.prefetch_related("questions__options"),
+            pk=quiz_id, is_published=True,
+            class_subject__enrollments__student=self.get_student(request),
+        )
+
+    def get(self, request, quiz_id):
+        quiz = self.get_quiz(request, quiz_id)
+        attempts = QuizAttempt.objects.filter(quiz=quiz, student=self.get_student(request))
+        return render(request, self.template_name, {"quiz": quiz, "attempts": attempts})
+
+    def post(self, request, quiz_id):
+        quiz = self.get_quiz(request, quiz_id)
+        student = self.get_student(request)
+        attempt_number = QuizAttempt.objects.filter(quiz=quiz, student=student).count() + 1
+        if attempt_number > quiz.max_attempts:
+            return HttpResponseForbidden("You have used all allowed attempts for this quiz.")
+        answers = {}
+        for question in quiz.questions.all():
+            values = request.POST.getlist(f"question_{question.pk}")
+            option_ids = [int(value) for value in values if value.isdigit()]
+            answers[question.pk] = {
+                "option_ids": option_ids,
+                "text": request.POST.get(f"question_{question.pk}", "").strip(),
+            }
+        if not any(payload["option_ids"] or payload["text"] for payload in answers.values()):
+            return HttpResponseForbidden("Answer at least one question before submitting.")
+        attempt = QuizAttempt.objects.create(quiz=quiz, student=student, attempt_number=attempt_number)
+        from .services import submit_quiz_attempt
+        submit_quiz_attempt(attempt=attempt, answers=answers)
         return redirect("dashboard:student_lms")
 
 
@@ -1421,8 +1475,84 @@ class TeacherAssessmentsView(TeacherRequiredMixin, TemplateView):
             class_subject__in=class_subjects
         ).select_related("class_subject__subject", "component").order_by("-created_at")
 
-        context.update({"class_subjects": class_subjects, "assessments": assessments})
+        quizzes = Quiz.objects.filter(class_subject__in=class_subjects).select_related(
+            "class_subject__subject"
+        ).order_by("-created_at")
+        components = AssessmentComponent.objects.filter(
+            structure__school=staff.school, structure__is_active=True,
+            structure__term__teaching_assignments__teacher=staff,
+            structure__term__teaching_assignments__is_active=True,
+        ).select_related("assessment_type", "structure").distinct()
+        context.update({
+            "class_subjects": class_subjects, "assessments": assessments,
+            "quizzes": quizzes, "components": components,
+            "question_types": QuizQuestion.QuestionType.choices,
+        })
         return context
+
+    def post(self, request):
+        staff = self.get_staff(request)
+        class_subject = self.get_owned_class_subject_or_404(staff, request.POST.get("class_subject_id"))
+        term_id = TeachingAssignment.objects.filter(
+            teacher=staff, class_subject=class_subject, is_active=True
+        ).values_list("term_id", flat=True).first()
+        title = request.POST.get("title", "").strip()
+        if not title or not term_id:
+            return HttpResponseForbidden("Title and an active teaching assignment are required.")
+        if request.POST.get("kind") == "cat":
+            component = get_object_or_404(
+                AssessmentComponent, pk=request.POST.get("component_id"),
+                structure__school=staff.school, structure__term_id=term_id,
+            )
+            Assessment.objects.create(
+                class_subject=class_subject, term_id=term_id, component=component,
+                title=title, created_by=staff,
+            )
+        elif request.POST.get("kind") == "quiz":
+            question_type = request.POST.get("question_type") or QuizQuestion.QuestionType.SHORT_ANSWER
+            quiz = Quiz.objects.create(
+                class_subject=class_subject, term_id=term_id, title=title,
+                description=request.POST.get("description", "").strip(),
+                max_attempts=max(1, int(request.POST.get("max_attempts") or 1)), created_by=staff,
+            )
+            question = QuizQuestion.objects.create(
+                quiz=quiz, question_text=request.POST.get("question_text", "").strip(),
+                question_type=question_type,
+                marks=Decimal(request.POST.get("question_marks") or "1"), order=1,
+            )
+            options = [line.strip() for line in request.POST.get("options", "").splitlines() if line.strip()]
+            correct = request.POST.get("correct_option", "").strip()
+            if question_type in (QuizQuestion.QuestionType.MULTIPLE_CHOICE, QuizQuestion.QuestionType.TRUE_FALSE):
+                for index, option_text in enumerate(options):
+                    QuizOption.objects.create(
+                        question=question, option_text=option_text, order=index,
+                        is_correct=option_text == correct,
+                    )
+        else:
+            return HttpResponseForbidden("Select CAT or Quiz.")
+        return redirect("dashboard:teacher_assessments")
+
+
+class TeacherQuizAttemptsView(TeacherRequiredMixin, View):
+    template_name = "dashboard/teacher/quiz_attempts.html"
+
+    def get_quiz(self, request, quiz_id):
+        staff = self.get_staff(request)
+        return get_object_or_404(Quiz, pk=quiz_id, class_subject__in=self.get_my_class_subjects(staff))
+
+    def get(self, request, quiz_id):
+        quiz = self.get_quiz(request, quiz_id)
+        attempts = quiz.attempts.select_related("student__user").prefetch_related("answers__question")
+        return render(request, self.template_name, {"quiz": quiz, "attempts": attempts})
+
+    def post(self, request, quiz_id):
+        quiz = self.get_quiz(request, quiz_id)
+        answer = get_object_or_404(QuizAnswer, pk=request.POST.get("answer_id"), attempt__quiz=quiz)
+        try:
+            grade_quiz_short_answer(answer=answer, marks_awarded=Decimal(request.POST.get("marks_awarded")))
+        except ValueError as exc:
+            return HttpResponseForbidden(str(exc))
+        return redirect("dashboard:teacher_quiz_attempts", quiz_id=quiz.pk)
 
 
 class TeacherMarksEntryView(TeacherRequiredMixin, TemplateView):

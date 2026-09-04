@@ -39,6 +39,10 @@ urlpatterns = [
         "student/lms/assignments/<int:assignment_id>/submit/",
         views.StudentSubmitAssignmentView.as_view(), name="student_submit_assignment",
     ),
+    path(
+        "student/lms/quizzes/<int:quiz_id>/attempt/",
+        views.StudentQuizAttemptView.as_view(), name="student_quiz_attempt",
+    ),
     path("student/finance/", views.StudentFinanceView.as_view(), name="student_finance"),
     path(
         "student/communication/", views.StudentCommunicationView.as_view(),
@@ -87,6 +91,10 @@ urlpatterns = [
         views.TeacherAnnouncementsView.as_view(), name="teacher_announcements",
     ),
     path("teacher/assessments/", views.TeacherAssessmentsView.as_view(), name="teacher_assessments"),
+    path(
+        "teacher/assessments/<int:quiz_id>/attempts/",
+        views.TeacherQuizAttemptsView.as_view(), name="teacher_quiz_attempts",
+    ),
     path(
         "teacher/assessments/<int:assessment_id>/marks/",
         views.TeacherMarksEntryView.as_view(), name="teacher_marks_entry",

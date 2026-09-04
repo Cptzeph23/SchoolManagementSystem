@@ -11,6 +11,14 @@
 <h3 class="mb-4">Assessments</h3>
 <p class="text-muted">Assessment instances are scheduled against weighting structures configured by Academic Admin.</p>
 
+<div class="row g-3 mb-4">
+<div class="col-lg-6"><div class="card sms-stat-card p-3"><div class="text-muted small mb-2">Create CAT</div>
+<form method="post" class="row g-2">{% csrf_token %}<input type="hidden" name="kind" value="cat"><div class="col-md-6"><select name="class_subject_id" class="form-select" required><option value="">Class / Subject</option>{% for cs in class_subjects %}<option value="{{ cs.pk }}">{{ cs.class_group }} — {{ cs.subject.name }}</option>{% endfor %}</select></div><div class="col-md-6"><select name="component_id" class="form-select" required><option value="">Assessment component</option>{% for component in components %}<option value="{{ component.pk }}">{{ component.assessment_type.name }} — {{ component.weight_percentage }}% ({{ component.max_marks }} marks)</option>{% endfor %}</select></div><div class="col-12"><input name="title" class="form-control" placeholder="CAT title" required></div><div class="col-12"><button class="btn btn-primary">Create CAT</button></div></form>
+</div></div>
+<div class="col-lg-6"><div class="card sms-stat-card p-3"><div class="text-muted small mb-2">Create Quiz</div>
+<form method="post" class="row g-2">{% csrf_token %}<input type="hidden" name="kind" value="quiz"><div class="col-md-6"><select name="class_subject_id" class="form-select" required><option value="">Class / Subject</option>{% for cs in class_subjects %}<option value="{{ cs.pk }}">{{ cs.class_group }} — {{ cs.subject.name }}</option>{% endfor %}</select></div><div class="col-md-6"><input name="title" class="form-control" placeholder="Quiz title" required></div><div class="col-12"><textarea name="description" class="form-control" rows="2" placeholder="Instructions"></textarea></div><div class="col-md-4"><input type="number" name="max_attempts" class="form-control" min="1" value="1" placeholder="Attempts"></div><div class="col-md-8"><select name="question_type" class="form-select">{% for value,label in question_types %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div class="col-12"><textarea name="question_text" class="form-control" rows="2" placeholder="Question" required></textarea></div><div class="col-md-4"><input type="number" step="0.01" name="question_marks" class="form-control" min="0.01" value="1" placeholder="Marks"></div><div class="col-md-8"><textarea name="options" class="form-control" rows="2" placeholder="Objective options, one per line"></textarea></div><div class="col-12"><input name="correct_option" class="form-control" placeholder="Correct option (exact text)"></div><div class="col-12"><button class="btn btn-primary">Create Quiz</button></div></form>
+</div></div></div>
+
 <div class="card sms-stat-card p-3">
     <table class="table table-hover align-middle mb-0">
         <thead>
@@ -33,4 +41,5 @@
         </tbody>
     </table>
 </div>
+<div class="card sms-stat-card p-3 mt-4"><div class="text-muted small mb-2">Quizzes</div><table class="table table-hover align-middle mb-0"><thead><tr><th>Title</th><th>Class / Subject</th><th>Attempts</th><th></th></tr></thead><tbody>{% for quiz in quizzes %}<tr><td>{{ quiz.title }}</td><td>{{ quiz.class_subject.class_group }} — {{ quiz.class_subject.subject.name }}</td><td>{{ quiz.max_attempts }}</td><td class="text-end"><a class="btn btn-sm btn-outline-secondary" href="{% url 'dashboard:teacher_quiz_attempts' quiz.pk %}">View Attempts</a></td></tr>{% empty %}<tr><td colspan="4" class="text-muted">No quizzes created yet.</td></tr>{% endfor %}</tbody></table></div>
 {% endblock %}
