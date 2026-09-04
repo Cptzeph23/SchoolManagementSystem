@@ -6,6 +6,7 @@ from django.contrib.auth import logout as auth_logout
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView as DjangoLoginView
 from django.http import Http404, HttpResponse, HttpResponseForbidden
+from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse, reverse_lazy
 from django.views import View
@@ -56,6 +57,7 @@ from .models import (
     Student,
     StudentGuardian,
     Subject,
+    School,
     TeachingAssignment,
     Term,
     TimetableSlot,
@@ -220,25 +222,39 @@ class SuperAdminDashboardView(RoleRequiredMixin, TemplateView):
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
 
-        current_year = AcademicYear.objects.filter(is_current=True).first()
-        current_term = Term.objects.filter(is_current=True).first()
-
-        # Same single-school resolution convention used by every other
-        # admin dashboard (Finance/Staff/Academic Admin) — see those
-        # views' get_school() docstrings for the multi-school caveat.
         from .models import School
-        school = School.objects.first()
-
-        financial_summary = compute_school_financial_summary(school=school) if school else {}
-        attendance_summary = compute_school_attendance_summary(school=school) if school else {}
+        schools = School.objects.all().order_by("name")
+        financial_summaries = [compute_school_financial_summary(school=school) for school in schools]
+        attendance_summaries = [compute_school_attendance_summary(school=school) for school in schools]
+        financial_summary = {
+            "total_billed": sum((item["total_billed"] for item in financial_summaries), Decimal("0")),
+            "total_collected": sum((item["total_collected"] for item in financial_summaries), Decimal("0")),
+            "outstanding_balance": sum((item["outstanding_balance"] for item in financial_summaries), Decimal("0")),
+            "arrears": sum((item["arrears"] for item in financial_summaries), Decimal("0")),
+            "overdue_invoice_count": sum(item["overdue_invoice_count"] for item in financial_summaries),
+            "unpaid_invoice_count": sum(item["unpaid_invoice_count"] for item in financial_summaries),
+        }
+        total_attendance = sum(item["total_records"] for item in attendance_summaries)
+        present_attendance = sum(item["present_count"] for item in attendance_summaries)
+        attendance_summary = {
+            "window_days": 30,
+            "total_records": total_attendance,
+            "present_count": present_attendance,
+            "attendance_rate_percent": round((present_attendance / total_attendance) * 100, 1) if total_attendance else None,
+        }
+        current_years = AcademicYear.objects.filter(is_current=True).order_by("school__name", "name")
+        current_terms = Term.objects.filter(is_current=True).order_by("academic_year__school__name", "name")
 
         context.update(
             {
                 "total_students": Student.objects.filter(is_active=True).count(),
                 "total_staff": Staff.objects.filter(is_active=True).count(),
                 "active_classes": Class.objects.filter(is_active=True).count(),
-                "current_academic_year": current_year,
-                "current_term": current_term,
+                "current_academic_year": current_years.first(),
+                "current_term": current_terms.first(),
+                "current_academic_years": current_years,
+                "current_terms": current_terms,
+                "schools": schools,
                 "financial_summary": financial_summary,
                 "attendance_summary": attendance_summary,
                 "recent_audit_logs": AuditLog.objects.select_related("actor")
@@ -474,9 +490,51 @@ class SuperAdminRequiredMixin(RoleRequiredMixin):
         context["active"] = self.active_nav
         return context
 
-    def get_school(self):
+    def get_school(self, school_id=None):
         from .models import School
-        return School.objects.first()
+        return get_object_or_404(School, pk=school_id) if school_id else School.objects.first()
+
+
+STAFF_ROLES = {
+    User.Role.STAFF_ADMIN, User.Role.ACADEMIC_ADMIN, User.Role.FINANCE_ADMIN,
+    User.Role.TEACHER, User.Role.EXAM_OFFICER, User.Role.CLASS_TEACHER,
+    User.Role.DEPARTMENT_HEAD, User.Role.ACCOUNTANT, User.Role.LIBRARIAN,
+}
+
+
+def _next_staff_id(school, user):
+    candidate = f"STAFF-{user.pk}"
+    if not Staff.objects.filter(school=school, staff_id=candidate).exists():
+        return candidate
+    index = 2
+    while Staff.objects.filter(school=school, staff_id=f"{candidate}-{index}").exists():
+        index += 1
+    return f"{candidate}-{index}"
+
+
+def _associate_user_with_school(*, user, school, role=None):
+    role = role or user.role
+    if role in STAFF_ROLES:
+        profile, created = Staff.objects.get_or_create(
+            user=user,
+            defaults={
+                "school": school, "staff_id": _next_staff_id(school, user),
+                "job_title": user.get_role_display(), "date_hired": datetime.date.today(),
+            },
+        )
+        if not created and profile.school_id != school.pk:
+            profile.school = school
+            profile.save(update_fields=["school", "updated_at"])
+    elif role == User.Role.STUDENT:
+        profile = Student.objects.filter(user=user).first()
+        if profile:
+            profile.school = school
+            profile.save(update_fields=["school", "updated_at"])
+    elif role == User.Role.PARENT:
+        profile = Guardian.objects.filter(user=user).first()
+        if profile:
+            profile.school = school
+            profile.save(update_fields=["school", "updated_at"])
 
 
 class SuperAdminUsersView(SuperAdminRequiredMixin, TemplateView):
@@ -490,15 +548,56 @@ class SuperAdminUsersView(SuperAdminRequiredMixin, TemplateView):
         if search:
             from django.db.models import Q
             users = users.filter(Q(username__icontains=search) | Q(first_name__icontains=search) | Q(last_name__icontains=search) | Q(email__icontains=search))
-        context.update({"users": users, "search": search, "roles": User.Role.choices})
+        context.update({"users": users, "search": search, "roles": User.Role.choices, "schools": School.objects.all()})
         return context
 
     def post(self, request):
-        user = get_object_or_404(User, pk=request.POST.get("user_id"))
         action = request.POST.get("action")
+        if action == "create":
+            username = request.POST.get("username", "").strip()
+            password = request.POST.get("password", "")
+            role = request.POST.get("role", "")
+            school_id = request.POST.get("school_id")
+            if not username or not password or role not in {value for value, _label in User.Role.choices}:
+                return HttpResponseForbidden("Username, password, and a valid role are required.")
+            school = get_object_or_404(School, pk=school_id) if school_id else None
+            if role != User.Role.SUPER_ADMIN and school is None:
+                return HttpResponseForbidden("A school is required for this role.")
+            try:
+                with transaction.atomic():
+                    new_user = User.objects.create_user(
+                        username=username, password=password,
+                        first_name=request.POST.get("first_name", "").strip(),
+                        last_name=request.POST.get("last_name", "").strip(),
+                        email=request.POST.get("email", "").strip(),
+                        role=role, phone_number=request.POST.get("phone_number", "").strip(),
+                    )
+                    if school:
+                        if role in STAFF_ROLES:
+                            Staff.objects.create(
+                                user=new_user, school=school,
+                                staff_id=request.POST.get("staff_id", "").strip() or _next_staff_id(school, new_user),
+                                job_title=request.POST.get("job_title", "").strip() or new_user.get_role_display(),
+                                date_hired=datetime.date.today(),
+                            )
+                        elif role == User.Role.STUDENT:
+                            admission = request.POST.get("admission_number", "").strip() or f"STU-{new_user.pk}"
+                            Student.objects.create(user=new_user, school=school, admission_number=admission, admission_date=datetime.date.today())
+                        elif role == User.Role.PARENT:
+                            Guardian.objects.create(user=new_user, school=school, first_name=new_user.first_name or username, last_name=new_user.last_name, relationship=request.POST.get("relationship", "Parent"), phone_number=new_user.phone_number)
+            except (IntegrityError, ValueError) as exc:
+                return HttpResponseForbidden(str(exc))
+            log_audit(actor=request.user, action=AuditLog.Action.CREATE, request=request, target_model="User", target_object_id=new_user.pk, description=f"Created {new_user.username} and associated the account with {school or 'all schools'}.")
+            return redirect("dashboard:super_admin_users")
+        user = get_object_or_404(User, pk=request.POST.get("user_id"))
         if user.pk == request.user.pk and action in {"lock", "deactivate", "role"}:
             return HttpResponseForbidden("You cannot disable or change your own super-admin account.")
         previous = {"is_active": user.is_active, "is_locked": user.is_locked, "role": user.role}
+        if action == "assign_school":
+            school = get_object_or_404(School, pk=request.POST.get("school_id"))
+            _associate_user_with_school(user=user, school=school)
+            log_audit(actor=request.user, action=AuditLog.Action.UPDATE, request=request, target_model="User", target_object_id=user.pk, description=f"Associated {user.username} with {school.name}.")
+            return redirect("dashboard:super_admin_users")
         if action == "lock":
             user.is_locked = True
             audit_action = AuditLog.Action.LOCK
@@ -527,13 +626,14 @@ class SuperAdminSchoolConfigView(SuperAdminRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        context["school"] = self.get_school()
+        from .models import School
+        context["schools"] = School.objects.all().order_by("name")
         return context
 
     def post(self, request):
-        school = self.get_school()
-        if school is None:
-            return HttpResponseForbidden("No school has been configured.")
+        from .models import School
+        action = request.POST.get("action", "update")
+        school = get_object_or_404(School, pk=request.POST.get("school_id")) if action == "update" and request.POST.get("school_id") else (School.objects.first() if action == "update" else School())
         previous = {"name": school.name, "code": school.code, "motto": school.motto, "address": school.address, "phone_number": school.phone_number, "email": school.email, "enable_position_ranking": school.enable_position_ranking}
         school.name = request.POST.get("name", "").strip()
         school.code = request.POST.get("code", "").strip()
@@ -541,14 +641,19 @@ class SuperAdminSchoolConfigView(SuperAdminRequiredMixin, TemplateView):
         school.address = request.POST.get("address", "").strip()
         school.phone_number = request.POST.get("phone_number", "").strip()
         school.email = request.POST.get("email", "").strip()
+        school.established_date = request.POST.get("established_date") or None
         school.enable_position_ranking = request.POST.get("enable_position_ranking") == "on"
+        if action == "create" or "is_active" in request.POST:
+            school.is_active = request.POST.get("is_active") == "on"
         if not school.name or not school.code:
             return HttpResponseForbidden("School name and code are required.")
         try:
-            school.save(update_fields=["name", "code", "motto", "address", "phone_number", "email", "enable_position_ranking", "updated_at"])
+            if request.FILES.get("logo"):
+                school.logo = request.FILES["logo"]
+            school.save()
         except Exception as exc:
             return HttpResponseForbidden(str(exc))
-        log_audit(actor=request.user, action=AuditLog.Action.UPDATE, request=request, target_model="School", target_object_id=school.pk, description=f"Updated school configuration for {school.name}.", previous_value=previous, new_value={"name": school.name, "code": school.code, "motto": school.motto, "address": school.address, "phone_number": school.phone_number, "email": school.email, "enable_position_ranking": school.enable_position_ranking})
+        log_audit(actor=request.user, action=AuditLog.Action.CREATE if action == "create" else AuditLog.Action.UPDATE, request=request, target_model="School", target_object_id=school.pk, description=f"{'Created' if action == 'create' else 'Updated'} school configuration for {school.name}.", previous_value=previous if action == "update" else {}, new_value={"name": school.name, "code": school.code, "motto": school.motto, "address": school.address, "phone_number": school.phone_number, "email": school.email, "enable_position_ranking": school.enable_position_ranking, "is_active": school.is_active})
         return redirect("dashboard:super_admin_school_config")
 
 
@@ -1681,11 +1786,10 @@ class FinanceRequiredMixin(RoleRequiredMixin):
         return context
 
     def get_school(self, request):
-        # Finance Admin/Accountant accounts aren't tied to a Student/Staff/
-        # Guardian profile the way other roles are (Phase 1's User model
-        # has no direct `school` FK) — for a single-school deployment this
-        # resolves to the one School row; multi-school support would add
-        # a FinanceAdmin-school assignment model as a follow-up.
+        if hasattr(request.user, "staff_profile"):
+            return request.user.staff_profile.school
+        # Legacy finance accounts without a Staff profile retain the existing
+        # data-based fallback until they are assigned through Super Admin.
         from .models import School
         from django.db.models import Count, Q
         return School.objects.filter(is_active=True).annotate(
@@ -2151,7 +2255,9 @@ class AcademicAdminRequiredMixin(RoleRequiredMixin):
 
     def get_school(self, request):
         from .models import School
-        return School.objects.first()
+        if hasattr(request.user, "staff_profile"):
+            return request.user.staff_profile.school
+        return None
 
 
 class AcademicAdminDashboardView(AcademicAdminRequiredMixin, TemplateView):

@@ -36,13 +36,13 @@
     <div class="col-md-3 col-sm-6">
         <div class="card sms-stat-card p-3">
             <div class="text-muted small">Current Academic Year</div>
-            <div class="fs-5 fw-semibold">{{ current_academic_year|default:"— not set —" }}</div>
+            <div class="fs-5 fw-semibold">{% if current_academic_years %}{{ current_academic_years|length }} configured{% else %}— not set —{% endif %}</div>
         </div>
     </div>
     <div class="col-md-3 col-sm-6">
         <div class="card sms-stat-card p-3">
             <div class="text-muted small">Current Term</div>
-            <div class="fs-5 fw-semibold">{{ current_term|default:"— not set —" }}</div>
+            <div class="fs-5 fw-semibold">{% if current_terms %}{{ current_terms|length }} configured{% else %}— not set —{% endif %}</div>
         </div>
     </div>
     <div class="col-md-3 col-sm-6">
@@ -74,6 +74,11 @@
             </div>
         </div>
     </div>
+</div>
+
+<div class="card sms-stat-card mt-4 p-3">
+    <div class="text-muted small mb-2">Registered Schools</div>
+    <div class="row g-2">{% for school in schools %}<div class="col-md-4"><span class="badge {% if school.is_active %}bg-success{% else %}bg-secondary{% endif %}">{{ school.name }}</span></div>{% empty %}<div class="text-muted">No schools configured.</div>{% endfor %}</div>
 </div>
 
 <div class="card sms-stat-card mt-4 p-3">
