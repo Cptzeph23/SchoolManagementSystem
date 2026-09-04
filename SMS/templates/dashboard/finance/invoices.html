@@ -21,6 +21,7 @@
                     <option value="{{ s.pk }}">{{ s.admission_number }} — {{ s.user.get_full_name|default:s.user.username }}</option>
                 {% endfor %}
             </select>
+            {% if not students %}<div class="form-text text-danger">No active students are available for this school.</div>{% endif %}
         </div>
         <div class="col-md-4">
             <select name="fee_structure_id" class="form-select" required>
@@ -29,6 +30,7 @@
                     <option value="{{ fs.pk }}">{{ fs.name }} ({{ fs.academic_year }} - {{ fs.term }})</option>
                 {% endfor %}
             </select>
+            {% if not fee_structures %}<div class="form-text text-danger">No active fee structures are available for this school.</div>{% endif %}
         </div>
         <div class="col-md-3">
             <input type="date" name="due_date" class="form-control" required>

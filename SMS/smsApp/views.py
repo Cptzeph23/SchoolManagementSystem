@@ -1557,7 +1557,15 @@ class FinanceRequiredMixin(RoleRequiredMixin):
         # resolves to the one School row; multi-school support would add
         # a FinanceAdmin-school assignment model as a follow-up.
         from .models import School
-        return School.objects.first()
+        from django.db.models import Count, Q
+        return School.objects.filter(is_active=True).annotate(
+            active_fee_structures=Count(
+                "fee_structures", filter=Q(fee_structures__is_active=True), distinct=True
+            ),
+            active_students=Count(
+                "students", filter=Q(students__is_active=True), distinct=True
+            ),
+        ).order_by("-active_fee_structures", "-active_students", "id").first()
 
 
 class FinanceAdminDashboardView(FinanceRequiredMixin, TemplateView):
