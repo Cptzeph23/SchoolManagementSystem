@@ -172,8 +172,12 @@ class FileValidationError(ValidationError):
 
 # Map MIME types / categories for LMS materials
 COURSE_MATERIAL_TYPE_TO_CATEGORY = {
-    "pdf": PDF_MIME_TYPES,
-    "image": IMAGE_MIME_TYPES,
-    "document": DOCUMENT_MIME_TYPES,
-    "material": COURSE_MATERIAL_MIME_TYPES,
+    # Values must match CourseMaterial.MaterialType, whose stored choice
+    # values are uppercase. The previous lowercase keys caused every file
+    # upload from the dashboard to be rejected before validation/storage.
+    "PDF": PDF_MIME_TYPES,
+    "IMAGE": IMAGE_MIME_TYPES,
+    "DOCUMENT": DOCUMENT_MIME_TYPES,
+    "VIDEO": COURSE_MATERIAL_MIME_TYPES,
+    "PRESENTATION": COURSE_MATERIAL_MIME_TYPES,
 }

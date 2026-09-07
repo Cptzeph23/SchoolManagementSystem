@@ -20,6 +20,7 @@
                 <span class="badge bg-secondary">{{ m.get_material_type_display }}</span>
                 {% if m.file %}<a href="{{ m.file.url }}" class="ms-2">Open</a>{% endif %}
                 {% if m.external_url %}<a href="{{ m.external_url }}" class="ms-2" target="_blank">Open Link</a>{% endif %}
+                {% if m.text_content %}<div class="mt-2">{{ m.text_content|linebreaksbr }}</div>{% endif %}
             </li>
         {% endfor %}
         </ul>

@@ -5,6 +5,7 @@ from decimal import Decimal
 from django.contrib.auth import logout as auth_logout
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView as DjangoLoginView
+from django.core.exceptions import ValidationError
 from django.http import Http404, HttpResponse, HttpResponseForbidden
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404, redirect, render
@@ -15,6 +16,10 @@ from django.views.generic import RedirectView, TemplateView
 from .validators import (
     COURSE_MATERIAL_TYPE_TO_CATEGORY,
     FileValidationError,
+    validate_course_material_content,
+    validate_document_content,
+    validate_image_content,
+    validate_pdf_content,
     validate_upload,
 )
 from .models import (
@@ -840,14 +845,10 @@ class StudentSubmitAssignmentView(StudentRequiredMixin, View):
             return HttpResponseForbidden("A submission file or answer is required for this assignment.")
         if submitted_file:
             try:
-                result = validate_upload(
-                    file_obj=submitted_file, category="ASSIGNMENT_SUBMISSION",
-                )
-            except FileValidationError as exc:
+                validate_upload(submitted_file, validate_document_content, 10)
+            except (FileValidationError, ValidationError) as exc:
                 return HttpResponseForbidden(str(exc))
-            # Spec §29 'never trust filenames supplied by users' — the file
-            # is renamed to a fresh UUID before it ever reaches storage.
-            submitted_file.name = result["safe_filename"]
+            # validate_upload renames the file to a fresh UUID before storage.
 
         try:
             submit_assignment(
@@ -1511,10 +1512,16 @@ class TeacherMaterialsView(TeacherRequiredMixin, TemplateView):
                     f"external_url or text_content instead."
                 )
             try:
-                result = validate_upload(file_obj=uploaded_file, category=category)
-            except FileValidationError as exc:
+                content_validator = {
+                    "PDF": validate_pdf_content,
+                    "IMAGE": validate_image_content,
+                    "DOCUMENT": validate_course_material_content,
+                    "VIDEO": validate_course_material_content,
+                    "PRESENTATION": validate_course_material_content,
+                }.get(material_type, validate_course_material_content)
+                validate_upload(uploaded_file, content_validator, 5)
+            except (FileValidationError, ValidationError) as exc:
                 return HttpResponseForbidden(str(exc))
-            uploaded_file.name = result["safe_filename"]
 
         CourseMaterial.objects.create(
             class_subject=class_subject, term_id=term_id,
