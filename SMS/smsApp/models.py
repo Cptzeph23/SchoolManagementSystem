@@ -1683,6 +1683,10 @@ class Quiz(models.Model):
     term = models.ForeignKey(Term, on_delete=models.CASCADE, related_name="quizzes")
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
+    max_marks = models.DecimalField(
+        max_digits=6, decimal_places=2, default=Decimal("100"),
+        help_text="Task score is normalized against this maximum; defaults to 100.",
+    )
     task_category = models.CharField(
         max_length=10, choices=TaskCategory.choices, default=TaskCategory.QUIZ,
         db_index=True,
@@ -1801,7 +1805,8 @@ class QuizAttempt(models.Model):
     def total_score(self):
         if self.auto_score is None and self.manual_score is None:
             return None
-        return (self.auto_score or Decimal("0")) + (self.manual_score or Decimal("0"))
+        scores = [score for score in (self.auto_score, self.manual_score) if score is not None]
+        return (sum(scores, Decimal("0")) / Decimal(len(scores))).quantize(Decimal("0.01"))
 
 
 class QuizAnswer(models.Model):

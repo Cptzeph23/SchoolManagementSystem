@@ -737,10 +737,7 @@ class StudentAcademicView(StudentRequiredMixin, TemplateView):
                 attempt = latest_attempts.get(quiz.pk)
                 if attempt is None or not attempt.is_fully_graded:
                     continue
-                maximum = sum(
-                    (question.marks for question in quiz.questions.all()),
-                    Decimal("0"),
-                )
+                maximum = quiz.max_marks or Decimal("100")
                 percentage = (
                     (attempt.total_score / maximum * Decimal("100")).quantize(Decimal("0.01"))
                     if maximum > 0 and attempt.total_score is not None else None
@@ -1744,6 +1741,7 @@ class TeacherAssessmentsView(TeacherRequiredMixin, TemplateView):
             quiz = Quiz.objects.create(
                 class_subject=class_subject, term_id=term_id, title=title,
                 description=request.POST.get("description", "").strip(),
+                max_marks=Decimal(request.POST.get("max_marks") or "100"),
                 task_category=task_category,
                 submission_format=request.POST.get("submission_format") or Quiz.SubmissionFormat.TEXT_ENTRY,
                 question_file=question_file,
