@@ -51,7 +51,7 @@
                             {% csrf_token %}
                             <textarea name="submitted_text" class="form-control form-control-sm mb-2" placeholder="Resubmission text (optional)"></textarea>
                             <input type="file" name="submitted_file" class="form-control form-control-sm mb-2">
-                            <button type="submit" class="btn btn-sm btn-outline-secondary" data-submission-format="{{ row.assignment.submission_format }}" disabled>Resubmit</button>
+                            <button type="submit" class="btn btn-sm btn-outline-secondary" data-submission-format="{{ row.assignment.submission_format }}">Resubmit</button>
                         </form>
                     {% endif %}
                 {% else %}
@@ -59,7 +59,7 @@
                         {% csrf_token %}
                         <textarea name="submitted_text" class="form-control form-control-sm mb-2" placeholder="Your answer"></textarea>
                         <input type="file" name="submitted_file" class="form-control form-control-sm mb-2">
-                        <button type="submit" class="btn btn-sm btn-secondary" data-submission-format="{{ row.assignment.submission_format }}" disabled>Submit</button>
+                        <button type="submit" class="btn btn-sm btn-secondary" data-submission-format="{{ row.assignment.submission_format }}">Submit</button>
                     </form>
                 {% endif %}
             </li>
@@ -96,15 +96,18 @@ document.querySelectorAll('form[action*="student_submit_assignment"]').forEach(f
     const file = form.querySelector('input[type="file"]');
     const button = form.querySelector('button[type="submit"]');
     if (!button) return;
-    function update() {
-        const format = button.dataset.submissionFormat;
+    function isValid() {
+        const format = (button.dataset.submissionFormat || '').trim().toUpperCase();
         const hasText = text && text.value.trim().length > 0;
         const hasFile = file && file.files.length > 0;
-        button.disabled = format === 'FILE_UPLOAD' ? !hasFile : format === 'TEXT_ENTRY' ? !hasText : !(hasText || hasFile);
+        return format === 'FILE_UPLOAD' ? hasFile : format === 'TEXT_ENTRY' ? hasText : (hasText || hasFile);
     }
-    if (text) text.addEventListener('input', update);
-    if (file) file.addEventListener('change', update);
-    update();
+    form.addEventListener('submit', function (event) {
+        if (!isValid()) {
+            event.preventDefault();
+            window.alert('Add the required answer text or file before submitting.');
+        }
+    });
 });
 </script>
 {% endblock %}
