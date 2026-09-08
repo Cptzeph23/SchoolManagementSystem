@@ -1561,10 +1561,15 @@ class Assignment(models.Model):
     instructions = models.TextField(blank=True)
     deadline = models.DateTimeField()
     max_marks = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("100"))
+    max_attempts = models.PositiveIntegerField(default=1)
     submission_format = models.CharField(
         max_length=15, choices=SubmissionFormat.choices, default=SubmissionFormat.FILE_UPLOAD
     )
     allow_resubmission = models.BooleanField(default=False)
+    overdue_reopened = models.BooleanField(
+        default=False,
+        help_text="Teacher has reopened this overdue assignment for eligible students.",
+    )
     created_by = models.ForeignKey(
         Staff, on_delete=models.SET_NULL, related_name="assignments_created",
         blank=True, null=True,
@@ -1690,8 +1695,13 @@ class Quiz(models.Model):
         upload_to="lms/assessment_questions/", blank=True, null=True,
         validators=[validate_file_size(5), validate_course_material_content],
     )
+    deadline = models.DateTimeField(blank=True, null=True)
     time_limit_minutes = models.PositiveIntegerField(blank=True, null=True)
     max_attempts = models.PositiveIntegerField(default=1)
+    overdue_reopened = models.BooleanField(
+        default=False,
+        help_text="Teacher has reopened this overdue task for eligible students.",
+    )
     is_published = models.BooleanField(default=True)
     created_by = models.ForeignKey(
         Staff, on_delete=models.SET_NULL, related_name="quizzes_created",

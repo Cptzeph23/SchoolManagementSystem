@@ -854,11 +854,12 @@ def submit_assignment(
         assignment=assignment, student=student
     ).first()
 
-    if existing is not None and not assignment.allow_resubmission:
+    if existing is not None and existing.attempt_number >= assignment.max_attempts:
         raise ValueError(
-            "This assignment does not allow resubmission; a submission "
-            "already exists for this student."
+            "You have used all allowed attempts for this assignment."
         )
+    if existing is not None and not assignment.allow_resubmission and assignment.max_attempts <= 1:
+        raise ValueError("This assignment does not allow resubmission.")
 
     now = timezone.now()
     is_late = now > assignment.deadline

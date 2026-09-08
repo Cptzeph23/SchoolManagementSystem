@@ -10,6 +10,7 @@ from django.http import Http404, HttpResponse, HttpResponseForbidden, JsonRespon
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse, reverse_lazy
+from django.utils import timezone
 from django.views import View
 from django.views.generic import RedirectView, TemplateView
 
@@ -846,6 +847,9 @@ class StudentSubmitAssignmentView(StudentRequiredMixin, View):
         student = self.get_student(request)
         assignment = get_object_or_404(Assignment, pk=assignment_id, is_published=True)
 
+        if timezone.now() > assignment.deadline and not assignment.overdue_reopened:
+            return HttpResponseForbidden("This assignment is overdue and has not been reopened by the teacher.")
+
         submitted_file = request.FILES.get("submitted_file")
         submitted_text = request.POST.get("submitted_text", "").strip()
         required = assignment.submission_format
@@ -887,12 +891,19 @@ class StudentQuizAttemptView(StudentRequiredMixin, View):
 
     def get(self, request, quiz_id):
         quiz = self.get_quiz(request, quiz_id)
-        attempts = QuizAttempt.objects.filter(quiz=quiz, student=self.get_student(request))
+        student = self.get_student(request)
+        attempts = QuizAttempt.objects.filter(quiz=quiz, student=student)
+        if quiz.deadline and timezone.now() > quiz.deadline and not quiz.overdue_reopened:
+            return HttpResponseForbidden("This task is overdue and has not been reopened by the teacher.")
+        if attempts.count() >= quiz.max_attempts:
+            return HttpResponseForbidden("You have used all allowed attempts for this task.")
         return render(request, self.template_name, {"quiz": quiz, "attempts": attempts})
 
     def post(self, request, quiz_id):
         quiz = self.get_quiz(request, quiz_id)
         student = self.get_student(request)
+        if quiz.deadline and timezone.now() > quiz.deadline and not quiz.overdue_reopened:
+            return HttpResponseForbidden("This task is overdue and has not been reopened by the teacher.")
         attempt_number = QuizAttempt.objects.filter(quiz=quiz, student=student).count() + 1
         if attempt_number > quiz.max_attempts:
             return HttpResponseForbidden("You have used all allowed attempts for this quiz.")
@@ -1473,6 +1484,14 @@ class TeacherAssignmentsView(TeacherRequiredMixin, TemplateView):
 
     def post(self, request):
         staff = self.get_staff(request)
+        if request.POST.get("action") in {"reopen", "close"}:
+            assignment = get_object_or_404(
+                Assignment, pk=request.POST.get("assignment_id"),
+                class_subject__in=self.get_my_class_subjects(staff),
+            )
+            assignment.overdue_reopened = request.POST.get("action") == "reopen"
+            assignment.save(update_fields=["overdue_reopened", "updated_at"])
+            return redirect("dashboard:teacher_assignments")
         class_subject = self.get_owned_class_subject_or_404(
             staff, request.POST.get("class_subject_id")
         )
@@ -1486,8 +1505,9 @@ class TeacherAssignmentsView(TeacherRequiredMixin, TemplateView):
             instructions=request.POST.get("instructions", ""),
             deadline=request.POST.get("deadline"),
             max_marks=request.POST.get("max_marks") or Decimal("100"),
+            max_attempts=max(1, int(request.POST.get("max_attempts") or 1)),
             submission_format=request.POST.get("submission_format", Assignment.SubmissionFormat.FILE_UPLOAD),
-            allow_resubmission=bool(request.POST.get("allow_resubmission")),
+            allow_resubmission=bool(request.POST.get("allow_resubmission")) or int(request.POST.get("max_attempts") or 1) > 1,
             created_by=staff,
         )
         question_file = request.FILES.get("question_file")
@@ -1683,6 +1703,14 @@ class TeacherAssessmentsView(TeacherRequiredMixin, TemplateView):
 
     def post(self, request):
         staff = self.get_staff(request)
+        if request.POST.get("action") in {"reopen", "close"}:
+            quiz = get_object_or_404(
+                Quiz, pk=request.POST.get("quiz_id"),
+                class_subject__in=self.get_my_class_subjects(staff),
+            )
+            quiz.overdue_reopened = request.POST.get("action") == "reopen"
+            quiz.save(update_fields=["overdue_reopened", "updated_at"])
+            return redirect("dashboard:teacher_assessments")
         class_subject = self.get_owned_class_subject_or_404(staff, request.POST.get("class_subject_id"))
         term_id = TeachingAssignment.objects.filter(
             teacher=staff, class_subject=class_subject, is_active=True
@@ -1719,6 +1747,7 @@ class TeacherAssessmentsView(TeacherRequiredMixin, TemplateView):
                 task_category=task_category,
                 submission_format=request.POST.get("submission_format") or Quiz.SubmissionFormat.TEXT_ENTRY,
                 question_file=question_file,
+                deadline=request.POST.get("deadline") or None,
                 max_attempts=max(1, int(request.POST.get("max_attempts") or 1)), created_by=staff,
             )
             question_text_values = request.POST.getlist("question_text") or [request.POST.get("question_text", "")]

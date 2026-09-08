@@ -36,7 +36,7 @@
         {% for row in assignment_rows %}
             <li class="mb-3 pb-3 border-bottom">
                 <strong>{{ row.assignment.class_subject.subject.name }}</strong> — {{ row.assignment.title }}
-                <div class="text-muted small">Due: {{ row.assignment.deadline }}</div>
+                <div class="text-muted small">Due: {{ row.assignment.deadline }} · Attempts: {{ row.assignment.max_attempts }}{% if row.assignment.overdue_reopened %} · <span class="text-warning">Late access reopened</span>{% endif %}</div>
                 {% for resource in row.assignment.resources.all %}<a href="{% if resource.file %}{{ resource.file.url }}{% else %}{{ resource.external_url }}{% endif %}" target="_blank" class="small me-2">View questions</a>{% endfor %}
                 {% if row.submission %}
                     <span class="badge bg-info">{{ row.submission.get_status_display }}</span>
