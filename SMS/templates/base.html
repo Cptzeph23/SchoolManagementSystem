@@ -143,14 +143,12 @@
                 </ol>
             </nav>
             <div class="d-flex align-items-center gap-3">
-                <button class="btn btn-light position-relative" title="Notifications" type="button">
-                    <i class="bi bi-bell"></i>
-                    {% if unread_notification_count %}
-                        <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger">
-                            {{ unread_notification_count }}
-                        </span>
-                    {% endif %}
-                </button>
+                <div class="dropdown">
+                    <button class="btn btn-light position-relative" title="Notifications" data-bs-toggle="dropdown" type="button" aria-label="Notifications">
+                        <i class="bi bi-bell"></i><span id="notification-badge" class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger{% if not unread_notification_count %} d-none{% endif %}">{{ unread_notification_count }}</span>
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end p-2" style="min-width:320px" id="notification-menu"><li class="dropdown-header">Notifications</li>{% for notification in dashboard_notifications %}<li><a class="dropdown-item {% if not notification.is_read %}fw-semibold{% endif %}" href="{% url 'dashboard:notification_open' notification.pk %}"><div>{{ notification.title }}</div><small class="text-muted">{{ notification.message|truncatechars:80 }}</small></a></li>{% empty %}<li class="dropdown-item-text text-muted">No notifications.</li>{% endfor %}</ul>
+                </div>
                 <div class="dropdown">
                     <button class="btn btn-light dropdown-toggle" data-bs-toggle="dropdown" type="button">
                         <i class="bi bi-person-circle me-1"></i>{{ request.user.get_full_name|default:request.user.username }}
@@ -181,6 +179,23 @@
         </main>
     </div>
 </div>
+<script>
+(function () {
+    const feedUrl = "{% url 'dashboard:notification_feed' %}";
+    const badge = document.getElementById("notification-badge");
+    const menu = document.getElementById("notification-menu");
+    if (!badge || !menu) return;
+    function refreshNotifications() {
+        fetch(feedUrl, {headers: {"X-Requested-With": "XMLHttpRequest"}}).then(r => r.json()).then(data => {
+            badge.textContent = data.unread_count;
+            badge.classList.toggle("d-none", !data.unread_count);
+            const rows = data.notifications.length ? data.notifications.map(n => '<li><a class="dropdown-item ' + (n.is_read ? '' : 'fw-semibold') + '" href="/notifications/' + n.id + '/open/"><div>' + n.title + '</div><small class="text-muted">' + n.message + '</small></a></li>').join('') : '<li class="dropdown-item-text text-muted">No notifications.</li>';
+            menu.innerHTML = '<li class="dropdown-header">Notifications</li>' + rows;
+        }).catch(() => {});
+    }
+    setInterval(refreshNotifications, 30000);
+})();
+</script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 {% block extra_scripts %}{% endblock %}
 </body>

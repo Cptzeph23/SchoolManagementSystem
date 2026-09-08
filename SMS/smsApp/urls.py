@@ -52,6 +52,8 @@ urlpatterns = [
         "student/notifications/<int:notification_id>/read/",
         views.StudentMarkNotificationReadView.as_view(), name="student_mark_notification_read",
     ),
+    path("notifications/<int:notification_id>/open/", views.NotificationOpenView.as_view(), name="notification_open"),
+    path("notifications/feed/", views.NotificationFeedView.as_view(), name="notification_feed"),
     path("parent/", views.ParentDashboardView.as_view(), name="parent_dashboard"),
     path(
         "parent/children/<int:student_id>/academic/",

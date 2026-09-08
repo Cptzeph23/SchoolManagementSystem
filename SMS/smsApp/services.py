@@ -895,6 +895,15 @@ def submit_assignment(
             new_value={"attempt_number": submission.attempt_number},
         )
 
+    if assignment.created_by_id:
+        send_notification(
+            recipient=assignment.created_by.user,
+            notification_type="SUBMISSION_RECEIVED",
+            title="New assignment submission",
+            body=f"{student} submitted {assignment.title}.",
+            related_model="Assignment", related_object_id=assignment.pk, request=request,
+        )
+
     return submission
 
 
@@ -963,6 +972,8 @@ def submit_quiz_attempt(
     for question in attempt.quiz.questions.all():
         payload = answers.get(question.pk, {})
         answer = QuizAnswer.objects.create(attempt=attempt, question=question)
+        if payload.get("file"):
+            answer.submitted_file = payload["file"]
 
         if question.question_type == question.QuestionType.SHORT_ANSWER:
             answer.text_answer = payload.get("text", "")

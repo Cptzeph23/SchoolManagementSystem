@@ -37,6 +37,7 @@
             <li class="mb-3 pb-3 border-bottom">
                 <strong>{{ row.assignment.class_subject.subject.name }}</strong> — {{ row.assignment.title }}
                 <div class="text-muted small">Due: {{ row.assignment.deadline }}</div>
+                {% for resource in row.assignment.resources.all %}<a href="{% if resource.file %}{{ resource.file.url }}{% else %}{{ resource.external_url }}{% endif %}" target="_blank" class="small me-2">View questions</a>{% endfor %}
                 {% if row.submission %}
                     <span class="badge bg-info">{{ row.submission.get_status_display }}</span>
                     {% if row.submission.marks_obtained is not None %}
@@ -69,13 +70,9 @@
     {% endif %}
 </div>
 
-<div class="card sms-stat-card p-3 mb-4"><div class="text-muted small mb-2">CATs</div>{% if cat_rows %}<ul class="list-unstyled mb-0">{% for cat in cat_rows %}<li class="mb-2"><strong>{{ cat.class_subject.subject.name }}</strong> — {{ cat.title }} <span class="badge bg-secondary">{{ cat.get_workflow_status_display }}</span></li>{% endfor %}</ul>{% else %}<p class="text-muted mb-0">No CATs available.</p>{% endif %}</div>
-
-<div class="card sms-stat-card p-3">
-    <div class="text-muted small mb-2">Quizzes</div>
-    {% if quiz_rows %}
+{% for label, rows in task_sections %}<div class="card sms-stat-card p-3 mb-4"><div class="text-muted small mb-2">{{ label }}</div>{% if rows %}
         <ul class="list-unstyled mb-0">
-        {% for row in quiz_rows %}
+        {% for row in rows %}
             <li class="mb-2">
                 <strong>{{ row.quiz.class_subject.subject.name }}</strong> — {{ row.quiz.title }}
                 {% if row.attempt %}
@@ -90,9 +87,9 @@
         {% endfor %}
         </ul>
     {% else %}
-        <p class="text-muted mb-0">No quizzes yet.</p>
+        <p class="text-muted mb-0">No {{ label|lower }} available.</p>
     {% endif %}
-</div>
+</div>{% endfor %}
 <script>
 document.querySelectorAll('form[action*="student_submit_assignment"]').forEach(function (form) {
     const text = form.querySelector('textarea[name="submitted_text"]');

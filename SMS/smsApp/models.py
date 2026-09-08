@@ -1662,12 +1662,34 @@ class AssignmentSubmission(models.Model):
 # -----------------------------------------------------------------------
 
 class Quiz(models.Model):
+    class TaskCategory(models.TextChoices):
+        QUIZ = "QUIZ", "Quiz"
+        CAT = "CAT", "CAT"
+        EXAM = "EXAM", "Exam"
+
+    class SubmissionFormat(models.TextChoices):
+        TEXT_ENTRY = "TEXT_ENTRY", "Type answers"
+        FILE_UPLOAD = "FILE_UPLOAD", "Upload document"
+        BOTH = "BOTH", "Type answers or upload document"
+
     class_subject = models.ForeignKey(
         ClassSubject, on_delete=models.CASCADE, related_name="quizzes"
     )
     term = models.ForeignKey(Term, on_delete=models.CASCADE, related_name="quizzes")
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
+    task_category = models.CharField(
+        max_length=10, choices=TaskCategory.choices, default=TaskCategory.QUIZ,
+        db_index=True,
+    )
+    submission_format = models.CharField(
+        max_length=15, choices=SubmissionFormat.choices,
+        default=SubmissionFormat.TEXT_ENTRY,
+    )
+    question_file = models.FileField(
+        upload_to="lms/assessment_questions/", blank=True, null=True,
+        validators=[validate_file_size(5), validate_course_material_content],
+    )
     time_limit_minutes = models.PositiveIntegerField(blank=True, null=True)
     max_attempts = models.PositiveIntegerField(default=1)
     is_published = models.BooleanField(default=True)
@@ -1780,6 +1802,10 @@ class QuizAnswer(models.Model):
     question = models.ForeignKey(QuizQuestion, on_delete=models.CASCADE, related_name="answers")
     selected_options = models.ManyToManyField(QuizOption, blank=True, related_name="selected_in_answers")
     text_answer = models.TextField(blank=True)
+    submitted_file = models.FileField(
+        upload_to="lms/quiz_submissions/", blank=True, null=True,
+        validators=[validate_file_size(25), validate_document_content],
+    )
     marks_awarded = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
 
     class Meta:
@@ -2680,6 +2706,8 @@ class Notification(models.Model):
         ASSIGNMENT_DEADLINE = "ASSIGNMENT_DEADLINE", "Assignment Deadline"
         ANNOUNCEMENT = "ANNOUNCEMENT", "Announcement"
         ATTENDANCE = "ATTENDANCE", "Attendance"
+        TASK_ADDED = "TASK_ADDED", "Task Added"
+        SUBMISSION_RECEIVED = "SUBMISSION_RECEIVED", "Submission Received"
         OTHER = "OTHER", "Other"
 
     recipient = models.ForeignKey(

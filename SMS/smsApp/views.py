@@ -6,7 +6,7 @@ from django.contrib.auth import logout as auth_logout
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView as DjangoLoginView
 from django.core.exceptions import ValidationError
-from django.http import Http404, HttpResponse, HttpResponseForbidden
+from django.http import Http404, HttpResponse, HttpResponseForbidden, JsonResponse
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse, reverse_lazy
@@ -16,6 +16,8 @@ from django.views.generic import RedirectView, TemplateView
 from .validators import (
     COURSE_MATERIAL_TYPE_TO_CATEGORY,
     FileValidationError,
+    validate_course_material_content,
+    validate_document_content,
     validate_course_material_content,
     validate_document_content,
     validate_image_content,
@@ -29,6 +31,7 @@ from .models import (
     AssessmentComponent,
     AssessmentMark,
     Assignment,
+    AssignmentResource,
     AssignmentSubmission,
     AttendanceRecord,
     AuditLog,
@@ -99,6 +102,7 @@ from .services import (
     record_login,
     record_payment,
     record_staff_attendance,
+    send_notification,
     register_student,
     render_report_html,
     submit_assignment,
@@ -819,7 +823,15 @@ class StudentLMSView(StudentRequiredMixin, TemplateView):
             "materials": materials,
             "assignment_rows": assignment_rows,
             "quiz_rows": quiz_rows,
-            "cat_rows": cats,
+            "cat_rows": [{"quiz": q, "attempt": my_attempts.get(q.pk)} for q in quizzes if q.task_category == Quiz.TaskCategory.CAT],
+            "exam_rows": [{"quiz": q, "attempt": my_attempts.get(q.pk)} for q in quizzes if q.task_category == Quiz.TaskCategory.EXAM],
+            "regular_quiz_rows": [{"quiz": q, "attempt": my_attempts.get(q.pk)} for q in quizzes if q.task_category == Quiz.TaskCategory.QUIZ],
+            "task_sections": [
+                ("CATs", [{"quiz": q, "attempt": my_attempts.get(q.pk)} for q in quizzes if q.task_category == Quiz.TaskCategory.CAT]),
+                ("Exams", [{"quiz": q, "attempt": my_attempts.get(q.pk)} for q in quizzes if q.task_category == Quiz.TaskCategory.EXAM]),
+                ("Quizzes", [{"quiz": q, "attempt": my_attempts.get(q.pk)} for q in quizzes if q.task_category == Quiz.TaskCategory.QUIZ]),
+            ],
+            "assessments": cats,
         })
         return context
 
@@ -885,18 +897,41 @@ class StudentQuizAttemptView(StudentRequiredMixin, View):
         if attempt_number > quiz.max_attempts:
             return HttpResponseForbidden("You have used all allowed attempts for this quiz.")
         answers = {}
+        uploaded_file = request.FILES.get("quiz_file")
+        typed_answer = False
         for question in quiz.questions.all():
             values = request.POST.getlist(f"question_{question.pk}")
             option_ids = [int(value) for value in values if value.isdigit()]
+            text_answer = request.POST.get(f"question_{question.pk}", "").strip()
+            typed_answer = typed_answer or bool(option_ids or text_answer)
             answers[question.pk] = {
                 "option_ids": option_ids,
-                "text": request.POST.get(f"question_{question.pk}", "").strip(),
+                "text": text_answer,
             }
-        if not any(payload["option_ids"] or payload["text"] for payload in answers.values()):
+        if quiz.submission_format == Quiz.SubmissionFormat.FILE_UPLOAD and not uploaded_file:
+            return HttpResponseForbidden("Upload the required answer document before submitting.")
+        if quiz.submission_format == Quiz.SubmissionFormat.TEXT_ENTRY and not typed_answer:
             return HttpResponseForbidden("Answer at least one question before submitting.")
+        if quiz.submission_format == Quiz.SubmissionFormat.BOTH and not (uploaded_file or typed_answer):
+            return HttpResponseForbidden("Type an answer or upload a document before submitting.")
+        if uploaded_file:
+            try:
+                validate_upload(uploaded_file, validate_document_content, 25)
+            except (FileValidationError, ValidationError) as exc:
+                return HttpResponseForbidden(str(exc))
+            if answers:
+                answers[next(iter(answers))]["file"] = uploaded_file
         attempt = QuizAttempt.objects.create(quiz=quiz, student=student, attempt_number=attempt_number)
         from .services import submit_quiz_attempt
         submit_quiz_attempt(attempt=attempt, answers=answers)
+        if quiz.created_by_id:
+            send_notification(
+                recipient=quiz.created_by.user,
+                notification_type=Notification.NotificationType.SUBMISSION_RECEIVED,
+                title=f"New {quiz.get_task_category_display()} submission",
+                body=f"{student} submitted {quiz.title}.",
+                related_model="Quiz", related_object_id=quiz.pk, request=request,
+            )
         return redirect("dashboard:student_lms")
 
 
@@ -974,6 +1009,30 @@ class StudentMarkNotificationReadView(StudentRequiredMixin, View):
         )
         mark_notification_read(notification=notification)
         return redirect("dashboard:student_communication")
+
+
+class NotificationOpenView(LoginRequiredMixin, View):
+    def get(self, request, notification_id):
+        notification = get_object_or_404(Notification, pk=notification_id, recipient=request.user)
+        mark_notification_read(notification=notification)
+        if notification.related_model == "Quiz" and notification.related_object_id:
+            if request.user.role in {User.Role.TEACHER, User.Role.CLASS_TEACHER}:
+                return redirect("dashboard:teacher_quiz_attempts", quiz_id=notification.related_object_id)
+            if request.user.role == User.Role.STUDENT:
+                return redirect("dashboard:student_quiz_attempt", quiz_id=notification.related_object_id)
+        if notification.related_model == "Assignment" and notification.related_object_id:
+            if request.user.role in {User.Role.TEACHER, User.Role.CLASS_TEACHER}:
+                return redirect("dashboard:teacher_assignment_submissions", assignment_id=notification.related_object_id)
+        return redirect(get_dashboard_url_for_role(request.user))
+
+
+class NotificationFeedView(LoginRequiredMixin, View):
+    def get(self, request):
+        rows = Notification.objects.filter(recipient=request.user).order_by("-created_at")[:8]
+        return JsonResponse({
+            "unread_count": Notification.objects.filter(recipient=request.user, is_read=False).count(),
+            "notifications": [{"id": row.pk, "title": row.title, "message": row.message, "is_read": row.is_read} for row in rows],
+        })
 
 
 # =============================================================================
@@ -1421,7 +1480,7 @@ class TeacherAssignmentsView(TeacherRequiredMixin, TemplateView):
             teacher=staff, class_subject=class_subject, is_active=True
         ).values_list("term_id", flat=True).first()
 
-        Assignment.objects.create(
+        assignment = Assignment.objects.create(
             class_subject=class_subject, term_id=term_id,
             title=request.POST.get("title", ""),
             instructions=request.POST.get("instructions", ""),
@@ -1431,6 +1490,24 @@ class TeacherAssignmentsView(TeacherRequiredMixin, TemplateView):
             allow_resubmission=bool(request.POST.get("allow_resubmission")),
             created_by=staff,
         )
+        question_file = request.FILES.get("question_file")
+        if question_file:
+            try:
+                validate_upload(question_file, validate_course_material_content, 5)
+            except (FileValidationError, ValidationError) as exc:
+                assignment.delete()
+                return HttpResponseForbidden(str(exc))
+            AssignmentResource.objects.create(
+                assignment=assignment, title=f"{assignment.title} questions", file=question_file,
+            )
+        for student in Student.objects.filter(enrollments__class_subject=class_subject).select_related("user").distinct():
+            send_notification(
+                recipient=student.user,
+                notification_type=Notification.NotificationType.TASK_ADDED,
+                title="New assignment added",
+                body=f"{assignment.title} has been added for {class_subject.subject.name}.",
+                related_model="Assignment", related_object_id=assignment.pk, request=request,
+            )
         return redirect("dashboard:teacher_assignments")
 
 
@@ -1599,6 +1676,8 @@ class TeacherAssessmentsView(TeacherRequiredMixin, TemplateView):
             "class_subjects": class_subjects, "assessments": assessments,
             "quizzes": quizzes, "components": components,
             "question_types": QuizQuestion.QuestionType.choices,
+            "task_categories": Quiz.TaskCategory.choices,
+            "quiz_submission_formats": Quiz.SubmissionFormat.choices,
         })
         return context
 
@@ -1611,7 +1690,8 @@ class TeacherAssessmentsView(TeacherRequiredMixin, TemplateView):
         title = request.POST.get("title", "").strip()
         if not title or not term_id:
             return HttpResponseForbidden("Title and an active teaching assignment are required.")
-        if request.POST.get("kind") == "cat":
+        kind = request.POST.get("kind")
+        if kind in {"cat", "exam"}:
             component = get_object_or_404(
                 AssessmentComponent, pk=request.POST.get("component_id"),
                 structure__school=staff.school, structure__term_id=term_id,
@@ -1620,28 +1700,57 @@ class TeacherAssessmentsView(TeacherRequiredMixin, TemplateView):
                 class_subject=class_subject, term_id=term_id, component=component,
                 title=title, created_by=staff,
             )
-        elif request.POST.get("kind") == "quiz":
+        if kind in {"cat", "exam", "quiz"}:
             question_type = request.POST.get("question_type") or QuizQuestion.QuestionType.SHORT_ANSWER
+            task_category = {
+                "cat": Quiz.TaskCategory.CAT,
+                "exam": Quiz.TaskCategory.EXAM,
+                "quiz": Quiz.TaskCategory.QUIZ,
+            }[kind]
+            question_file = request.FILES.get("question_file")
+            if question_file:
+                try:
+                    validate_upload(question_file, validate_course_material_content, 5)
+                except (FileValidationError, ValidationError) as exc:
+                    return HttpResponseForbidden(str(exc))
             quiz = Quiz.objects.create(
                 class_subject=class_subject, term_id=term_id, title=title,
                 description=request.POST.get("description", "").strip(),
+                task_category=task_category,
+                submission_format=request.POST.get("submission_format") or Quiz.SubmissionFormat.TEXT_ENTRY,
+                question_file=question_file,
                 max_attempts=max(1, int(request.POST.get("max_attempts") or 1)), created_by=staff,
             )
-            question = QuizQuestion.objects.create(
-                quiz=quiz, question_text=request.POST.get("question_text", "").strip(),
-                question_type=question_type,
-                marks=Decimal(request.POST.get("question_marks") or "1"), order=1,
-            )
-            options = [line.strip() for line in request.POST.get("options", "").splitlines() if line.strip()]
-            correct = request.POST.get("correct_option", "").strip()
-            if question_type in (QuizQuestion.QuestionType.MULTIPLE_CHOICE, QuizQuestion.QuestionType.TRUE_FALSE):
-                for index, option_text in enumerate(options):
-                    QuizOption.objects.create(
-                        question=question, option_text=option_text, order=index,
-                        is_correct=option_text == correct,
-                    )
+            question_text_values = request.POST.getlist("question_text") or [request.POST.get("question_text", "")]
+            option_values = request.POST.getlist("options") or [request.POST.get("options", "")]
+            correct_values = request.POST.getlist("correct_option") or [request.POST.get("correct_option", "")]
+            question_texts = [item.strip() for item in question_text_values if item.strip()]
+            if not question_texts:
+                question_texts = ["See the uploaded question document."] if question_file else []
+            for question_index, question_text in enumerate(question_texts, start=1):
+                question = QuizQuestion.objects.create(
+                    quiz=quiz, question_text=question_text,
+                    question_type=question_type,
+                    marks=Decimal(request.POST.get("question_marks") or "1"), order=question_index,
+                )
+                if question_type in (QuizQuestion.QuestionType.MULTIPLE_CHOICE, QuizQuestion.QuestionType.TRUE_FALSE, QuizQuestion.QuestionType.MULTIPLE_ANSWER):
+                    options = [line.strip() for line in option_values[min(question_index - 1, len(option_values) - 1)].splitlines() if line.strip()]
+                    correct = correct_values[min(question_index - 1, len(correct_values) - 1)].strip()
+                    for index, option_text in enumerate(options):
+                        QuizOption.objects.create(
+                            question=question, option_text=option_text, order=index,
+                            is_correct=option_text == correct,
+                        )
+            for student in Student.objects.filter(enrollments__class_subject=class_subject).select_related("user").distinct():
+                send_notification(
+                    recipient=student.user,
+                    notification_type=Notification.NotificationType.TASK_ADDED,
+                    title=f"New {quiz.get_task_category_display()} added",
+                    body=f"{quiz.title} has been added for {class_subject.subject.name}.",
+                    related_model="Quiz", related_object_id=quiz.pk, request=request,
+                )
         else:
-            return HttpResponseForbidden("Select CAT or Quiz.")
+            return HttpResponseForbidden("Select CAT, Exam, or Quiz.")
         return redirect("dashboard:teacher_assessments")
 
 
