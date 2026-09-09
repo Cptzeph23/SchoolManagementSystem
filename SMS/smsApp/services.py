@@ -225,6 +225,56 @@ def compute_weighted_average(
     }
 
 
+def compute_student_subject_completion(*, student, class_subject, term) -> dict[str, int | bool]:
+    """Return completion across every task type for one subject/term.
+
+    Formal Assessment rows, assignment submissions, and interactive Quiz
+    attempts are stored separately. New CAT/exam tasks create both a formal
+    Assessment row and an interactive Quiz row, so matching titles are
+    counted once through the Quiz attempt rather than blocking completion
+    until a duplicate manual mark is entered.
+    """
+    from .models import Assessment, Assignment, AssignmentSubmission, Quiz, QuizAttempt
+
+    quizzes = Quiz.objects.filter(
+        class_subject=class_subject, term=term, is_published=True
+    )
+    quiz_titles = quizzes.values_list("title", flat=True)
+    assessments = Assessment.objects.filter(
+        class_subject=class_subject, term=term
+    ).exclude(title__in=quiz_titles)
+    assignments = Assignment.objects.filter(
+        class_subject=class_subject, term=term, is_published=True
+    )
+
+    assessment_total = assessments.count()
+    assessment_done = assessments.filter(
+        marks__student=student, marks__marks_obtained__isnull=False
+    ).distinct().count()
+    assignment_total = assignments.count()
+    assignment_done = AssignmentSubmission.objects.filter(
+        assignment__in=assignments, student=student,
+        marks_obtained__isnull=False,
+        status=AssignmentSubmission.Status.GRADED,
+    ).values("assignment_id").distinct().count()
+    quiz_total = quizzes.count()
+    quiz_done = 0
+    for quiz in quizzes:
+        attempt = QuizAttempt.objects.filter(
+            quiz=quiz, student=student, is_fully_graded=True
+        ).order_by("-attempt_number").first()
+        if attempt is not None and attempt.total_score is not None:
+            quiz_done += 1
+
+    total = assessment_total + assignment_total + quiz_total
+    completed = assessment_done + assignment_done + quiz_done
+    return {
+        "total_tasks": total,
+        "completed_tasks": completed,
+        "is_complete": total > 0 and completed == total,
+    }
+
+
 # =============================================================================
 # Phase 8 — Result Processing Workflow (spec §14)
 # DRAFT -> SUBMITTED -> REVIEWED -> VERIFIED -> APPROVED -> PUBLISHED.

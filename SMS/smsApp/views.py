@@ -80,6 +80,7 @@ from .services import (
     compute_school_academic_summary,
     compute_school_attendance_summary,
     compute_school_financial_summary,
+    compute_student_subject_completion,
     compute_staff_workload,
     compute_student_account_summary,
     compute_weighted_average,
@@ -701,6 +702,7 @@ class StudentAcademicView(StudentRequiredMixin, TemplateView):
 
         subject_rows = []
         quiz_rows = []
+        pending_tasks = []
         if term is not None:
             class_subjects = ClassSubject.objects.filter(
                 enrollments__student=student, enrollments__academic_year=term.academic_year
@@ -708,6 +710,9 @@ class StudentAcademicView(StudentRequiredMixin, TemplateView):
             grading_scheme = student.school.grading_schemes.filter(is_default=True).first()
             for cs in class_subjects:
                 summary = compute_weighted_average(student, cs, term)
+                completion = compute_student_subject_completion(
+                    student=student, class_subject=cs, term=term
+                )
                 band = None
                 if grading_scheme and summary["weight_covered"] > 0:
                     band = get_grade_for_mark(grading_scheme, summary["weighted_total"])
@@ -715,8 +720,61 @@ class StudentAcademicView(StudentRequiredMixin, TemplateView):
                     "subject": cs.subject.name,
                     "score": summary["weighted_total"],
                     "grade": band.grade if band else "-",
-                    "is_complete": summary["is_complete"],
+                    "is_complete": completion["is_complete"],
+                    "completed_tasks": completion["completed_tasks"],
+                    "total_tasks": completion["total_tasks"],
                 })
+
+                # Show exactly which records are preventing completion. New
+                # CAT/exam tasks have a matching formal Assessment row and
+                # interactive Quiz row; the Quiz is the actionable record,
+                # so do not list the duplicate Assessment as another task.
+                quizzes_for_subject = Quiz.objects.filter(
+                    class_subject=cs, term=term, is_published=True
+                )
+                quiz_titles = quizzes_for_subject.values_list("title", flat=True)
+                for assessment in Assessment.objects.filter(
+                    class_subject=cs, term=term
+                ).exclude(title__in=quiz_titles):
+                    if not assessment.marks.filter(student=student).exists():
+                        pending_tasks.append({
+                            "subject": cs.subject.name,
+                            "category": "Assessment",
+                            "title": assessment.title,
+                            "reason": "Mark not entered",
+                        })
+
+                for assignment in Assignment.objects.filter(
+                    class_subject=cs, term=term, is_published=True
+                ):
+                    submission = assignment.submissions.filter(student=student).first()
+                    if submission is None:
+                        reason = "Not submitted"
+                    elif submission.marks_obtained is None or submission.status != AssignmentSubmission.Status.GRADED:
+                        reason = "Awaiting teacher grading"
+                    else:
+                        continue
+                    pending_tasks.append({
+                        "subject": cs.subject.name,
+                        "category": "Assignment",
+                        "title": assignment.title,
+                        "reason": reason,
+                        "assignment_id": assignment.pk,
+                    })
+
+                for quiz in quizzes_for_subject:
+                    attempt = QuizAttempt.objects.filter(
+                        quiz=quiz, student=student
+                    ).order_by("-attempt_number").first()
+                    if attempt is not None and attempt.is_fully_graded and attempt.total_score is not None:
+                        continue
+                    pending_tasks.append({
+                        "subject": cs.subject.name,
+                        "category": quiz.get_task_category_display(),
+                        "title": quiz.title,
+                        "reason": "Not attempted" if attempt is None else "Awaiting teacher grading",
+                        "quiz_id": quiz.pk,
+                    })
 
             # Quizzes are stored separately from official AssessmentMark rows.
             # Keep them separate from Current Term Results because quizzes have
@@ -762,6 +820,7 @@ class StudentAcademicView(StudentRequiredMixin, TemplateView):
             "current_term": term,
             "subject_rows": subject_rows,
             "quiz_rows": quiz_rows,
+            "pending_tasks": pending_tasks,
             "report_cards": report_cards,
         })
         return context
@@ -1141,6 +1200,9 @@ class ParentChildAcademicView(ParentRequiredMixin, TemplateView):
             grading_scheme = child.school.grading_schemes.filter(is_default=True).first()
             for cs in class_subjects:
                 summary = compute_weighted_average(child, cs, term)
+                completion = compute_student_subject_completion(
+                    student=child, class_subject=cs, term=term
+                )
                 band = None
                 if grading_scheme and summary["weight_covered"] > 0:
                     band = get_grade_for_mark(grading_scheme, summary["weighted_total"])
@@ -1148,7 +1210,7 @@ class ParentChildAcademicView(ParentRequiredMixin, TemplateView):
                     "subject": cs.subject.name,
                     "score": summary["weighted_total"],
                     "grade": band.grade if band else "-",
-                    "is_complete": summary["is_complete"],
+                    "is_complete": completion["is_complete"],
                 })
 
             assignments = Assignment.objects.filter(
