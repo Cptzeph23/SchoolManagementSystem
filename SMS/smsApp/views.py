@@ -1095,10 +1095,15 @@ class NotificationOpenView(LoginRequiredMixin, View):
 
 class NotificationFeedView(LoginRequiredMixin, View):
     def get(self, request):
-        rows = Notification.objects.filter(recipient=request.user).order_by("-created_at")[:8]
+        from .context_processors import dashboard_notifications
+
+        context = dashboard_notifications(request)
         return JsonResponse({
-            "unread_count": Notification.objects.filter(recipient=request.user, is_read=False).count(),
-            "notifications": [{"id": row.pk, "title": row.title, "message": row.message, "is_read": row.is_read} for row in rows],
+            "unread_count": context["unread_notification_count"],
+            "notifications": [
+                {"id": row.pk, "title": row.title, "message": row.message, "is_read": row.is_read}
+                for row in context["dashboard_notifications"]
+            ],
         })
 
 
@@ -1403,10 +1408,19 @@ class TeacherClassesView(TeacherRequiredMixin, TemplateView):
         staff = self.get_staff(self.request)
         class_subjects = self.get_my_class_subjects(staff)
 
-        rows = []
-        for cs in class_subjects:
-            student_count = Enrollment.objects.filter(class_subject=cs).count()
-            rows.append({"class_subject": cs, "student_count": student_count})
+        from django.db.models import Count, Q
+
+        class_subjects = class_subjects.annotate(
+            student_count=Count(
+                "enrollments",
+                filter=Q(enrollments__status=Enrollment.Status.ENROLLED),
+                distinct=True,
+            )
+        )
+        rows = [
+            {"class_subject": cs, "student_count": cs.student_count}
+            for cs in class_subjects
+        ]
 
         context.update({"staff": staff, "rows": rows})
         return context

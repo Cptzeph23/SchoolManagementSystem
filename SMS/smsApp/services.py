@@ -199,13 +199,24 @@ def compute_weighted_average(
     if published_only:
         assessments = assessments.filter(workflow_status=Assessment.WorkflowStatus.PUBLISHED)
 
+    assessments = list(assessments)
+    # Fetch all marks in one query; per-assessment lookups are expensive over Supabase.
+    from .models import AssessmentMark
+    marks_by_assessment = {
+        mark.assessment_id: mark
+        for mark in AssessmentMark.objects.filter(
+            assessment_id__in=[assessment.pk for assessment in assessments],
+            student_id=student.pk,
+        )
+    }
+
     weighted_total = Decimal("0")
     weight_covered = Decimal("0")
     components_graded = 0
-    components_total = assessments.count()
+    components_total = len(assessments)
 
     for assessment in assessments:
-        mark_row = assessment.marks.filter(student=student).first()
+        mark_row = marks_by_assessment.get(assessment.pk)
         if mark_row is None:
             continue
         component = assessment.component
@@ -257,14 +268,18 @@ def compute_student_subject_completion(*, student, class_subject, term) -> dict[
         marks_obtained__isnull=False,
         status=AssignmentSubmission.Status.GRADED,
     ).values("assignment_id").distinct().count()
-    quiz_total = quizzes.count()
-    quiz_done = 0
-    for quiz in quizzes:
-        attempt = QuizAttempt.objects.filter(
-            quiz=quiz, student=student, is_fully_graded=True
-        ).order_by("-attempt_number").first()
-        if attempt is not None and attempt.total_score is not None:
-            quiz_done += 1
+    quizzes = list(quizzes)
+    quiz_total = len(quizzes)
+    latest_attempts = {}
+    for attempt in QuizAttempt.objects.filter(
+        quiz__in=quizzes, student=student, is_fully_graded=True
+    ).order_by("quiz_id", "-attempt_number"):
+        latest_attempts.setdefault(attempt.quiz_id, attempt)
+    quiz_done = sum(
+        1 for quiz in quizzes
+        if (attempt := latest_attempts.get(quiz.pk)) is not None
+        and attempt.total_score is not None
+    )
 
     total = assessment_total + assignment_total + quiz_total
     completed = assessment_done + assignment_done + quiz_done
@@ -1831,6 +1846,8 @@ def mark_notification_read(*, notification) -> None:
         notification.is_read = True
         notification.read_at = timezone.now()
         notification.save(update_fields=["is_read", "read_at"])
+        from django.core.cache import cache
+        cache.delete(f"dashboard-notifications:{notification.recipient_id}")
 
 
 # --- Role-aware convenience wrappers matching spec §22's exact examples ---

@@ -22,6 +22,8 @@ ALLOWED_HOSTS = env.list("ALLOWED_HOSTS")  # required, no default in prod
 DATABASES = {
     "default": env.db("DATABASE_URL")
 }
+DATABASES["default"]["CONN_MAX_AGE"] = env.int("DB_CONN_MAX_AGE", default=60)
+DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
 
 # ---------------------------------------------------------------------------
 # Security hardening (§27 of spec)
